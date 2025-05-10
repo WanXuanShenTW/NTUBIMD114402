@@ -2,18 +2,46 @@ import cv2
 import numpy as np
 import mediapipe as mp
 
-# 初始化 MediaPipe Pose
+# 初始化 MediaPipe Pose（可考慮根據需要調整其他參數）
 mp_pose = mp.solutions.pose
 pose = mp_pose.Pose()
 
-# 提取骨架點
 def extract_skeleton_points(image):
-    results = pose.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+    if not isinstance(image, np.ndarray):
+        try:
+            image = np.array(image)
+        except Exception as e:
+            raise ValueError("無法轉換影像為 numpy.ndarray") from e
+
+    image = np.array(image, copy=True)
+    image = np.ascontiguousarray(image, dtype=np.uint8)
+    
+    if image is None:
+        raise ValueError("讀取到的影像為 None")
+    if image.dtype != np.uint8:
+        raise ValueError(f"錯誤的影像型態: {image.dtype}, 應為 uint8")
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("影像形狀不符合要求，必須為 3-channel 影像")
+    
+    # --- 新增: 將影像轉換為正方形，提供 IMAGE_DIMENSIONS  ---
+    h, w, _ = image.shape
+    if h != w:
+        size = max(h, w)
+        square_image = np.zeros((size, size, 3), dtype=np.uint8)
+        square_image[:h, :w] = image
+        image = square_image
+    
+    rgb_image = image[..., ::-1].copy()  # 直接用 numpy 反轉 BGR -> RGB
+    
+    try:
+        results = pose.process(rgb_image)
+    except Exception as e:
+        raise Exception(f"骨架解析失敗：{e}")
+    
     if results.pose_landmarks:
         return [(lm.x, lm.y, lm.visibility) for lm in results.pose_landmarks.landmark]
     return []
 
-# 正規化骨架資料
 def normalize_skeleton_data(skeleton_data, scaler, time_steps=120):
     if len(skeleton_data) >= time_steps:
         slice_data = skeleton_data[-time_steps:]
