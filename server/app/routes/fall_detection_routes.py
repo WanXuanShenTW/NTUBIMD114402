@@ -2,6 +2,7 @@ import math
 import os
 import tempfile
 import datetime
+import threading
 import cv2
 import numpy as np
 from flask import Blueprint, request, jsonify
@@ -12,25 +13,24 @@ from ..db import get_connection
 fall_detection_bp = Blueprint("fall_detection_bp", __name__)
 
 TEMP_VIDEO_DIR = "tmp"
-VIDEOS_DIR = os.path.join(os.getcwd(), "videos")
+VIDEOS_DIR = "fall_videos"
 
 model, scaler = load_fall_model()
 
 # 使用 temp 檔案儲存影片段
-user_temp_files = {}       # 用於儲存跌倒前的影片檔 (pre-fall)
-user_post_temp_files = {}  # 用於跌倒後上傳的影片檔 (post-fall)
+user_temp_files = {}            # 用於儲存跌倒前的影片檔 (pre-fall)
+user_post_temp_files = {}       # 用於跌倒後上傳的影片檔 (post-fall)
 user_skeleton_buffers = {}
+user_post_fall_buffers = {}
 user_update_counts = {}
-user_buffer_filled = {}    # 紀錄每個使用者是否累計到足夠的幀數
+user_can_save = {}
 
-SMALL_BUFFER_SIZE = 60       # 用於骨架推論最低骨架資料筆數
-PREDICTION_INTERVAL = 30
+SMALL_BUFFER_SIZE = 60          # 用於骨架推論最低骨架資料筆數
 BUFFER_UPDATE_SIZE = 30
-SERVER_MAX_FPS = 30    # 伺服器最大處理 FPS
+SERVER_MAX_FPS = 30             # 伺服器最大處理 FPS
 
-PRE_FALL_SECONDS = 2   # 前置影片秒數上限 (秒)
-POST_FALL_SECONDS = 1  # 跌倒後影片秒數上限 (秒)
-MIN_REQUIRED_FRAMES = PRE_FALL_SECONDS * SERVER_MAX_FPS  # 前置至少需要的幀數
+PRE_FALL_SECONDS = 2            # 前置影片秒數上限 (秒)
+POST_FALL_SECONDS = 2           # 跌倒後影片秒數上限 (秒)
 
 def save_video(user_id, frames):
     if not frames:
@@ -48,15 +48,15 @@ def save_video(user_id, frames):
     out.release()
     return video_filename
 
-def save_to_db(user_id, video_filename, result):
+def save_to_db(user_id, location, pose_before_fall, video_filename, result):
     try:
         conn = get_connection()
         cursor = conn.cursor()
         query = """
-                INSERT INTO fall_events (user_id, detected_time, video_filename, result)
+                INSERT INTO fall_events (user_id, detected_time, location, pose_before_fall, video_filename)
                 VALUES (%s, %s, %s, %s)
                 """
-        values = (user_id, datetime.datetime.now(), video_filename, result)
+        values = (user_id, datetime.datetime.now(), location, pose_before_fall, video_filename, result)
         cursor.execute(query, values)
         conn.commit()
         cursor.close()
@@ -100,7 +100,7 @@ def update_post_files(user_id, max_frames):
 
 @fall_detection_bp.route("/detect_fall_video", methods=["POST"])
 def detect_fall_video():
-    global user_temp_files, user_post_temp_files, user_skeleton_buffers, user_update_counts, user_buffer_filled
+    global user_temp_files, user_post_temp_files, user_skeleton_buffers, user_update_counts, user_can_save, user_post_fall_buffers
 
     user_id = request.form.get("id")
     if not user_id:
@@ -113,108 +113,83 @@ def detect_fall_video():
     if not video_file.filename.lower().endswith(".mp4"):
         return jsonify({"error": "檔案格式不符，請上傳 MP4 影片"}), 400
 
-    # 初始化使用者暫存區、骨架資料與狀態旗標
+    # 初始化使用者暫存區與布林變數
     if user_id not in user_temp_files:
         user_temp_files[user_id] = []
-        user_post_temp_files[user_id] = []
         user_skeleton_buffers[user_id] = []
         user_update_counts[user_id] = 0
-        user_buffer_filled[user_id] = False
+        user_can_save[user_id] = True  # 預設為 True，允許儲存
+        user_post_fall_buffers[user_id] = []  # 初始化跌倒後緩衝區
 
-    fall_detected = False
     prediction_result = "Insufficient data"
 
     try:
-        # 將上傳的影片存成 temporary 檔（亂數名稱由 NamedTemporaryFile 產生）
+        # 將上傳的影片存成 temporary 檔
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4", dir=TEMP_VIDEO_DIR) as tmp:
             video_path = tmp.name
             tmp.write(video_file.read())
 
-        # 取得本次上傳影片的總幀數
-        current_file_frames = get_frames_in_file(video_path)
-
-        # 利用存檔的影片進行骨架抽取與跌倒判斷
+        # 取得本次上傳影片的 FPS 和總幀數
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return jsonify({"error": "影片讀取失敗"}), 400
 
-        video_fps = cap.get(cv2.CAP_PROP_FPS)
-        drop_rate = math.ceil(video_fps / SERVER_MAX_FPS) if video_fps > SERVER_MAX_FPS else 1
-        
+        video_fps = int(cap.get(cv2.CAP_PROP_FPS))
+        current_file_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        print(f"[INFO] User {user_id}: Current video FPS = {video_fps}, frames = {current_file_frames}")
+
         frame_index = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
 
-            # 每秒抽取一個 frame 更新骨架資料（僅在尚未偵測跌倒時）
-            if frame_index % max(1, int(video_fps)) == 0 and not fall_detected:
-                skeleton = extract_skeleton_points(frame)
-                if skeleton:
-                    user_skeleton_buffers[user_id].append(skeleton)
-                    user_update_counts[user_id] += 1
+            skeleton = extract_skeleton_points(frame)
+            if skeleton:
+                user_skeleton_buffers[user_id].append(skeleton)
+                user_update_counts[user_id] += 1
 
-                if (len(user_skeleton_buffers[user_id]) >= SMALL_BUFFER_SIZE and 
-                    user_update_counts[user_id] >= PREDICTION_INTERVAL):
-                    norm_data = normalize_skeleton_data(user_skeleton_buffers[user_id], scaler, time_steps=SMALL_BUFFER_SIZE)
-                    pred = model.predict(norm_data)[0][0]
-                    if pred >= 0.5:
-                        prediction_result = "fall"
-                        fall_detected = True
-                        print(f"[INFO] User {user_id}: 跌倒事件偵測到。")
-                    else:
-                        prediction_result = "Non_fall"
-                    user_update_counts[user_id] = 0
-                    if len(user_skeleton_buffers[user_id]) >= BUFFER_UPDATE_SIZE:
-                        user_skeleton_buffers[user_id] = user_skeleton_buffers[user_id][BUFFER_UPDATE_SIZE:]
+            # 如果已偵測為跌倒，將幀存入跌倒後緩衝區
+            if not user_can_save[user_id]:
+                user_post_fall_buffers[user_id].append(frame)
+
             frame_index += 1
         cap.release()
 
-        # 累計前置暫存區影片的幀數，加上本次影片幀數
-        prev_frames = get_total_frames_in_files(user_temp_files.get(user_id, []))
-        accumulated_frames = prev_frames + current_file_frames
-        print(f"[DEBUG] User {user_id}: Accumulated frames (pre-temp + current) = {accumulated_frames}")
+        # 列印累計的骨架幀數
+        total_frames = len(user_skeleton_buffers[user_id])
+        print(f"[INFO] User {user_id}: Total accumulated skeleton frames = {total_frames}")
 
-        # 檢查是否已經累計到足夠的幀數並更新旗標
-        if not user_buffer_filled[user_id]:
-            if accumulated_frames >= MIN_REQUIRED_FRAMES:
-                user_buffer_filled[user_id] = True
-                print(f"[INFO] User {user_id}: Buffer has reached sufficient frames: {accumulated_frames}")
+        # 如果累計骨架資料達到要求，進行推論
+        if total_frames >= SMALL_BUFFER_SIZE:
+            norm_data = normalize_skeleton_data(user_skeleton_buffers[user_id], scaler, time_steps=SMALL_BUFFER_SIZE)
+            all_pred = model.predict(norm_data)
+            print(f"[DEBUG] User {user_id}: Prediction result = {all_pred}")
+            pred = all_pred[0][0]
+            if pred >= 0.5:
+                prediction_result = "fall"
+                print(f"[INFO] User {user_id}: 跌倒事件偵測到。")
+                user_can_save[user_id] = False  # 偵測到跌倒後禁止再次儲存
             else:
-                prediction_result = "Insufficient data"
-        else:
-            # 一旦達到足夠幀數，以後回傳只會是 fall 或 Non_fall，如果預測結果仍然是不足，則訂為 Non_fall
-            if prediction_result == "Insufficient data":
                 prediction_result = "Non_fall"
+                print(f"[INFO] User {user_id}: 未偵測到跌倒事件。")
+                user_can_save[user_id] = True  # 回歸非跌倒時設為 True，允許儲存
 
-        if prediction_result == "fall":
-            # 若跌倒，將本次影片加入 post-fall 暫存區
-            user_post_temp_files[user_id].append(video_path)
-            max_post_frames = POST_FALL_SECONDS * SERVER_MAX_FPS
-            update_post_files(user_id, max_post_frames)
-            # 組合前置與後置影片檔
-            combined_clip_paths = user_temp_files[user_id] + user_post_temp_files[user_id]
-            combined_frames = []
-            for clip in combined_clip_paths:
-                cap_clip = cv2.VideoCapture(clip)
-                while True:
-                    ret, frame = cap_clip.read()
-                    if not ret:
-                        break
-                    combined_frames.append(frame)
-                cap_clip.release()
-            video_filename = save_video(user_id, combined_frames)
-            if video_filename:
-                save_to_db(user_id, video_filename, "fall")
-                return jsonify({"id": user_id, "result": "fall", "video": video_filename}), 200
-            else:
-                return jsonify({"error": "跌倒影片儲存失敗"}), 500
+            # 清除最早的影片檔案
+            if user_temp_files[user_id]:
+                old_file = user_temp_files[user_id].pop(0)
+                if os.path.exists(old_file):
+                    os.remove(old_file)
 
-        else:
-            # 若推論結果為 Non_fall 或 Insufficient data，將本次影片加入前置暫存區
-            user_temp_files[user_id].append(video_path)
-            update_temp_files(user_id, MIN_REQUIRED_FRAMES)
-            return jsonify({"id": user_id, "result": prediction_result}), 200
+            # 清除已處理的骨架資料
+            user_skeleton_buffers[user_id] = user_skeleton_buffers[user_id][BUFFER_UPDATE_SIZE:]
+
+        # 將本次影片加入暫存區
+        user_temp_files[user_id].append(video_path)
+        response = jsonify({"id": user_id, "result": prediction_result})
+        response.status_code = 200
+
+        return response
 
     except Exception as e:
         print(f"[ERROR] User {user_id}: {e}")
