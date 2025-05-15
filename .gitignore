@@ -1,48 +1,42 @@
-# ---- Python ----
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.egg-info/
+# Python compiled files
+**/__pycache__/
+server/**/*.pyc
+server/**/*.pyo
+server/**/*.pyd
 
-# ---- Flask uploads & static files ----
-uploaded_images/
-static/
-
-# ---- AI models ----
-models/
-
-# ---- Virtual Environments ----
-env/
+# Virtual environments
 venv/
-.smartcare_env/
-.pose_guard_env/
+env/
+server/venv/
+server/env/
 
-# ---- Jupyter / Notebook files ----
-.ipynb_checkpoints/
+# Flask uploads and static
+server/uploaded_images/
+server/static/
 
-# ---- IDE / Editor settings ----
-.vscode/
-.idea/
-*.sublime-project
-*.sublime-workspace
+# Models
+server/models/
 
-# ---- System files ----
-.DS_Store
-Thumbs.db
-desktop.ini
+# Notebook checkpoints
+server/.ipynb_checkpoints/
 
-# ---- Config and Secrets ----
-.env
-.env.*
-*.log
+# IDE settings
+server/.vscode/
+server/.idea/
 
-# ---- Conda environment exports ----
-env.txt
+# System files
+server/.DS_Store
+server/Thumbs.db
+server/desktop.ini
 
-# ---- Misc ----
-*.bak
-*.tmp
+# Secrets and configs
+server/.env
+server/.env.*
+server/*.log
 
-# ---- Azure Key ----
-key.pem
+# Temp & backup
+server/*.bak
+server/*.tmp
+
+# Azure key
+server/key.pem
