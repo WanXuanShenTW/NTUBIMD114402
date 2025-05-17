@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:orientation="vertical"
+        android:paddingTop="80dp"
+        android:paddingBottom="24dp"
+        android:paddingLeft="24dp"
+        android:paddingRight="24dp"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center_horizontal">
+
+
+    <!-- 標題 -->
+        <TextView
+            android:id="@+id/titleText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="AI 底家"
+            android:textSize="25sp"
+            android:layout_marginBottom="35dp" />
+
+        <!-- Username -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Username"
+            android:layout_marginTop="8dp"
+            android:layout_marginBottom="4dp" />
+        <EditText
+            android:id="@+id/usernameInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="輸入姓名"
+            android:background="@drawable/edittext_background"
+            android:padding="12dp"
+            android:inputType="textPersonName"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Phone Number -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Phone Number"
+            android:layout_marginBottom="4dp" />
+        <EditText
+            android:id="@+id/phoneInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="輸入電話號碼"
+            android:background="@drawable/edittext_background"
+            android:padding="12dp"
+            android:inputType="phone"
+            android:layout_marginBottom="12dp" />
+
+        <!-- Password -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Password"
+            android:layout_marginBottom="4dp" />
+        <EditText
+            android:id="@+id/passwordInput"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="輸入密碼"
+            android:background="@drawable/edittext_background"
+            android:padding="12dp"
+            android:inputType="textPassword"
+            android:layout_marginBottom="30dp" />
+
+        <!-- 忘記密碼 -->
+        <androidx.appcompat.widget.AppCompatButton
+            android:id="@+id/forgotPasswordButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="忘記密碼"
+            android:background="@drawable/outline_button"
+            android:textColor="#000000"
+            android:textSize="17sp"
+            android:elevation="0dp"
+            android:layout_marginBottom="8dp" />
+
+
+
+        <!-- 帳號註冊 -->
+        <androidx.appcompat.widget.AppCompatButton
+            android:id="@+id/registerButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="帳號註冊"
+            android:background="@drawable/outline_button"
+            android:textColor="#000000"
+            android:textSize="17sp"
+            android:elevation="0dp"
+            android:layout_marginBottom="8dp" />
+
+
+        <!-- 登入 -->
+        <androidx.appcompat.widget.AppCompatButton
+            android:id="@+id/loginButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="登入"
+            android:background="@drawable/button_rounded_black"
+            android:textColor="#FFFFFF"
+            android:textSize="17sp"
+            android:elevation="0dp"
+            android:layout_marginBottom="8dp" />
+
+    </LinearLayout>
+</ScrollView>
