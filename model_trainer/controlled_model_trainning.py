@@ -18,14 +18,11 @@ OUTPUT_NORMAL_FOLDER = 'outputs/skeletons/N01/normal'
 OUTPUT_FALL_FOLDER = 'outputs/skeletons/N01/fall'
 MODEL_SAVE_PATH = 'outputs/models/lstm_fall_detection_model_N01.h5'
 SCALER_SAVE_PATH = 'outputs/models/scaler_N01.pkl'
-TEST_VIDEO_PATH = 'medias/test/IMG_8049.mp4'
+TEST_VIDEO_PATH = 'medias/test/IMG_8048.mp4'
 
 REGENERATE_SKELETON = False  # 是否重新生成骨架數據
 TIME_STEPS = 60  # 推論所需的幀數
 INFERENCE_FREQUENCY = 15  # 每隔多少幀進行一次推論
-
-# 若 normal 資料太多，設定取樣比例 (例如只取 50% 的幀)
-SAMPLE_RATE_NORMAL = 0.5
 
 # 初始化 MediaPipe
 mp_pose = mp.solutions.pose
@@ -40,8 +37,7 @@ def extract_skeleton_points(image):
         return [(lm.x, lm.y, lm.visibility) for lm in results.pose_landmarks.landmark]
     return []
 
-# 修改後的 process_and_save_skeleton_data：sample_rate 放在 progress_bar 之前
-def process_and_save_skeleton_data(video_path, output_file, sample_rate=1.0, progress_bar=None):
+def process_and_save_skeleton_data(video_path, output_file, progress_bar=None):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Failed to open video file: {video_path}")
@@ -52,12 +48,6 @@ def process_and_save_skeleton_data(video_path, output_file, sample_rate=1.0, pro
         success, frame = cap.read()
         if not success or frame is None:
             break
-
-        # 加入取樣機制：若 sample_rate < 1.0，僅以固定機率處理該幀
-        if sample_rate < 1.0 and random.random() > sample_rate:
-            if progress_bar:
-                progress_bar.update(1)
-            continue
 
         skeleton_points = extract_skeleton_points(frame)
         if skeleton_points:
@@ -71,19 +61,14 @@ def process_and_save_skeleton_data(video_path, output_file, sample_rate=1.0, pro
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(skeleton_data, f)
 
-def count_frames_in_video(video_path, sample_rate=1.0):
+def count_frames_in_video(video_path):
     cap = cv2.VideoCapture(video_path)
     count = 0
     while True:
         success, _ = cap.read()
         if not success:
             break
-        # 根據 sample_rate 決定是否計數該幀
-        if sample_rate < 1.0:
-            if random.random() <= sample_rate:
-                count += 1
-        else:
-            count += 1
+        count += 1
     cap.release()
     return count
 
@@ -91,23 +76,19 @@ def process_videos_from_folder(folder_path, output_folder):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
     video_files = [video_file for video_file in os.listdir(folder_path) if video_file.lower().endswith(('.mp4', '.avi', '.mov'))]
-    
-    # 根據資料夾決定 sample_rate：normal 使用 SAMPLE_RATE_NORMAL，fall 則使用 1.0
-    sample_rate = SAMPLE_RATE_NORMAL if folder_path == NORMAL_FOLDER else 1.0
 
     # 統計所有影片實際處理的總幀數
     total_frames = 0
     for video_file in video_files:
         video_path = os.path.join(folder_path, video_file)
-        total_frames += count_frames_in_video(video_path, sample_rate)
+        total_frames += count_frames_in_video(video_path)
 
     # 建立進度條
     with tqdm(total=total_frames, desc=f"Processing frames in {folder_path}") as pbar:
         for video_file in video_files:
             video_path = os.path.join(folder_path, video_file)
             output_file = os.path.join(output_folder, f'{os.path.splitext(video_file)[0]}.json')
-            # 改用關鍵字傳遞 sample_rate 與 progress_bar
-            process_and_save_skeleton_data(video_path, output_file, sample_rate=sample_rate, progress_bar=pbar)
+            process_and_save_skeleton_data(video_path, output_file, progress_bar=pbar)
 
 def calculate_acceleration(skeleton_data):
     acceleration = []
@@ -148,10 +129,6 @@ def load_data(normal_folder, fall_folder, time_steps=60):
     fall_files = [file for file in os.listdir(fall_folder) if file.lower().endswith('.json')]
     # 取得 normal 資料夾內所有 json 檔案列表
     normal_files = [file for file in os.listdir(normal_folder) if file.lower().endswith('.json')]
-    # 計算 normal 需取的筆數：fall 筆數的 1/5
-    required_normal_count = len(fall_files) // 5
-    if required_normal_count < len(normal_files):
-        normal_files = random.sample(normal_files, required_normal_count)
 
     # 處理 normal 檔案 (label = 0)
     for file in normal_files:
@@ -179,7 +156,7 @@ def load_data(normal_folder, fall_folder, time_steps=60):
 
     return np.array(X), np.array(y)
 
-def build_lstm_model(input_shape):
+
     model = models.Sequential()
     model.add(layers.LSTM(64, return_sequences=True, input_shape=input_shape))
     model.add(layers.Dropout(0.5))
@@ -189,7 +166,29 @@ def build_lstm_model(input_shape):
     model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
     return model
 
-def train_lstm_model(normal_folder, fall_folder, model_save_path, scaler_save_path, time_steps=60):
+def build_cnn_lstm_model(input_shape):
+    model = models.Sequential()
+    
+    # CNN layers for spatial feature extraction
+    model.add(layers.Conv1D(filters=64, kernel_size=3, activation='relu', input_shape=input_shape))
+    model.add(layers.MaxPooling1D(pool_size=2))
+    model.add(layers.Conv1D(filters=128, kernel_size=3, activation='relu'))
+    model.add(layers.MaxPooling1D(pool_size=2))
+    model.add(layers.Dropout(0.5))
+    
+    # LSTM layers for temporal feature extraction
+    model.add(layers.LSTM(64, return_sequences=True))
+    model.add(layers.LSTM(64))
+    model.add(layers.Dropout(0.5))
+    
+    # Fully connected layer for classification
+    model.add(layers.Dense(1, activation='sigmoid'))
+    
+    # Compile the model
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
     X, y = load_data(normal_folder, fall_folder, time_steps)
     from sklearn.model_selection import train_test_split
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -205,6 +204,31 @@ def train_lstm_model(normal_folder, fall_folder, model_save_path, scaler_save_pa
 
     input_shape = (X_train_reshaped.shape[1], X_train_reshaped.shape[2])
     model = build_lstm_model(input_shape)
+
+    model.fit(X_train_reshaped, y_train, epochs=10, batch_size=32, validation_data=(X_test_reshaped, y_test))
+
+    model.save(model_save_path)
+    with open(scaler_save_path, 'wb') as f:
+        pickle.dump(scaler, f)
+
+    return model
+
+def train_cnn_lstm_model(normal_folder, fall_folder, model_save_path, scaler_save_path, time_steps=60):
+    X, y = load_data(normal_folder, fall_folder, time_steps)
+    from sklearn.model_selection import train_test_split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    scaler = MinMaxScaler()
+    X_train_flat = X_train.reshape(X_train.shape[0], -1)
+    X_test_flat = X_test.reshape(X_test.shape[0], -1)
+    X_train_norm = scaler.fit_transform(X_train_flat)
+    X_test_norm = scaler.transform(X_test_flat)
+
+    X_train_reshaped = X_train_norm.reshape(X_train.shape[0], time_steps, -1)
+    X_test_reshaped = X_test_norm.reshape(X_test.shape[0], time_steps, -1)
+
+    input_shape = (X_train_reshaped.shape[1], X_train_reshaped.shape[2])
+    model = build_cnn_lstm_model(input_shape)
 
     model.fit(X_train_reshaped, y_train, epochs=10, batch_size=32, validation_data=(X_test_reshaped, y_test))
 
@@ -289,7 +313,8 @@ if __name__ == '__main__':
             print("已取消覆蓋，將沿用現有骨架資料。")
     
     print("開始訓練模型...")
-    model = train_lstm_model(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, MODEL_SAVE_PATH, SCALER_SAVE_PATH, TIME_STEPS)
+    # model = train_lstm_model(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, MODEL_SAVE_PATH, SCALER_SAVE_PATH, TIME_STEPS)
+    model = train_cnn_lstm_model(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, MODEL_SAVE_PATH, SCALER_SAVE_PATH, TIME_STEPS)
     print("訓練完成，模型與 scaler 已儲存。")
 
     model = models.load_model(MODEL_SAVE_PATH)
