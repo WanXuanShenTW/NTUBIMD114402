@@ -21,9 +21,9 @@ MODEL_SAVE_PATH = 'outputs/models/cnn_lstm_fall_detection_model_N01_1.h5'
 SCALER_SAVE_PATH = 'outputs/models/scaler_N01_1.pkl'
 TEST_VIDEO_PATH = 'medias/test/IMG_8049.mp4'
 
-REGENERATE_SKELETON = False  # 是否重新生成骨架數據
-TIME_STEPS = 60  # 推論所需的幀數
-INFERENCE_FREQUENCY = 15  # 每隔多少幀進行一次推論
+REGENERATE_SKELETON = False     # 是否重新生成骨架數據
+TIME_STEPS = 60                 # 推論所需的幀數
+INFERENCE_FREQUENCY = 10        # 每隔多少幀進行一次推論
 
 # 初始化 MediaPipe
 mp_pose = mp.solutions.pose
@@ -120,6 +120,13 @@ def load_data(normal_folder, fall_folder, time_steps=60):
     X, y = [], []
 
     def pad_or_truncate(skeleton_data, time_steps):
+        # 拋棄前面連續的全零骨架
+        idx = 0
+        while idx < len(skeleton_data) and all(tuple(pt) == (0, 0, 0) for pt in skeleton_data[idx]):
+            idx += 1
+        skeleton_data = skeleton_data[idx:]  # 丟棄前面的全零骨架
+
+        # 正常補齊長度
         if len(skeleton_data) >= time_steps:
             return skeleton_data[:time_steps]
         else:
@@ -214,24 +221,19 @@ def build_cnn_lstm_model(input_shape):
 
     return model
 
-def train_cnn_lstm_model(normal_folder, fall_folder, model_save_path, scaler_save_path, time_steps=60):
+def train_cnn_lstm_model_all_data(normal_folder, fall_folder, model_save_path, scaler_save_path, time_steps=60):
     X, y = load_data(normal_folder, fall_folder, time_steps)
-    from sklearn.model_selection import train_test_split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
     scaler = MinMaxScaler()
-    X_train_flat = X_train.reshape(X_train.shape[0], -1)
-    X_test_flat = X_test.reshape(X_test.shape[0], -1)
-    X_train_norm = scaler.fit_transform(X_train_flat)
-    X_test_norm = scaler.transform(X_test_flat)
+    X_flat = X.reshape(X.shape[0], -1)
+    X_norm = scaler.fit_transform(X_flat)
+    X_reshaped = X_norm.reshape(X.shape[0], time_steps, -1)
 
-    X_train_reshaped = X_train_norm.reshape(X_train.shape[0], time_steps, -1)
-    X_test_reshaped = X_test_norm.reshape(X_test.shape[0], time_steps, -1)
-
-    input_shape = (X_train_reshaped.shape[1], X_train_reshaped.shape[2])
+    input_shape = (X_reshaped.shape[1], X_reshaped.shape[2])
     model = build_cnn_lstm_model(input_shape)
 
-    model.fit(X_train_reshaped, y_train, epochs=10, batch_size=32, validation_data=(X_test_reshaped, y_test))
+    # 全部資料都用於訓練，不做驗證集
+    model.fit(X_reshaped, y, epochs=10, batch_size=32)
 
     model.save(model_save_path)
     with open(scaler_save_path, 'wb') as f:
@@ -307,12 +309,6 @@ def visualize_score_distribution(y_true, y_scores):
     fall_scores = [score for score, label in zip(y_scores, y_true) if label == 1]
     normal_scores = [score for score, label in zip(y_scores, y_true) if label == 0]
 
-    # 測試用繪圖 (檢查繪圖是否正常)
-    plt.figure()
-    plt.plot(np.random.normal(size=100), label="Test Plot")
-    plt.legend()
-    plt.show()
-
     # 繪製分數分佈圖
     plt.figure(figsize=(10, 6))
     plt.hist(normal_scores, bins=20, alpha=0.7, label='Normal (label=0)', color='green')
@@ -337,39 +333,44 @@ if __name__ == '__main__':
         import tkinter as tk
         from tkinter import messagebox
 
-        # 顯示確認對話視窗
         root = tk.Tk()
-        root.withdraw()  # 隱藏主視窗
+        root.withdraw()
         answer = messagebox.askyesno("覆蓋確認", "確定要覆蓋現有的骨架資料嗎？此動作會清空輸出骨架檔案的位置。")
         root.destroy()
 
         if answer:
-            # 若確認覆蓋，先清空輸出骨架的資料夾
             for folder in [OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER]:
                 if os.path.exists(folder):
                     shutil.rmtree(folder)
                 os.makedirs(folder)
-            # 重新生成骨架資料
             process_videos_from_folder(NORMAL_FOLDER, OUTPUT_NORMAL_FOLDER)
             process_videos_from_folder(FALL_FOLDER, OUTPUT_FALL_FOLDER)
         else:
             print("已取消覆蓋，將沿用現有骨架資料。")
     
     print("開始訓練模型...")
-    # model = train_lstm_model(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, MODEL_SAVE_PATH, SCALER_SAVE_PATH, TIME_STEPS)
-    model = train_cnn_lstm_model(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, MODEL_SAVE_PATH, SCALER_SAVE_PATH, TIME_STEPS)
+    model = train_cnn_lstm_model_all_data(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, MODEL_SAVE_PATH, SCALER_SAVE_PATH, TIME_STEPS)
     print("訓練完成，模型與 scaler 已儲存。")
 
     model = models.load_model(MODEL_SAVE_PATH)
     with open(SCALER_SAVE_PATH, 'rb') as f:
         scaler = pickle.load(f)
 
-    # 測試用隨機數據
-    np.random.seed(42)
-    y_true_test = np.random.choice([0, 1], size=100, p=[0.7, 0.3])  # 70% Normal, 30% Fall
-    y_scores_test = np.random.uniform(0, 1, size=100)  # 隨機分數在 [0, 1] 範圍內
+    # === 用真實測試集資料繪製分數分佈圖 ===
+    # 重新載入資料並分割
+    X, y = load_data(OUTPUT_NORMAL_FOLDER, OUTPUT_FALL_FOLDER, TIME_STEPS)
+    from sklearn.model_selection import train_test_split
+    _, X_test, _, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+    # 正規化
+    X_test_flat = X_test.reshape(X_test.shape[0], -1)
+    X_test_norm = scaler.transform(X_test_flat)
+    X_test_reshaped = X_test_norm.reshape(X_test.shape[0], TIME_STEPS, -1)
+
+    # 預測分數
+    y_scores = model.predict(X_test_reshaped).flatten()
 
     # 呼叫 visualize_score_distribution 函數
-    visualize_score_distribution(y_true_test, y_scores_test)
+    visualize_score_distribution(y_test, y_scores)
 
     display_video_with_skeleton_and_fall_detection(TEST_VIDEO_PATH, model, scaler, TIME_STEPS, INFERENCE_FREQUENCY)
