@@ -10,15 +10,16 @@ from sklearn.preprocessing import MinMaxScaler
 import pickle
 from tqdm import tqdm  # 新增 tqdm 進度條功能
 import random
+import matplotlib.pyplot as plt
 
 # === 配置區 ===
 NORMAL_FOLDER = 'medias/train_video/normal'
 FALL_FOLDER = 'medias/train_video/fall'
 OUTPUT_NORMAL_FOLDER = 'outputs/skeletons/N01/normal'
 OUTPUT_FALL_FOLDER = 'outputs/skeletons/N01/fall'
-MODEL_SAVE_PATH = 'outputs/models/lstm_fall_detection_model_N01.h5'
-SCALER_SAVE_PATH = 'outputs/models/scaler_N01.pkl'
-TEST_VIDEO_PATH = 'medias/test/IMG_8048.mp4'
+MODEL_SAVE_PATH = 'outputs/models/cnn_lstm_fall_detection_model_N01_1.h5'
+SCALER_SAVE_PATH = 'outputs/models/scaler_N01_1.pkl'
+TEST_VIDEO_PATH = 'medias/test/IMG_8049.mp4'
 
 REGENERATE_SKELETON = False  # 是否重新生成骨架數據
 TIME_STEPS = 60  # 推論所需的幀數
@@ -273,10 +274,17 @@ def display_video_with_skeleton_and_fall_detection(video_path, model, scaler, ti
             normalized_skeleton_data = normalize_skeleton_data(recent_skeleton_data, scaler, time_steps)
             fall_probability = predict_fall(normalized_skeleton_data, model, scaler)
 
-            fall_probability_text = f"Fall Probability: {fall_probability:.2f}"
-            cv2.putText(frame, fall_probability_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            if fall_probability > 0.5:
+            # 根據 fall_probability 判斷顯示的文字
+            if fall_probability > 0.6:
+                fall_probability_text = f"Fall Detected: {fall_probability:.2f}"
+                cv2.putText(frame, fall_probability_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 cv2.putText(frame, 'Warning: Fall Detected!', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+            elif fall_probability < 0.4:
+                fall_probability_text = f"Normal: {fall_probability:.2f}"
+                cv2.putText(frame, fall_probability_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                fall_probability_text = f"Uncertain / Unknown: {fall_probability:.2f}"
+                cv2.putText(frame, fall_probability_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
 
         cv2.imshow('Fall Detection', frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -287,6 +295,41 @@ def display_video_with_skeleton_and_fall_detection(video_path, model, scaler, ti
     cap.release()
     cv2.destroyAllWindows()
     pose.close()
+
+def visualize_score_distribution(y_true, y_scores):
+    """
+    視覺化二元分類模型的分數分佈圖。
+    
+    :param y_true: list or array, 真實標籤 (0: Normal, 1: Fall)
+    :param y_scores: list or array, 模型預測分數 (sigmoid 輸出)
+    """
+    # 分離分數到兩個列表
+    fall_scores = [score for score, label in zip(y_scores, y_true) if label == 1]
+    normal_scores = [score for score, label in zip(y_scores, y_true) if label == 0]
+
+    # 測試用繪圖 (檢查繪圖是否正常)
+    plt.figure()
+    plt.plot(np.random.normal(size=100), label="Test Plot")
+    plt.legend()
+    plt.show()
+
+    # 繪製分數分佈圖
+    plt.figure(figsize=(10, 6))
+    plt.hist(normal_scores, bins=20, alpha=0.7, label='Normal (label=0)', color='green')
+    plt.hist(fall_scores, bins=20, alpha=0.7, label='Fall (label=1)', color='red')
+
+    # 添加閾值線
+    plt.axvline(x=0.4, color='blue', linestyle='--', label='Threshold: 0.4')
+    plt.axvline(x=0.6, color='orange', linestyle='--', label='Threshold: 0.6')
+
+    # 添加圖例、標籤和標題
+    plt.legend(loc='upper center')
+    plt.xlabel('Prediction Score')
+    plt.ylabel('Frequency')
+    plt.title('Score Distribution of Fall and Normal Classes')
+
+    # 顯示圖表
+    plt.show()
 
 if __name__ == '__main__':
     if REGENERATE_SKELETON:
@@ -320,5 +363,13 @@ if __name__ == '__main__':
     model = models.load_model(MODEL_SAVE_PATH)
     with open(SCALER_SAVE_PATH, 'rb') as f:
         scaler = pickle.load(f)
+
+    # 測試用隨機數據
+    np.random.seed(42)
+    y_true_test = np.random.choice([0, 1], size=100, p=[0.7, 0.3])  # 70% Normal, 30% Fall
+    y_scores_test = np.random.uniform(0, 1, size=100)  # 隨機分數在 [0, 1] 範圍內
+
+    # 呼叫 visualize_score_distribution 函數
+    visualize_score_distribution(y_true_test, y_scores_test)
 
     display_video_with_skeleton_and_fall_detection(TEST_VIDEO_PATH, model, scaler, TIME_STEPS, INFERENCE_FREQUENCY)
