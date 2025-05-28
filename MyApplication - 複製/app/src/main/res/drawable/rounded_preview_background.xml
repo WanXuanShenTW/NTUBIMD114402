@@ -1,0 +1,6 @@
+<!-- res/drawable/rounded_preview_background.xml -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+    <solid android:color="#000000" /> <!-- 可以改為透明色：#00000000 -->
+    <corners android:radius="20dp" />
+</shape>

@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.core.widget.NestedScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true"
+    android:background="#F5F5F5">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <!--返回列-->
+        <LinearLayout
+            android:id="@+id/btnBackToMain"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingTop="16dp"
+            android:paddingBottom="8dp">
+
+            <ImageView
+                android:layout_width="50dp"
+                android:layout_height="50dp"
+                android:src="@drawable/ic_arrow_back"
+                android:contentDescription="返回" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="主選單"
+                android:textSize="20sp"
+                android:layout_marginStart="8dp"/>
+        </LinearLayout>
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#E0E0E0" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="― 查詢歷史影像 ―"
+            android:textSize="20sp"
+            android:layout_marginTop="20dp"
+            android:layout_marginBottom="5dp"
+            android:textColor="#333333"
+            android:layout_gravity="center_horizontal" />
+
+        <!--使用者 ID 區-->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="使用者 ID"
+            android:textSize="17sp"
+            android:layout_marginTop="20dp"
+            android:layout_marginStart="8dp"/>
+
+        <EditText
+            android:id="@+id/editUserId"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="使用者代號"
+            android:background="@drawable/edittext_rounded_bg"
+            android:inputType="number"
+            android:padding="12dp"
+            android:layout_marginTop="4dp"/>
+
+        <!--日期-->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="輸入日期區間"
+            android:textSize="17sp"
+            android:layout_marginTop="24dp"
+            android:layout_marginStart="8dp"/>
+
+        <!-- 開始日期 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="開始日期"
+            android:textSize="17sp"
+            android:layout_marginTop="16dp"
+            android:layout_marginStart="8dp" />
+
+        <EditText
+            android:id="@+id/editStartDate"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="YYYY-MM-DD"
+            android:background="@drawable/edittext_rounded_bg"
+            android:padding="12dp"
+            android:focusable="false"
+            android:layout_marginTop="4dp"/>
+
+        <!-- 結束日期 -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="結束日期"
+            android:textSize="17sp"
+            android:layout_marginTop="16dp"
+            android:layout_marginStart="8dp"/>
+
+        <EditText
+            android:id="@+id/editEndDate"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:hint="YYYY-MM-DD"
+            android:background="@drawable/edittext_rounded_bg"
+            android:padding="12dp"
+            android:focusable="false"
+            android:layout_marginTop="4dp"/>
+
+        <!-- 送出按鈕 -->
+        <androidx.appcompat.widget.AppCompatButton
+            android:id="@+id/btnSearch"
+            android:layout_width="200dp"
+            android:layout_height="wrap_content"
+            android:text="送出"
+            android:background="@drawable/button_rounded_black"
+            android:textColor="#FFFFFF"
+            android:textSize="17sp"
+            android:elevation="0dp"
+            android:layout_marginTop="30dp"
+            android:layout_gravity="center_horizontal"
+            android:gravity="center"/>
+
+        <!--顯示影片列表 -->
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:nestedScrollingEnabled="false"
+            android:layout_marginTop="16dp"
+            android:padding="8dp" />
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>
