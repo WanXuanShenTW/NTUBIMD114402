@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import mediapipe as mp
+from scipy.interpolate import interp1d
 
 # 初始化 MediaPipe Pose（可考慮根據需要調整其他參數）
 mp_pose = mp.solutions.pose
@@ -64,3 +65,17 @@ def normalize_skeleton_data(skeleton_data, scaler, time_steps=120):
     flat = combo.reshape(1, -1)
     scaled = scaler.transform(flat)
     return scaled.reshape(1, time_steps, 132)
+
+def interpolate_skeleton_data(skeleton_data, target_length):
+    """
+    將 skeleton_data 從原始長度插值到指定長度（線性補幀）
+    """
+    if len(skeleton_data) >= target_length:
+        return skeleton_data
+
+    original_indices = np.arange(len(skeleton_data))
+    target_indices = np.linspace(0, len(skeleton_data) - 1, target_length)
+    skeleton_np = np.array(skeleton_data)  # shape: (T, 33, 3)
+    interpolator = interp1d(original_indices, skeleton_np, axis=0, kind='linear', fill_value='extrapolate')
+    interpolated = interpolator(target_indices)
+    return interpolated.tolist()
