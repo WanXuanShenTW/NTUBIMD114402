@@ -20,6 +20,7 @@ import com.example.myapplication.adapter.VideoEventAdapter
 import retrofit2.*
 import java.util.*
 
+@androidx.media3.common.util.UnstableApi
 class VideoListActivity : AppCompatActivity() {
 
     private lateinit var recyclerView: RecyclerView
@@ -34,11 +35,21 @@ class VideoListActivity : AppCompatActivity() {
     private var userId: Int = -1
     private var isDataLoaded = false
 
+    companion object {
+        var cachedEvents: MutableList<VideoEvent>? = null
+        var lastStartDate: String? = null
+        var lastEndDate: String? = null
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_video_list)
 
         findViewById<LinearLayout>(R.id.btnBackToMain).setOnClickListener {
+            // 清空快取，返回主頁
+            cachedEvents = null
+            lastStartDate = null
+            lastEndDate = null
             startActivity(Intent(this, DashboardActivity::class.java))
             finish()
         }
@@ -57,9 +68,9 @@ class VideoListActivity : AppCompatActivity() {
         adapter = VideoEventAdapter(
             mutableListOf(),
             onItemClick = { event ->
-                val videoUrl = "https://c8fd-60-250-79-110.ngrok-free.app/fall_video_file?record_id=${event.record_id}"
+                val videoUrl = "${ApiConfig.BASE_URL}fall_video_file?record_id=${event.record_id}"
                 val intent = Intent(this, VideoPlayerActivity::class.java).apply {
-                    putExtra("record_id", event.record_id) // 🔥 加這行！
+                    putExtra("record_id", event.record_id)
                     putExtra("video_url", videoUrl)
                     putExtra("video_filename", event.video_filename)
                 }
@@ -101,12 +112,34 @@ class VideoListActivity : AppCompatActivity() {
         editStartDate.setOnClickListener { showDatePicker { editStartDate.setText(it) } }
         editEndDate.setOnClickListener { showDatePicker { editEndDate.setText(it) } }
 
+        // 如果已有快取，就直接顯示
+        if (cachedEvents != null) {
+            Log.d("VideoList", "使用快取的事件資料：${cachedEvents!!.size} 筆")
+            adapter.updateData(cachedEvents!!)
+            isDataLoaded = true
+            recyclerView.visibility = View.VISIBLE
+            loadingProgress.visibility = View.GONE
+            editStartDate.setText(lastStartDate ?: "")
+            editEndDate.setText(lastEndDate ?: "")
+            return
+        }
+
+        // 沒有快取時，設定預設結束日期為今天
+        val today = Calendar.getInstance()
+        val todayStr = String.format(
+            "%04d-%02d-%02d",
+            today.get(Calendar.YEAR),
+            today.get(Calendar.MONTH) + 1,
+            today.get(Calendar.DAY_OF_MONTH)
+        )
+        editEndDate.setText(todayStr)
+
         btnSearch.setOnClickListener {
             val startDate = editStartDate.text.toString()
             val endDate = editEndDate.text.toString()
 
             if (startDate.isBlank() || endDate.isBlank()) {
-                Toast.makeText(this, "請選擇起訖日期", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "請選擇開始與結束日期", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
 
@@ -127,27 +160,23 @@ class VideoListActivity : AppCompatActivity() {
                             Log.d("VideoList", "取得事件數量：${events.size}")
                             adapter.updateData(events)
                             isDataLoaded = true
+
+                            // 快取資料
+                            cachedEvents = events
+                            lastStartDate = startDate
+                            lastEndDate = endDate
                         } else {
-                            Toast.makeText(this@VideoListActivity, "查詢失敗 (${response.code()})，請稍後再試或確認伺服器是否開啟", Toast.LENGTH_LONG).show()
+                            Toast.makeText(this@VideoListActivity, "查詢失敗 (${response.code()})", Toast.LENGTH_LONG).show()
                         }
                     }
 
                     override fun onFailure(call: Call<List<VideoEvent>>, t: Throwable) {
                         loadingProgress.visibility = View.GONE
                         recyclerView.visibility = View.VISIBLE
-                        Toast.makeText(this@VideoListActivity, "連線失敗：${t.message}，請確認網路或伺服器狀態", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@VideoListActivity, "連線失敗：${t.message}", Toast.LENGTH_LONG).show()
                     }
                 })
         }
-
-        val today = Calendar.getInstance()
-        val todayStr = String.format("%04d-%02d-%02d",
-            today.get(Calendar.YEAR),
-            today.get(Calendar.MONTH) + 1,
-            today.get(Calendar.DAY_OF_MONTH))
-        editStartDate.setText(todayStr)
-        editEndDate.setText(todayStr)
-        btnSearch.performClick()
     }
 
     private fun addToFavorite(event: VideoEvent) {
