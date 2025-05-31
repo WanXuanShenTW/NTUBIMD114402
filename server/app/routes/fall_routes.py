@@ -173,12 +173,11 @@ def detect_fall_video():
     global user_temp_videos_path, user_processing_files, user_skeleton_buffers, user_can_save, user_is_falling, user_falling_end 
 
     #確認使用者 ID 與影片檔案是否存在
-    data = request.form
-    user_id = data.get("id")
+    user_id = request.form.get("id")
     if not user_id:
         return jsonify({"error": "缺少使用者 ID"}), 400
 
-    video_file = data.get("video")
+    video_file = request.files.get("video")
     if not video_file:
         return jsonify({"error": "未接收到影片檔案"}), 400
 
