@@ -1,4 +1,5 @@
 from ..dao.fall_event_dao import insert_fall_event, fetch_fall_events_by_user_and_time_range, get_fall_event_video_filename_by_id
+from ..dao.video_watchlist_dao import is_video_in_watchlist
 from ..db import get_connection
 
 def save_fall_video_path_with_video(
@@ -21,11 +22,20 @@ def save_fall_video_path_with_video(
         if record_id is None:
             raise RuntimeError("資料庫紀錄跌倒影像資料失敗")
         return record_id
-    
-def list_fall_video_data_from_reange(user_id: int, start=None, end=None, limit=5):
-    with get_connection() as conn:
-        return fetch_fall_events_by_user_and_time_range(conn, user_id, start, end, limit)
 
 def get_video_filename_with_id(record_id: int) -> str:
     with get_connection() as conn:
         return get_fall_event_video_filename_by_id(conn, record_id)
+    
+def list_fall_video_data_from_reange(user_id: int, start=None, end=None, limit=5):
+    """
+    取得跌倒影片資料，並標記每筆是否在該使用者的觀看清單。
+    """
+    with get_connection() as conn:
+        results = fetch_fall_events_by_user_and_time_range(conn, user_id, start, end, limit)
+        for row in results:
+            record_id = row.get("record_id")
+            row["in_watchlist"] = is_video_in_watchlist(conn, user_id, record_id)
+        return results
+
+

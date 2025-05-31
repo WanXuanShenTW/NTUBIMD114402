@@ -10,6 +10,7 @@ from flask import Blueprint, request, jsonify, send_file
 from ..fall_model import load_fall_model
 from ..utils import extract_skeleton_points, normalize_skeleton_data, interpolate_skeleton_data
 from ..db import get_connection
+from ..service.fall_video_service import list_fall_video_data_from_reange, get_video_filename_with_id
 
 fall_bp = Blueprint("fall_bp", __name__)
 
@@ -40,7 +41,7 @@ BUFFER_UPDATE_SIZE = 30
 SERVER_MAX_FPS = 60             # 伺服器最大處理 FPS
 
 FALL_THRESHOLD_UPPER = 0.7      # 預測值大於此為跌倒
-FALL_THRESHOLD_LOWER = 0.3      # 預測值小於此為非跌倒
+FALL_THRESHOLD_LOWER = 0.5      # 預測值小於此為非跌倒
 
 PRE_FALL_COUNTS = 4             # 前置影片筆數
 POST_FALL_COUNTS = 2            # 跌倒後影片筆數
@@ -172,11 +173,12 @@ def detect_fall_video():
     global user_temp_videos_path, user_processing_files, user_skeleton_buffers, user_can_save, user_is_falling, user_falling_end 
 
     #確認使用者 ID 與影片檔案是否存在
-    user_id = request.form.get("id")
+    data = request.form
+    user_id = data.get("id")
     if not user_id:
         return jsonify({"error": "缺少使用者 ID"}), 400
 
-    video_file = request.files.get("video")
+    video_file = data.get("video")
     if not video_file:
         return jsonify({"error": "未接收到影片檔案"}), 400
 
@@ -353,48 +355,13 @@ def get_merged_fall_videos():
             start = None
     except Exception:
         return jsonify({"error": "日期格式錯誤，請用 yyyy-mm-dd"}), 400
-
-    # 使用指定 schema 查詢
-    query = """
-        SELECT record_id, user_id, detected_time, location, pose_before_fall, video_filename
-        FROM `114-402`.fall_events
-        WHERE user_id = %s AND video_filename IS NOT NULL
-    """
-    values = [user_id]
-    if start and end:
-        query += " AND detected_time BETWEEN %s AND %s"
-        values.extend([start, end])
-    elif start:
-        query += " AND detected_time >= %s"
-        values.append(start)
-    elif end:
-        query += " AND detected_time <= %s"
-        values.append(end)
-    query += f" ORDER BY detected_time DESC LIMIT {limit}"
-
-    # 查詢資料庫
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(query, tuple(values))
-    rows = cursor.fetchall()
-    cursor.close()
-    conn.close()
-
-    if not rows:
-        return jsonify([])
-
-    # 回傳 JSON
-    result = []
-    for row in rows:
-        result.append({
-            "record_id": row[0],
-            "user_id": row[1],
-            "detected_time": row[2].strftime("%Y-%m-%d %H:%M:%S"),
-            "location": row[3],
-            "pose_before_fall": row[4],
-            "video_filename": row[5]
-        })
-    return jsonify(result)
+       
+    data = list_fall_video_data_from_reange(user_id, start, end, limit)
+    # 統一格式
+    for row in data:
+        if isinstance(row["detected_time"], datetime.datetime):
+            row["detected_time"] = row["detected_time"].strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(data)
 
 @fall_bp.route("/fall_video_file", methods=["GET"])
 def get_merged_fall_video_file():
@@ -402,27 +369,16 @@ def get_merged_fall_video_file():
     if not record_id:
         return jsonify({"error": "缺少 record_id 參數"}), 400
 
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT video_filename FROM `114-402`.fall_events WHERE record_id = %s AND video_filename IS NOT NULL",
-        (record_id,)
-    )
-    row = cursor.fetchone()
-    cursor.close()
-    conn.close()
-
-    if not row or not row[0]:
+    video_filename = get_video_filename_with_id(record_id)
+    if not video_filename:
         return jsonify({"error": "找不到影片"}), 404
 
-    video_filename = row[0]
     video_path = os.path.join(VIDEOS_DIR, video_filename)
     if not os.path.exists(video_path):
         return jsonify({"error": "影片檔案不存在於伺服器"}), 404
 
-    # ✅ 用 send_file 傳送絕對路徑
     return send_file(
-        os.path.abspath(video_path),  # 這裡轉成絕對路徑最保險
+        os.path.abspath(video_path),
         as_attachment=True,
         mimetype="video/mp4"
     )
