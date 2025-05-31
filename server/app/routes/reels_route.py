@@ -29,7 +29,7 @@ def speak_latest_post():
             gpt_response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[
-                    {"role": "system", "content": "請將這段社群貼文改寫成適合語音播放的親切說話語氣，不需太正式："},
+                    {"role": "system", "content": "請將這段社群貼文用繁體中文讀出來。"},
                     {"role": "user", "content": content}
                 ]
             )
@@ -40,7 +40,7 @@ def speak_latest_post():
         tts_response = client.audio.speech.create(
             model="tts-1",
             voice="nova",  
-            input=spoken_text
+            input=spoken_text,
         )
 
         audio_data = tts_response.read()

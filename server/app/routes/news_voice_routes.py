@@ -28,6 +28,7 @@ def generate_news_audio():
             voice="nova",
             input=summary,
             instructions="請用溫暖親切的語氣唸出今日新聞摘要。",
+            speed=0.8
         ) as response:
             response.stream_to_file(speech_file_path)
 

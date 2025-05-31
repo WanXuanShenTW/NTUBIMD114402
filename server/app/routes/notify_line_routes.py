@@ -41,7 +41,7 @@ def notify_line():
 
         message = f"""⚠️ 注意！偵測到跌倒事件 ⚠️
                     時間：{detected_time}
-                    請立即檢查爺爺奶奶們的狀況，確保他們安全無恙。"""
+                    請立即檢查爺爺奶奶的狀況，確保他們安全無恙。"""
         
         conn = get_connection()
         cursor = conn.cursor()
