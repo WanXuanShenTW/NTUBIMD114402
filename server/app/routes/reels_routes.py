@@ -6,13 +6,14 @@ from pathlib import Path
 from datetime import datetime
 
 reels_bp = Blueprint("reels_bp", __name__)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 AUDIO_DIR = Path(__file__).resolve().parent.parent.parent / "static/reels_audio"
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 @reels_bp.route('/speak_latest_post', methods=['GET'])
 def speak_latest_post():
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     try:
         conn = get_connection()
         cursor = conn.cursor()

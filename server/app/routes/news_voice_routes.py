@@ -10,10 +10,9 @@ news_voice_bp = Blueprint('news_voice', __name__)
 VOICE_OUTPUT_DIR = Path(__file__).resolve().parent.parent.parent / 'static/news_audio'
 VOICE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
 @news_voice_bp.route('/generate_news_audio', methods=['POST'])
 def generate_news_audio():
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     try:
         today_str = datetime.today().strftime("%Y%m%d")
         speech_file_path = VOICE_OUTPUT_DIR / f"news_{today_str}.mp3"

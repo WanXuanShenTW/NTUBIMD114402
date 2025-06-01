@@ -1,21 +1,19 @@
 import os
-import datetime
-import tempfile
 import shutil
-import requests
-import numpy as np
+import tempfile
+import datetime
 import cv2
 from flask import Blueprint, request, jsonify, send_file
-
-from .notify_line_routes import notify_line
+import requests
 from ..fall_model import load_fall_model
 from ..utils import extract_skeleton_points, normalize_skeleton_data, interpolate_skeleton_data
 from ..db import get_connection
-from ..service.fall_video_service import save_fall_video_path_with_video, list_fall_video_data_from_reange, get_video_filename_with_id
+from ..routes import notify_line_routes
+from ..service.fall_video_service import list_fall_video_data_from_reange, get_video_filename_with_id, save_fall_video_path_with_video
 
 fall_bp = Blueprint("fall_bp", __name__)
 
-GAS_URL = "https://d0dd-150-116-202-175.ngrok-free.app/notify_line"
+GAS_URL="https://0a53-150-116-202-175.ngrok-free.app/notify_line"
 
 TEMP_VIDEO_DIR = "sources/tmp"
 VIDEOS_DIR = "sources/fall_videos"
@@ -29,7 +27,7 @@ def clear_temp_directory():
 # 在應用程式啟動時清空暫存區
 clear_temp_directory()
 
-model, scaler = load_fall_model()
+model, scaler = load_fall_model()  # 載入跌倒偵測模型與標準化器
 
 # 使用 temp 檔案儲存影片段
 user_temp_videos_path = {}            # 用於儲存跌倒前的影片檔 (pre-fall)
@@ -44,7 +42,7 @@ BUFFER_UPDATE_SIZE = 30
 SERVER_MAX_FPS = 60             # 伺服器最大處理 FPS
 
 FALL_THRESHOLD_UPPER = 0.7      # 預測值大於此為跌倒
-FALL_THRESHOLD_LOWER = 0.3      # 預測值小於此為非跌倒
+FALL_THRESHOLD_LOWER = 0.5      # 預測值小於此為非跌倒
 
 PRE_FALL_COUNTS = 4             # 前置影片筆數
 POST_FALL_COUNTS = 2            # 跌倒後影片筆數
@@ -64,6 +62,41 @@ def save_video(user_id, frames):
         out.write(frame)
     out.release()
     return video_filename
+
+def save_to_db(user_id, location, pose_before_fall, video_filename):
+    """
+    儲存跌倒事件資訊到資料庫。
+
+    :param user_id: 使用者 ID
+    :param location: 跌倒事件發生的位置
+    :param pose_before_fall: 跌倒前的姿勢
+    :param video_filename: 儲存的影片檔案名稱
+    :param result: 跌倒事件的結果（fall 或 non_fall）
+    """
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        query = """
+                INSERT INTO fall_events (user_id, detected_time, location, pose_before_fall, video_filename)
+                VALUES (%s, %s, %s, %s, %s)
+                """
+        values = (user_id, datetime.datetime.now(), location, pose_before_fall, video_filename)
+        cursor.execute(query, values)
+        conn.commit()
+
+        # 獲取自動生成的 record_id
+        record_id = cursor.lastrowid
+        print(f"[INFO] DB 儲存成功:\n"
+              f"record_id={record_id}\n"
+              f"user_id={user_id}\n"
+              f"location={location}\n"
+              f"pose_before_fall={pose_before_fall}\n"
+              f"video_filename={video_filename}")
+        
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"[ERROR] DB 儲存失敗: {e}")
 
 def get_frames_in_file(file_path):
     cap = cv2.VideoCapture(file_path)
@@ -199,13 +232,20 @@ def detect_fall_video():
         print(f"[INFO] User {user_id}: Total accumulated skeleton frames = {total_frames}")
 
         if total_frames > SMALL_BUFFER_SIZE:
-            # 先做線性插值補幀
-            skeleton_for_pred = interpolate_skeleton_data(
-                user_skeleton_buffers[user_id], SMALL_BUFFER_SIZE
-            )
-            norm_data = normalize_skeleton_data(
-                skeleton_for_pred, scaler, time_steps=SMALL_BUFFER_SIZE
-            )
+            # 根據 fps 決定是否做線性補幀
+            if video_fps <= 30:
+                # 做線性插值補幀
+                skeleton_for_pred = interpolate_skeleton_data(
+                    user_skeleton_buffers[user_id], SMALL_BUFFER_SIZE
+                )
+                norm_data = normalize_skeleton_data(
+                    skeleton_for_pred, scaler, time_steps=SMALL_BUFFER_SIZE
+                )
+            else:
+                # 不做線性補幀
+                norm_data = normalize_skeleton_data(
+                    user_skeleton_buffers[user_id], scaler, time_steps=SMALL_BUFFER_SIZE
+                )
             all_pred = model.predict(norm_data)
             print(f"[DEBUG] User {user_id}: Prediction result = {all_pred}")
             pred = all_pred[0][0]
@@ -223,7 +263,6 @@ def detect_fall_video():
                         print(f"[INFO] 已通知 GAS，回應: {response.status_code} {response.text}")
                     except Exception as e:
                         print(f"[ERROR] 通知 GAS 失敗: {e}")
-                    
 
                 if not user_is_falling[user_id]:
                     user_processing_files[user_id] = user_temp_videos_path[user_id].copy()
@@ -239,6 +278,7 @@ def detect_fall_video():
                     # 清空兩個暫存區
                     user_processing_files[user_id] = []
                     user_temp_videos_path[user_id] = []
+                    user_skeleton_buffers[user_id] = []
 
                     save_fall_video_path_with_video(
                         user_id=user_id,
@@ -257,14 +297,16 @@ def detect_fall_video():
                     merged_video_path = os.path.join(VIDEOS_DIR, f"{user_id}_merged_fall_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}.mp4")
                     merge_videos(user_processing_files[user_id], merged_video_path)
                     print(f"[INFO] User {user_id}: 合併影片已儲存至 {merged_video_path}")
-                    save_fall_video_path_with_video(
+                    save_to_db(
                         user_id=user_id,
                         location="客廳",
                         pose_before_fall="走路中",
                         video_filename=os.path.basename(merged_video_path),
+                        result="fall"
                     )
                     user_processing_files[user_id] = []
                     user_temp_videos_path[user_id] = []
+                    user_skeleton_buffers[user_id] = []
                     user_is_falling[user_id] = False
                     user_falling_end[user_id] = True
 
@@ -275,7 +317,10 @@ def detect_fall_video():
 
             # 清除舊的骨架資料
             user_skeleton_buffers[user_id] = user_skeleton_buffers[user_id][BUFFER_UPDATE_SIZE:]
-
+        else:
+            prediction_result = "Insufficient data"
+            return jsonify({"result": prediction_result})
+        
         # 將本次影片加入暫存區
         user_temp_videos_path[user_id].append(video_path)
 
@@ -327,23 +372,13 @@ def get_merged_fall_videos():
             start = None
     except Exception:
         return jsonify({"error": "日期格式錯誤，請用 yyyy-mm-dd"}), 400
-
-    # 改為呼叫 service 層
-    rows = list_fall_video_data_from_reange(user_id, start, end, limit)
-    if not rows:
-        return jsonify([])
-
-    result = []
-    for row in rows:
-        result.append({
-            "record_id": row["record_id"],
-            "user_id": row["user_id"],
-            "detected_time": row["detected_time"].strftime("%Y-%m-%d %H:%M:%S"),
-            "location": row["location"],
-            "pose_before_fall": row["pose_before_fall"],
-            "video_filename": row["video_filename"]
-        })
-    return jsonify(result)
+       
+    data = list_fall_video_data_from_reange(user_id, start, end, limit)
+    # 統一格式
+    for row in data:
+        if isinstance(row["detected_time"], datetime.datetime):
+            row["detected_time"] = row["detected_time"].strftime("%Y-%m-%d %H:%M:%S")
+    return jsonify(data)
 
 @fall_bp.route("/fall_video_file", methods=["GET"])
 def get_merged_fall_video_file():
@@ -351,7 +386,6 @@ def get_merged_fall_video_file():
     if not record_id:
         return jsonify({"error": "缺少 record_id 參數"}), 400
 
-    # 改為呼叫 service 層
     video_filename = get_video_filename_with_id(record_id)
     if not video_filename:
         return jsonify({"error": "找不到影片"}), 404
