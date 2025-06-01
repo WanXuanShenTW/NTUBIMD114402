@@ -66,16 +66,45 @@ def normalize_skeleton_data(skeleton_data, scaler, time_steps=120):
     scaled = scaler.transform(flat)
     return scaled.reshape(1, time_steps, 132)
 
+def kalman_filter_1d(data, process_variance=1e-5, measurement_variance=1e-2):
+    """
+    對一維資料進行 Kalman 濾波。
+    """
+    n = len(data)
+    x = data[0]
+    P = 1.0
+    Q = process_variance
+    R = measurement_variance
+    result = [x]
+    for i in range(1, n):
+        # 預測
+        x = x
+        P = P + Q
+        # 更新
+        K = P / (P + R)
+        x = x + K * (data[i] - x)
+        P = (1 - K) * P
+        result.append(x)
+    return result
+
 def interpolate_skeleton_data(skeleton_data, target_length):
     """
-    將 skeleton_data 從原始長度插值到指定長度（線性補幀）
+    使用 Kalman 濾波器平滑骨架資料，並補足到 target_length。
     """
-    if len(skeleton_data) >= target_length:
-        return skeleton_data
-
-    original_indices = np.arange(len(skeleton_data))
-    target_indices = np.linspace(0, len(skeleton_data) - 1, target_length)
     skeleton_np = np.array(skeleton_data)  # shape: (T, 33, 3)
-    interpolator = interp1d(original_indices, skeleton_np, axis=0, kind='linear', fill_value='extrapolate')
-    interpolated = interpolator(target_indices)
-    return interpolated.tolist()
+    T, J, D = skeleton_np.shape  # T: 幀數, J: 關節數, D: 維度(x, y, v)
+
+    # 對每個關節的每個維度做 Kalman 濾波
+    filtered = np.zeros_like(skeleton_np)
+    for j in range(J):
+        for d in range(D):
+            filtered[:, j, d] = kalman_filter_1d(skeleton_np[:, j, d])
+
+    # 若不足 target_length，則重複最後一幀補齊
+    if T < target_length:
+        pad = np.tile(filtered[-1:], (target_length - T, 1, 1))
+        filtered = np.concatenate([filtered, pad], axis=0)
+    elif T > target_length:
+        filtered = filtered[-target_length:]
+
+    return filtered.tolist()

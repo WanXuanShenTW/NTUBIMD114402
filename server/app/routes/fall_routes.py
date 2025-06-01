@@ -1,16 +1,14 @@
-import math
 import os
 import shutil
 import tempfile
 import datetime
-import threading
 import cv2
-import numpy as np
 from flask import Blueprint, request, jsonify, send_file
+
 from ..fall_model import load_fall_model
 from ..utils import extract_skeleton_points, normalize_skeleton_data, interpolate_skeleton_data
 from ..db import get_connection
-from ..service.fall_video_service import list_fall_video_data_from_reange, get_video_filename_with_id
+from ..service.fall_video_service import list_fall_video_data_from_reange, get_video_filename_with_id, save_fall_video_path_with_video
 
 fall_bp = Blueprint("fall_bp", __name__)
 
@@ -231,16 +229,20 @@ def detect_fall_video():
         print(f"[INFO] User {user_id}: Total accumulated skeleton frames = {total_frames}")
 
         if total_frames > SMALL_BUFFER_SIZE:
-            # 先做線性插值補幀
-            # skeleton_for_pred = interpolate_skeleton_data(
-            #     user_skeleton_buffers[user_id], SMALL_BUFFER_SIZE
-            # )
-            # norm_data = normalize_skeleton_data(
-            #     skeleton_for_pred, scaler, time_steps=SMALL_BUFFER_SIZE
-            # )
-            norm_data = normalize_skeleton_data(
-                user_skeleton_buffers[user_id], scaler, time_steps=SMALL_BUFFER_SIZE
-            )
+            # 根據 fps 決定是否做線性補幀
+            if video_fps <= 30:
+                # 做線性插值補幀
+                skeleton_for_pred = interpolate_skeleton_data(
+                    user_skeleton_buffers[user_id], SMALL_BUFFER_SIZE
+                )
+                norm_data = normalize_skeleton_data(
+                    skeleton_for_pred, scaler, time_steps=SMALL_BUFFER_SIZE
+                )
+            else:
+                # 不做線性補幀
+                norm_data = normalize_skeleton_data(
+                    user_skeleton_buffers[user_id], scaler, time_steps=SMALL_BUFFER_SIZE
+                )
             all_pred = model.predict(norm_data)
             print(f"[DEBUG] User {user_id}: Prediction result = {all_pred}")
             pred = all_pred[0][0]
@@ -264,13 +266,13 @@ def detect_fall_video():
                     # 清空兩個暫存區
                     user_processing_files[user_id] = []
                     user_temp_videos_path[user_id] = []
+                    user_skeleton_buffers[user_id] = []
 
-                    save_to_db(
+                    save_fall_video_path_with_video(
                         user_id=user_id,
                         location="客廳",
                         pose_before_fall="走路中",
                         video_filename=os.path.basename(merged_video_path),
-                        result="fall"
                     )
                     user_is_falling[user_id] = False
                     user_falling_end[user_id] = True
@@ -292,6 +294,7 @@ def detect_fall_video():
                     )
                     user_processing_files[user_id] = []
                     user_temp_videos_path[user_id] = []
+                    user_skeleton_buffers[user_id] = []
                     user_is_falling[user_id] = False
                     user_falling_end[user_id] = True
 
@@ -302,7 +305,10 @@ def detect_fall_video():
 
             # 清除舊的骨架資料
             user_skeleton_buffers[user_id] = user_skeleton_buffers[user_id][BUFFER_UPDATE_SIZE:]
-
+        else:
+            prediction_result = "Insufficient data"
+            return jsonify({"result": prediction_result})
+        
         # 將本次影片加入暫存區
         user_temp_videos_path[user_id].append(video_path)
 
