@@ -3,8 +3,8 @@ import pickle
 from tensorflow import keras
 
 # 模型與 Scaler 的路徑
-MODEL_PATH = "models/fall_detection_modelN01.keras"
-SCALER_PATH = "models/scaler.pkl"
+MODEL_PATH = "models/cnn_lstm_fall_detection_model.h5"
+SCALER_PATH = "models/cnn_scaler.pkl"
 
 # 載入模型與 Scaler
 def load_fall_model():
