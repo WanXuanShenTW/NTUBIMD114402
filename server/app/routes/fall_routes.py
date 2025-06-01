@@ -4,13 +4,17 @@ import tempfile
 import datetime
 import cv2
 from flask import Blueprint, request, jsonify, send_file
+import requests
 
 from ..fall_model import load_fall_model
 from ..utils import extract_skeleton_points, normalize_skeleton_data, interpolate_skeleton_data
 from ..db import get_connection
+from ..routes import notify_line_routes
 from ..service.fall_video_service import list_fall_video_data_from_reange, get_video_filename_with_id, save_fall_video_path_with_video
 
 fall_bp = Blueprint("fall_bp", __name__)
+
+GAS_URL="https://0a53-150-116-202-175.ngrok-free.app/notify_line"
 
 TEMP_VIDEO_DIR = "sources/tmp"
 VIDEOS_DIR = "sources/fall_videos"
@@ -251,6 +255,15 @@ def detect_fall_video():
             if pred > FALL_THRESHOLD_UPPER:
                 prediction_result = "fall"
                 print(f"[INFO] User {user_id}: 跌倒事件偵測到。")
+                
+                if prediction_result == "fall":
+                    GAS_URL
+                    payload = {} # 這裡可以根據需要填入 GAS 的 payload 資料
+                    try:
+                        response = requests.post(GAS_URL, json=payload)
+                        print(f"[INFO] 已通知 GAS，回應: {response.status_code} {response.text}")
+                    except Exception as e:
+                        print(f"[ERROR] 通知 GAS 失敗: {e}")
 
                 if not user_is_falling[user_id]:
                     user_processing_files[user_id] = user_temp_videos_path[user_id].copy()
