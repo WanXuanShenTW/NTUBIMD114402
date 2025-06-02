@@ -1,65 +1,80 @@
 <?xml version="1.0" encoding="utf-8"?>
-<androidx.core.widget.NestedScrollView
-    xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="#F5F5F5"
-    android:fillViewport="true">
+    android:background="#F5F5F5">
 
-    <LinearLayout
+    <!-- 主畫面內容 -->
+    <androidx.core.widget.NestedScrollView
         android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical"
-        android:padding="16dp">
+        android:layout_height="match_parent"
+        android:fillViewport="true">
 
-        <!-- 返回列區塊 -->
         <LinearLayout
-            android:id="@+id/btnBackToMain"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:paddingTop="16dp"
-            android:paddingBottom="8dp">
+            android:orientation="vertical"
+            android:padding="16dp">
 
-            <ImageView
-                android:layout_width="50dp"
-                android:layout_height="50dp"
-                android:src="@drawable/ic_arrow_back"
-                android:contentDescription="返回"/>
+            <!-- 返回列區塊 -->
+            <LinearLayout
+                android:id="@+id/btnBackToMain"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingTop="16dp"
+                android:paddingBottom="8dp">
 
+                <ImageView
+                    android:layout_width="50dp"
+                    android:layout_height="50dp"
+                    android:src="@drawable/ic_arrow_back"
+                    android:contentDescription="返回" />
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="主選單"
+                    android:textSize="20sp"
+                    android:layout_marginStart="8dp" />
+            </LinearLayout>
+
+            <!-- 分隔線 -->
+            <View
+                android:layout_width="match_parent"
+                android:layout_height="1dp"
+                android:background="#DDDDDD"
+                android:layout_marginTop="4dp"
+                android:layout_marginBottom="12dp" />
+
+            <!-- 標題 -->
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="主選單"
+                android:text="― 收藏影像 ―"
                 android:textSize="20sp"
-                android:layout_marginStart="8dp"/>
+                android:layout_marginTop="20dp"
+                android:layout_marginBottom="15dp"
+                android:textColor="#333333"
+                android:layout_gravity="center_horizontal" />
+
+            <!-- 影片清單 -->
+            <androidx.recyclerview.widget.RecyclerView
+                android:id="@+id/recyclerFavorite"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:nestedScrollingEnabled="false"
+                android:padding="8dp" />
         </LinearLayout>
+    </androidx.core.widget.NestedScrollView>
 
-        <!-- 分隔線 -->
-        <View
-            android:layout_width="match_parent"
-            android:layout_height="1dp"
-            android:background="#DDDDDD"
-            android:layout_marginTop="4dp"
-            android:layout_marginBottom="12dp" />
-
-        <!-- 標題 -->
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="― 收藏影像 ―"
-            android:textSize="20sp"
-            android:layout_marginBottom="15dp"
-            android:textColor="#333333"
-            android:layout_gravity="center_horizontal" />
-
-        <!-- 影片清單 -->
-        <androidx.recyclerview.widget.RecyclerView
-            android:id="@+id/recyclerFavorite"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:nestedScrollingEnabled="false"
-            android:padding="8dp" />
-    </LinearLayout>
-</androidx.core.widget.NestedScrollView>
+    <!-- 載入圈圈 -->
+    <ProgressBar
+        android:id="@+id/loadingProgress"
+        style="@android:style/Widget.DeviceDefault.Light.ProgressBar.Large"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:visibility="gone" />
+</FrameLayout>
