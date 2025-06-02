@@ -12,7 +12,7 @@ import com.example.myapplication.model.VideoEvent
 class VideoEventAdapter(
     private var videoEvents: MutableList<VideoEvent>,
     private val onItemClick: (VideoEvent) -> Unit,
-    private val onFavoriteClick: (VideoEvent) -> Unit
+    private val onFavoriteClick: (VideoEvent, Int, () -> Unit) -> Unit
 ) : RecyclerView.Adapter<VideoEventAdapter.ViewHolder>() {
 
     inner class ViewHolder(itemView: View) : RecyclerView.ViewHolder(itemView) {
@@ -39,7 +39,7 @@ class VideoEventAdapter(
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val event = videoEvents[position]
-        holder.txtEventType.text = "事件：${event.event_type}"
+        holder.txtEventType.text = "事件：${event.video_type}"   // ← 改這行
         holder.txtEventTime.text = "時間：${event.detected_time}"
         holder.txtVideoName.text = "影片：${event.video_filename}"
 
@@ -51,11 +51,27 @@ class VideoEventAdapter(
         holder.btnFavorite.setImageResource(heartIcon)
 
         holder.btnFavorite.setOnClickListener {
-            onFavoriteClick(event)
+            val pos = holder.bindingAdapterPosition
+            if (pos != RecyclerView.NO_POSITION) {
+                val targetEvent = videoEvents[pos]
+                onFavoriteClick(targetEvent, pos) {
+                    // API 成功後由外部呼叫 done() → 更新愛心狀態
+                    notifyItemChanged(pos)
+                }
+            }
         }
     }
 
     override fun getItemCount() = videoEvents.size
+
+    fun updateFavoriteByRecordId(recordId: Int, isFavorite: Boolean) {
+        videoEvents.forEachIndexed { index, event ->
+            if (event.record_id == recordId) {
+                event.isFavorite = isFavorite
+                notifyItemChanged(index)
+            }
+        }
+    }
 
     fun updateData(newList: List<VideoEvent>) {
         videoEvents = newList.toMutableList()
@@ -65,7 +81,7 @@ class VideoEventAdapter(
     fun getItemPosition(event: VideoEvent): Int {
         return videoEvents.indexOfFirst {
             it.video_filename == event.video_filename &&
-                    it.event_type == event.event_type &&
+                    it.video_type == event.video_type &&
                     it.detected_time == event.detected_time
         }
     }

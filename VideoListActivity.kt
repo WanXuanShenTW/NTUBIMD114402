@@ -20,7 +20,6 @@ import com.example.myapplication.adapter.VideoEventAdapter
 import retrofit2.*
 import java.util.*
 
-@androidx.media3.common.util.UnstableApi
 class VideoListActivity : AppCompatActivity() {
 
     private lateinit var recyclerView: RecyclerView
@@ -30,29 +29,16 @@ class VideoListActivity : AppCompatActivity() {
     private lateinit var editEndDate: EditText
     private lateinit var btnSearch: Button
     private lateinit var loadingProgress: ProgressBar
+    private var isFavoriteActionRunning = false
 
     private val apiService = RetrofitClient.apiService
-    private var userId: Int = -1
+    private var caregiverId: Int = -1
+    private var elderId: Int = -1
     private var isDataLoaded = false
-
-    companion object {
-        var cachedEvents: MutableList<VideoEvent>? = null
-        var lastStartDate: String? = null
-        var lastEndDate: String? = null
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_video_list)
-
-        findViewById<LinearLayout>(R.id.btnBackToMain).setOnClickListener {
-            // 清空快取，返回主頁
-            cachedEvents = null
-            lastStartDate = null
-            lastEndDate = null
-            startActivity(Intent(this, DashboardActivity::class.java))
-            finish()
-        }
 
         recyclerView = findViewById(R.id.recyclerView)
         editUserId = findViewById(R.id.editUserId)
@@ -61,9 +47,15 @@ class VideoListActivity : AppCompatActivity() {
         btnSearch = findViewById(R.id.btnSearch)
         loadingProgress = findViewById(R.id.loadingProgress)
 
-        userId = 529
-        editUserId.setText(userId.toString())
+        caregiverId = 3
+        elderId = 529
+        editUserId.setText(caregiverId.toString())
         editUserId.isEnabled = false
+
+        val btnBack: LinearLayout = findViewById(R.id.btnBackToMain)
+        btnBack.setOnClickListener {
+            finish()
+        }
 
         adapter = VideoEventAdapter(
             mutableListOf(),
@@ -72,22 +64,33 @@ class VideoListActivity : AppCompatActivity() {
                 val intent = Intent(this, VideoPlayerActivity::class.java).apply {
                     putExtra("record_id", event.record_id)
                     putExtra("video_url", videoUrl)
-                    putExtra("video_filename", event.video_filename)
                 }
                 startActivity(intent)
             },
-            onFavoriteClick = { event ->
+            onFavoriteClick = { event, position, done ->
                 if (!isDataLoaded) {
-                    Toast.makeText(this, "資料尚未載入完成，請稍後再試", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "資料尚未載入完成", Toast.LENGTH_SHORT).show()
                     return@VideoEventAdapter
                 }
-                if (event.isFavorite) {
-                    removeFromFavorite(event)
-                } else {
-                    addToFavorite(event)
+
+                if (isFavoriteActionRunning) {
+                    Toast.makeText(this, "正在處理收藏中，請稍後", Toast.LENGTH_SHORT).show()
+                    return@VideoEventAdapter
                 }
-                event.isFavorite = !event.isFavorite
-                adapter.notifyItemChanged(adapter.getItemPosition(event))
+
+                if (event.isFavorite) {
+                    removeFromFavorite(event) {
+                        event.isFavorite = false
+                        adapter.updateFavoriteByRecordId(event.record_id, event.isFavorite)
+                        done()
+                    }
+                } else {
+                    addToFavorite(event) {
+                        event.isFavorite = true
+                        adapter.updateFavoriteByRecordId(event.record_id, event.isFavorite)
+                        done()
+                    }
+                }
             }
         )
 
@@ -112,26 +115,8 @@ class VideoListActivity : AppCompatActivity() {
         editStartDate.setOnClickListener { showDatePicker { editStartDate.setText(it) } }
         editEndDate.setOnClickListener { showDatePicker { editEndDate.setText(it) } }
 
-        // 如果已有快取，就直接顯示
-        if (cachedEvents != null) {
-            Log.d("VideoList", "使用快取的事件資料：${cachedEvents!!.size} 筆")
-            adapter.updateData(cachedEvents!!)
-            isDataLoaded = true
-            recyclerView.visibility = View.VISIBLE
-            loadingProgress.visibility = View.GONE
-            editStartDate.setText(lastStartDate ?: "")
-            editEndDate.setText(lastEndDate ?: "")
-            return
-        }
-
-        // 沒有快取時，設定預設結束日期為今天
         val today = Calendar.getInstance()
-        val todayStr = String.format(
-            "%04d-%02d-%02d",
-            today.get(Calendar.YEAR),
-            today.get(Calendar.MONTH) + 1,
-            today.get(Calendar.DAY_OF_MONTH)
-        )
+        val todayStr = String.format("%04d-%02d-%02d", today.get(Calendar.YEAR), today.get(Calendar.MONTH) + 1, today.get(Calendar.DAY_OF_MONTH))
         editEndDate.setText(todayStr)
 
         btnSearch.setOnClickListener {
@@ -147,68 +132,87 @@ class VideoListActivity : AppCompatActivity() {
             loadingProgress.visibility = View.VISIBLE
             recyclerView.visibility = View.GONE
 
-            apiService.getFallVideos(userId, startDate, endDate, limit = 5)
+            apiService.getFallVideos(caregiverId, elderId, startDate, endDate, limit = 5)
                 .enqueue(object : Callback<List<VideoEvent>> {
                     override fun onResponse(call: Call<List<VideoEvent>>, response: Response<List<VideoEvent>>) {
-                        loadingProgress.visibility = View.GONE
-                        recyclerView.visibility = View.VISIBLE
                         if (response.isSuccessful && response.body() != null) {
                             val events = response.body()!!
                                 .map {
-                                    it.copy(user_id = userId, isFavorite = false, event_type = "fall")
-                                }.toMutableList()
-                            Log.d("VideoList", "取得事件數量：${events.size}")
+                                    it.copy(
+                                        user_id = caregiverId,
+                                        isFavorite = it.in_watchlist,
+                                        video_type = it.video_type ?: "fall"
+                                    )
+                                }
+                                .toMutableList()
+
                             adapter.updateData(events)
                             isDataLoaded = true
-
-                            // 快取資料
-                            cachedEvents = events
-                            lastStartDate = startDate
-                            lastEndDate = endDate
+                            loadingProgress.visibility = View.GONE
+                            recyclerView.visibility = View.VISIBLE
                         } else {
-                            Toast.makeText(this@VideoListActivity, "查詢失敗 (${response.code()})", Toast.LENGTH_LONG).show()
+                            Toast.makeText(this@VideoListActivity, "查詢失敗：${response.code()}", Toast.LENGTH_SHORT).show()
+                            loadingProgress.visibility = View.GONE
+                            recyclerView.visibility = View.VISIBLE
                         }
                     }
 
                     override fun onFailure(call: Call<List<VideoEvent>>, t: Throwable) {
+                        Toast.makeText(this@VideoListActivity, "連線錯誤：${t.message}", Toast.LENGTH_SHORT).show()
                         loadingProgress.visibility = View.GONE
                         recyclerView.visibility = View.VISIBLE
-                        Toast.makeText(this@VideoListActivity, "連線失敗：${t.message}", Toast.LENGTH_LONG).show()
                     }
                 })
         }
     }
 
-    private fun addToFavorite(event: VideoEvent) {
-        val data = FavoriteRequest(event.user_id, event.video_filename, event.event_type)
+    private fun addToFavorite(event: VideoEvent, onSuccess: () -> Unit) {
+        if (isFavoriteActionRunning) return
+        isFavoriteActionRunning = true
+
+        val data = FavoriteRequest(event.user_id, event.record_id, event.video_type ?: "fall")
+        Log.d("FavoriteDebug", "送出收藏請求：user_id=${data.user_id}, record_id=${data.record_id}, video_type=${data.video_type}")
+
         apiService.addFavorite(data).enqueue(object : Callback<Map<String, String>> {
             override fun onResponse(call: Call<Map<String, String>>, response: Response<Map<String, String>>) {
+                isFavoriteActionRunning = false
                 if (response.isSuccessful) {
                     Toast.makeText(this@VideoListActivity, "已加入收藏", Toast.LENGTH_SHORT).show()
+                    onSuccess()
                 } else {
-                    Toast.makeText(this@VideoListActivity, "加入收藏失敗：${response.code()}", Toast.LENGTH_SHORT).show()
+                    val errorBody = response.errorBody()?.string()
+                    Log.e("FavoriteDebug", "加入收藏失敗：${response.code()}, $errorBody")
                 }
             }
 
             override fun onFailure(call: Call<Map<String, String>>, t: Throwable) {
-                Toast.makeText(this@VideoListActivity, "連線失敗：${t.message}", Toast.LENGTH_SHORT).show()
+                isFavoriteActionRunning = false
+                Log.e("FavoriteDebug", "加入收藏錯誤：${t.message}")
             }
         })
     }
 
-    private fun removeFromFavorite(event: VideoEvent) {
-        val data = FavoriteRequest(event.user_id, event.video_filename, event.event_type)
+    private fun removeFromFavorite(event: VideoEvent, onSuccess: () -> Unit) {
+        if (isFavoriteActionRunning) return
+        isFavoriteActionRunning = true
+
+        val data = FavoriteRequest(event.user_id, event.record_id, event.video_type ?: "fall")
+
         apiService.removeFavorite(data).enqueue(object : Callback<Map<String, String>> {
             override fun onResponse(call: Call<Map<String, String>>, response: Response<Map<String, String>>) {
+                isFavoriteActionRunning = false
                 if (response.isSuccessful) {
                     Toast.makeText(this@VideoListActivity, "已取消收藏", Toast.LENGTH_SHORT).show()
+                    onSuccess()
                 } else {
-                    Toast.makeText(this@VideoListActivity, "取消收藏失敗", Toast.LENGTH_SHORT).show()
+                    val errorBody = response.errorBody()?.string()
+                    Log.e("FavoriteDebug", "取消收藏失敗：${response.code()}, $errorBody")
                 }
             }
 
             override fun onFailure(call: Call<Map<String, String>>, t: Throwable) {
-                Toast.makeText(this@VideoListActivity, "連線失敗：${t.message}", Toast.LENGTH_SHORT).show()
+                isFavoriteActionRunning = false
+                Log.e("FavoriteDebug", "取消收藏錯誤：${t.message}")
             }
         })
     }
