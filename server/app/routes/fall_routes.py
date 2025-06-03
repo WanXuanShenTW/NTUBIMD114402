@@ -3,14 +3,17 @@ import shutil
 import tempfile
 import datetime
 import cv2
+import requests
 from flask import Blueprint, request, jsonify, send_file
 
 from ..fall_model import load_fall_model
 from ..utils import extract_skeleton_points, normalize_skeleton_data, interpolate_skeleton_data
 from ..db import get_connection
-from ..service.fall_video_service import list_fall_video_data_from_reange, get_video_filename_with_id, save_fall_video_path_with_video
+from ..service.fall_event_service import get_fall_event_video_filename_by_record_id, get_video_filename_for_fall_event, add_fall_event_with_video
 
 fall_bp = Blueprint("fall_bp", __name__)
+
+GAS_URL="https://0a53-150-116-202-175.ngrok-free.app/notify_line" #要改成伺服器ip/notify_line
 
 TEMP_VIDEO_DIR = "sources/tmp"
 VIDEOS_DIR = "sources/fall_videos"
@@ -34,7 +37,7 @@ user_processing_files = {}      # 用於儲存跌倒事件期間的影片檔案
 user_is_falling = {}            # 用於標記使用者是否正在處理跌倒事件
 user_falling_end = {}           # 用於標記使用者是否已經結束跌倒事件
 
-SMALL_BUFFER_SIZE = 60          # 用於骨架推論最低骨架資料筆數
+SMALL_BUFFER_SIZE = 60          # 用於骨架推論最低骨架資料幀數
 BUFFER_UPDATE_SIZE = 30
 SERVER_MAX_FPS = 60             # 伺服器最大處理 FPS
 
@@ -164,12 +167,20 @@ def merge_videos(video_files, output_file):
     out.release()
     print(f"✅ 影片合併完成，已儲存至：{output_file}")
 
-
+#之後要把API的"_"換掉 盡量改用"/"
 @fall_bp.route("/fall_video", methods=["POST"])
 def detect_fall_video():
     # 全域變數
     global user_temp_videos_path, user_processing_files, user_skeleton_buffers, user_can_save, user_is_falling, user_falling_end 
-
+    """
+    處理使用者上傳的影片，進行跌倒偵測與骨架點提取。
+    參數:
+        id: 使用者 ID (必填)
+        video: 上傳的影片檔案 (必填，格式為 MP4)
+    回傳:
+        JSON 格式的偵測結果，包括使用者 ID 與預測結果
+    """
+    
     #確認使用者 ID 與影片檔案是否存在
     user_id = request.form.get("id")
     if not user_id:
@@ -251,6 +262,13 @@ def detect_fall_video():
             if pred > FALL_THRESHOLD_UPPER:
                 prediction_result = "fall"
                 print(f"[INFO] User {user_id}: 跌倒事件偵測到。")
+                
+                payload = {} # 這裡可以根據需要填入 GAS 的 payload 資料
+                try:
+                    response = requests.post(GAS_URL, json=payload)
+                    print(f"[INFO] 已通知 GAS，回應: {response.status_code} {response.text}")
+                except Exception as e:
+                    print(f"[ERROR] 通知 GAS 失敗: {e}")
 
                 if not user_is_falling[user_id]:
                     user_processing_files[user_id] = user_temp_videos_path[user_id].copy()
@@ -268,7 +286,7 @@ def detect_fall_video():
                     user_temp_videos_path[user_id] = []
                     user_skeleton_buffers[user_id] = []
 
-                    save_fall_video_path_with_video(
+                    add_fall_event_with_video(
                         user_id=user_id,
                         location="客廳",
                         pose_before_fall="走路中",
@@ -329,24 +347,31 @@ def get_merged_fall_videos():
     """
     查詢合併後的跌倒影片資料（只回傳資料庫資料，不傳送影片檔案）
     參數:
-        user_id: int (必填)
+        elder_id: int (必填)
+        caregiver_id: int (必填)
         start_date: yyyy-mm-dd (可選)
         end_date: yyyy-mm-dd (可選)
         limit: int (可選，最多5，預設5)
     回傳:
         JSON 格式的影片資料
     """
-    user_id = request.args.get("user_id", type=int)
-    start_str = request.args.get("start_date")
-    end_str = request.args.get("end_date")
-    limit = request.args.get("limit", default=5, type=int)
+    data = request.args
+    missing = []
+    if not data.get("elder_id"):
+        missing.append("elder_id")
+    if not data.get("caregiver_id"):
+        missing.append("caregiver_id")
+    if missing:
+        return jsonify({"error": f"缺少參數: {', '.join(missing)}"}), 400
+    elder_id = data.get("elder_id", type=int)
+    caregiver_id = data.get("caregiver_id", type=int)
+    start_str = data.get("start_date")
+    end_str = data.get("end_date")
+    limit = data.get("limit", default=5, type=int)
     if limit > 5:
         limit = 5
     if limit < 1:
         limit = 1
-
-    if not user_id:
-        return jsonify({"error": "缺少 user_id 參數"}), 400
 
     # 處理時間區間
     try:
@@ -361,20 +386,32 @@ def get_merged_fall_videos():
     except Exception:
         return jsonify({"error": "日期格式錯誤，請用 yyyy-mm-dd"}), 400
        
-    data = list_fall_video_data_from_reange(user_id, start, end, limit)
+    data_list = get_video_filename_for_fall_event(elder_id, caregiver_id, start, end, limit)
     # 統一格式
-    for row in data:
+    for row in data_list:
         if isinstance(row["detected_time"], datetime.datetime):
             row["detected_time"] = row["detected_time"].strftime("%Y-%m-%d %H:%M:%S")
-    return jsonify(data)
+    return jsonify(data_list)
 
 @fall_bp.route("/fall_video_file", methods=["GET"])
 def get_merged_fall_video_file():
+    """
+    取得合併後的跌倒影片檔案。
+    參數:
+        record_id: int (必填，資料庫中的 record_id)
+    回傳:
+        影片檔案，若找不到則回傳錯誤訊息
+    """
+    data = request.args
+    missing = []
+    if "record_id" not in data:
+        missing.append("record_id")
+    if missing:
+        return jsonify({"error": f"缺少參數: {', '.join(missing)}"}), 400
+    
     record_id = request.args.get("record_id", type=int)
-    if not record_id:
-        return jsonify({"error": "缺少 record_id 參數"}), 400
 
-    video_filename = get_video_filename_with_id(record_id)
+    video_filename = get_fall_event_video_filename_by_record_id(record_id)
     if not video_filename:
         return jsonify({"error": "找不到影片"}), 404
 

@@ -1,9 +1,13 @@
 import mysql.connector
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def get_connection():
     return mysql.connector.connect(
-        host="140.131.114.242",
-        user="smartcare_db",
-        password="SmartCare114@2",
-        database="114-402"
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME")
     )

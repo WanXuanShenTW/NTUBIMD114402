@@ -36,50 +36,39 @@ def insert_video_watchlist(
         print(f"[ERROR] 新增影片到觀看清單失敗: {e}")
         return None
 
-def is_video_in_watchlist(conn, user_id: int, record_id: int) -> bool:
+def select_watchlist_entry_by_user_and_record(conn, user_id: int, record_id: int):
     """
-    檢查指定 user_id 和 record_id 是否存在於觀看清單。
+    查詢指定 user_id 和 record_id 是否存在於觀看清單，回傳資料列或 None。
     """
     try:
         cursor = conn.cursor()
         query = """
-            SELECT 1 FROM video_watchlist
+            SELECT * FROM video_watchlist
             WHERE user_id = %s AND record_id = %s
             LIMIT 1
         """
         cursor.execute(query, (user_id, record_id))
-        return cursor.fetchone() is not None
+        return cursor.fetchone()
     except Exception as e:
-        print(f"[ERROR] 檢查影片是否在觀看清單失敗: {e}")
-        return False
-    
-def get_video_watchlist_by_user_id(
-    conn,
-    record_id: int,
-    user_id: int
-) -> Optional[list]:
-    """
-    獲取指定使用者的觀看清單。
+        print(f"[ERROR] 查詢觀看清單失敗: {e}")
+        return None
 
-    :param conn: 資料庫連線物件，由 service 層傳入
-    :param watchlist_id: 觀看清單 ID
-    :param user_id: 使用者 ID
-    :return: 成功回傳影片列表，失敗回傳 None
+def select_watchlist_record_ids_by_user(conn, user_id: int, viedo_type:str) -> list:
+    """
+    根據 user_id 查詢觀看清單，回傳所有符合條件的 record_id 清單。
     """
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         query = """
-            SELECT *
-            FROM video_watchlist
-            WHERE record_id = %s AND user_id = %s
+            SELECT record_id FROM video_watchlist
+            WHERE user_id = %s AND video_type = %s
         """
-        cursor.execute(query, (record_id, user_id))
-        results = cursor.fetchall()
-        print(f"[INFO] 獲取觀看清單成功: {len(results)} 影片")
-        return results
+        cursor.execute(query, (user_id, viedo_type))
+        rows = cursor.fetchall()
+        return [row["record_id"] for row in rows] if rows else []
     except Exception as e:
-        print(f"[ERROR] 獲取觀看清單失敗: {e}")
-        return None
+        print(f"[ERROR] 查詢觀看清單失敗: {e}")
+        return []
     
 def delete_watchlist_by_id(
     conn,

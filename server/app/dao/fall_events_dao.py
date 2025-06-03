@@ -40,7 +40,7 @@ def insert_fall_event(
         print(f"[ERROR] 新增跌倒事件失敗: {e}")
         return None
 
-def fetch_fall_events_by_user_and_time_range(
+def select_fall_event_records_by_user_and_time_range(
     conn,
     user_id: int,
     start: Optional[datetime.datetime] = None,
@@ -83,17 +83,39 @@ def fetch_fall_events_by_user_and_time_range(
         print(f"[ERROR] 查詢跌倒事件失敗: {e}")
         return []
 
-def get_fall_event_video_filename_by_id(conn, record_id: int) -> Optional[str]:
+def select_fall_event_video_filename_by_id(conn, record_id: int) -> Optional[str]:
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True)
         cursor.execute(
             "SELECT video_filename FROM `114-402`.fall_events WHERE record_id = %s AND video_filename IS NOT NULL",
             (record_id,)
         )
         row = cursor.fetchone()
-        if row and row[0]:
-            return row[0]
+        if row["video_filename"]:
+            return row["video_filename"]
         return None
     except Exception as e:
         print(f"[ERROR] 查詢影片檔名失敗: {e}")
+        return None
+    
+def select_fall_event_by_id(conn, record_id: int) -> Optional[Dict[str, Any]]:
+    try:
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT record_id, user_id, detected_time, location, pose_before_fall, video_filename FROM `114-402`.fall_events WHERE record_id = %s",
+            (record_id,)
+        )
+        row = cursor.fetchone()
+        if row:
+            return {
+                "record_id": row["record_id"],
+                "user_id": row["user_id"],
+                "detected_time": row["detected_time"],
+                "location": row["location"],
+                "pose_before_fall": row["pose_before_fall"],
+                "video_filename": row["video_filename"]
+            }
+        return None
+    except Exception as e:
+        print(f"[ERROR] 查詢跌倒事件失敗: {e}")
         return None
