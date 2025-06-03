@@ -3,7 +3,7 @@ from pathlib import Path
 from openai import OpenAI
 from datetime import datetime
 import os
-from app.util.news_summary_generator import generate_daily_summary
+from ..utils import generate_daily_summary
 
 news_voice_bp = Blueprint('news_voice', __name__)
 
