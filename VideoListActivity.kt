@@ -140,6 +140,7 @@ class VideoListActivity : AppCompatActivity() {
                                 .map {
                                     it.copy(
                                         user_id = caregiverId,
+                                        location = it.location,
                                         isFavorite = it.in_watchlist,
                                         video_type = it.video_type ?: "fall"
                                     )

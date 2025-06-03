@@ -39,9 +39,10 @@ class VideoEventAdapter(
 
     override fun onBindViewHolder(holder: ViewHolder, position: Int) {
         val event = videoEvents[position]
-        holder.txtEventType.text = "事件：${event.video_type}"   // ← 改這行
+        holder.txtEventType.text = "事件：${event.video_type}"
         holder.txtEventTime.text = "時間：${event.detected_time}"
-        holder.txtVideoName.text = "影片：${event.video_filename}"
+        holder.txtVideoName.text = "地點：${event.location ?: "未知"}\n影片：${event.video_filename}"
+
 
         val heartIcon = if (event.isFavorite) {
             R.drawable.ic_collect_filled
