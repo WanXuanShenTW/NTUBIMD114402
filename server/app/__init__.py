@@ -6,7 +6,9 @@ from .routes.watchlist_routes import watchlist_bp
 from .routes.user_routes import user_bp
 from .routes.notify_line_routes import notify_line_bp
 from .routes.news_voice_routes import news_voice_bp
-from .routes.reels_routes import reels_bp 
+from .routes.reels_routes import reels_bp
+from .routes.auth_routes import auth_bp
+from .routes.emergency_contacts_routes import contact_bp 
 
 def create_app():
     app = Flask(__name__)
@@ -18,4 +20,6 @@ def create_app():
     app.register_blueprint(notify_line_bp)
     app.register_blueprint(news_voice_bp)
     app.register_blueprint(reels_bp)
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(contact_bp) 
     return app

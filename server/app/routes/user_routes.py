@@ -1,5 +1,10 @@
 from flask import Blueprint, request, jsonify
-from ..service.user_service import register_user
+from ..service.user_service import (
+    add_user,
+    update_user_info,
+    get_user_info,
+    delete_user_account
+)
 
 user_bp = Blueprint("user_bp", __name__)
 
@@ -12,15 +17,68 @@ def register():
     if missing:
         return jsonify({"error": f"缺少參數: {', '.join(missing)}"}), 400
 
-    result = register_user(
-        name=data["name"],
-        phone=data["phone"],
-        password=data["password"],
-        role_id=data["role_id"],
-        line_id=data.get("line_id")
-    )
+    try:
+        user_id = add_user(
+            name=data["name"],
+            phone=data["phone"],
+            password=data["password"],
+            role_id=data["role_id"],
+            line_id=data.get("line_id")
+        )
+        return jsonify({"message": "註冊成功", "user_id": user_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 409
 
-    if "error" in result:
-        return jsonify({"error": result["error"]}), result.get("status", 409)
+@user_bp.route("/user", methods=["PATCH"])
+def update_user():
+    data = request.get_json()
+    phone = data.get("phone")
+    if not phone:
+        return jsonify({"error": "缺少 phone 參數"}), 400
+
+    allowed_fields = ["name", "password", "role_id", "line_id"]
+    update_data = {key: data[key] for key in allowed_fields if key in data}
+
+    if not update_data:
+        return jsonify({"error": "請提供至少一個欄位"}), 400
+
+    try:
+        success = update_user_info(phone, **update_data)
+        return jsonify({"message": "更新成功"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@user_bp.route("/user", methods=["GET"])
+def get_user():
+    phone = request.args.get("phone")
+    if not phone:
+        return jsonify({"error": "缺少 phone 參數"}), 400
+
+    try:
+        user = get_user_info(phone)
+        return jsonify(user)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@user_bp.route("/user", methods=["DELETE"])
+def delete_user():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "缺少必要參數"}), 400
     
-    return jsonify({"message": "註冊成功", "user_id": result["user_id"]})
+    missing = []
+    if not data.get("phone"):
+        missing.append("phone")
+    if missing:
+        return jsonify({"error": f"缺少參數: {', '.join(missing)}"}), 400
+
+    try:
+        success = delete_user_account(data.get("phone"))
+        if success:
+            return jsonify({"message": "刪除成功"})
+        else:
+            return jsonify({"error": "刪除失敗，使用者不存在"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500

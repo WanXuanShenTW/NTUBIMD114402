@@ -1,4 +1,9 @@
-from ..dao.video_watchlist_dao import insert_video_watchlist, delete_watchlist_by_id, select_watchlist_entry_by_user_and_record, select_watchlist_record_ids_by_user
+from ..dao.video_watchlist_dao import (
+    insert_video_watchlist,
+    delete_watchlist_by_id,
+    select_watchlist_entry_by_user_and_record,
+    select_watchlist_record_ids_by_user
+)
 from ..dao.fall_events_dao import select_fall_event_by_id
 from ..db import get_connection
 

@@ -1,4 +1,8 @@
-from ..dao.fall_events_dao import insert_fall_event, select_fall_event_records_by_user_and_time_range, select_fall_event_video_filename_by_id
+from ..dao.fall_events_dao import (
+    insert_fall_event,
+    select_fall_event_records_by_user_and_time_range,
+    select_fall_event_video_filename_by_id
+)
 from ..dao.video_watchlist_dao import select_watchlist_entry_by_user_and_record
 from ..db import get_connection
 
