@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify
 from ..service.user_service import (
     add_user,
     update_user_info,
+    change_user_password,
     get_user_info,
     delete_user_account
 )
@@ -36,7 +37,7 @@ def update_user():
     if not phone:
         return jsonify({"error": "缺少 phone 參數"}), 400
 
-    allowed_fields = ["name", "password", "role_id", "line_id"]
+    allowed_fields = ["name", "role_id", "line_id"]
     update_data = {key: data[key] for key in allowed_fields if key in data}
 
     if not update_data:
@@ -45,6 +46,26 @@ def update_user():
     try:
         success = update_user_info(phone, **update_data)
         return jsonify({"message": "更新成功"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@user_bp.route("/user/password", methods=["PATCH"])
+def change_password():
+    data = request.get_json()
+    phone = data.get("phone")
+    old_password = data.get("old_password")
+    new_password = data.get("new_password")
+    confirm_password = data.get("confirm_password")
+
+    if not all([phone, old_password, new_password, confirm_password]):
+        return jsonify({"error": "缺少必要參數"}), 400
+    if new_password != confirm_password:
+        return jsonify({"error": "新密碼與確認密碼不一致"}), 400
+
+    try:
+        # 這裡呼叫你 service 層的 change_password 函式
+        change_user_password(phone, old_password, new_password)
+        return jsonify({"message": "密碼修改成功"})
     except Exception as e:
         return jsonify({"error": str(e)}), 400
 
