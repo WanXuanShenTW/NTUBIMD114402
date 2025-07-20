@@ -1,0 +1,121 @@
+{
+  "name": "起床習慣",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "seconds",
+              "secondsInterval": 15
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -120,
+        0
+      ],
+      "id": "b3b783a4-e68f-4ca4-944b-b6acdf483cbc",
+      "name": "Schedule Trigger"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT user_id, wake_times\nFROM wake_times_last7;",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        100,
+        0
+      ],
+      "id": "8d08697f-2e3c-4d84-b1cc-15fc1f1ab000",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "mySql": {
+          "id": "qW4DJGL44EByyCxI",
+          "name": "MySQL account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nreturn items.map(item => {\n  // 把字串 parse 成真正的 JS 陣列\n  const arr = JSON.parse(item.json.wake_times);\n  return {\n    json: {\n      user_id:    item.json.user_id,\n      wake_times: arr,          // 現在是一個 Array([\n                               //   \"2025-07-05 07:12:50\",\n                               //   \"2025-07-06 06:55:05\",\n                               //   …\n                               // ])\n    }\n  };\n});\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        280,
+        0
+      ],
+      "id": "3be22388-af3c-47da-aae8-91c68138e325",
+      "name": "字串轉陣列"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 取出所有 upstream 傳進來的 items\nconst items = $input.all();\n\n// map 出新的 items\nconst newItems = items.map(item => {\n  const { user_id, wake_times } = item.json;\n  // wake_times 已經是 string[]，直接拿來當陣列即可\n  const arr = wake_times;\n\n  // 接下來把時間字串轉秒數\n  const secs = arr.map(t => {\n    const d = new Date(t);\n    return d.getHours()*3600 + d.getMinutes()*60 + d.getSeconds();\n  });\n  const n = secs.length;\n  const avg = secs.reduce((a,b)=>a+b,0)/n;\n  const std = Math.sqrt(secs.map(x=>Math.pow(x-avg,2)).reduce((a,b)=>a+b,0)/n);\n  const earliest = Math.min(...secs);\n  const latest   = Math.max(...secs);\n\n  function fmt(sec){\n    const h = String(Math.floor(sec/3600)).padStart(2,'0');\n    const m = String(Math.floor((sec%3600)/60)).padStart(2,'0');\n    const s = String(Math.round(sec%60)).padStart(2,'0');\n    return `${h}:${m}:${s}`;\n  }\n\n  return {\n    json: {\n      user_id,\n      avg_time:  fmt(avg),\n      std_time:  `${Math.round(std/60)} 分鐘`,\n      earliest:  fmt(earliest),\n      latest:    fmt(latest),\n    }\n  };\n});\n\nreturn newItems;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "id": "e53b6d3c-ccea-4c16-8650-557eb86df4d5",
+      "name": "起床統計"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "字串轉陣列",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "字串轉陣列": {
+      "main": [
+        [
+          {
+            "node": "起床統計",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Taipei",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "01018726-7e3d-431a-8143-55080c7c4ae2",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "330da8c6942e5e4d1b16b5d750eb8966ffdc142ca9f1bce1583354d6e8966f71"
+  },
+  "id": "zxP91QpAgNKzwu0B",
+  "tags": []
+}
