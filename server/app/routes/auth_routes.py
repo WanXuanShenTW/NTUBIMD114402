@@ -1,26 +1,30 @@
-from flask import Blueprint, request, jsonify
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
 from ..service.user_service import get_user_info
 
-auth_bp = Blueprint("auth_bp", __name__)
+auth_router = APIRouter()
 
-@auth_bp.route("/login", methods=["POST"])
-def login():
-    data = request.get_json()
-    phone = data.get("phone")
-    password = data.get("password")
+class LoginRequest(BaseModel):
+    phone: str
+    password: str
 
-    if not phone or not password:
-        return jsonify({"error": "缺少 phone 或 password"}), 400
-    elif not phone.isdigit() or len(phone) != 10:
-        return jsonify({"error": "phone 必須是10位數字"}), 400 
+@auth_router.post("/login")
+async def login(data: LoginRequest):
+    phone = data.phone
+    password = data.password
+
+    if not phone.isdigit() or len(phone) != 10:
+        raise HTTPException(status_code=400, detail="phone 必須是10位數字")
     
     try:
-        user = get_user_info(phone)
+        user = await get_user_info(phone)
         if user is None:
-            return jsonify({"error": "使用者不存在"}), 404
+            raise HTTPException(status_code=404, detail="使用者不存在")
         if user["password"] != password:
-            return jsonify({"error": "密碼錯誤"}), 401
+            raise HTTPException(status_code=401, detail="密碼錯誤")
         
-        return jsonify({"message": "登入成功"})
+        return {"message": "登入成功"}
+    except HTTPException:
+        raise
     except Exception as e:
-        return jsonify({"error": f"伺服器錯誤: {str(e)}"}), 500
+        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")

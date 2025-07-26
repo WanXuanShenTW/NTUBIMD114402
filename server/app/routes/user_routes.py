@@ -1,4 +1,6 @@
-from flask import Blueprint, request, jsonify
+from fastapi import APIRouter, HTTPException, Body, Query
+from pydantic import BaseModel
+from typing import Optional
 from ..service.user_service import (
     add_user,
     update_user_info,
@@ -7,99 +9,87 @@ from ..service.user_service import (
     delete_user_account
 )
 
-user_bp = Blueprint("user_bp", __name__)
+user_router = APIRouter()
 
-@user_bp.route("/register", methods=["POST"])
-def register():
-    data = request.get_json()
-    required = ["name", "phone", "password", "role_id"]
-    missing = [key for key in required if key not in data]
+class RegisterRequest(BaseModel):
+    name: str
+    phone: str
+    password: str
+    role_id: int
+    line_id: Optional[str] = None
 
-    if missing:
-        return jsonify({"error": f"缺少參數: {', '.join(missing)}"}), 400
+class UpdateUserRequest(BaseModel):
+    phone: str
+    name: Optional[str] = None
+    role_id: Optional[int] = None
+    line_id: Optional[str] = None
 
+class ChangePasswordRequest(BaseModel):
+    phone: str
+    old_password: str
+    new_password: str
+    confirm_password: str
+
+class DeleteUserRequest(BaseModel):
+    phone: str
+
+@user_router.post("/register")
+async def register(data: RegisterRequest):
     try:
-        user_id = add_user(
-            name=data["name"],
-            phone=data["phone"],
-            password=data["password"],
-            role_id=data["role_id"],
-            line_id=data.get("line_id")
+        user_id = await add_user(
+            name=data.name,
+            phone=data.phone,
+            password=data.password,
+            role_id=data.role_id,
+            line_id=data.line_id
         )
-        return jsonify({"message": "註冊成功", "user_id": user_id})
+        return {"message": "註冊成功", "user_id": user_id}
     except Exception as e:
-        return jsonify({"error": str(e)}), 409
+        raise HTTPException(status_code=409, detail=str(e))
 
-@user_bp.route("/user", methods=["PATCH"])
-def update_user():
-    data = request.get_json()
-    phone = data.get("phone")
-    if not phone:
-        return jsonify({"error": "缺少 phone 參數"}), 400
+@user_router.patch("/user")
+async def update_user(data: UpdateUserRequest):
+    if not data.phone:
+        raise HTTPException(status_code=400, detail="缺少 phone 參數")
 
-    allowed_fields = ["name", "role_id", "line_id"]
-    update_data = {key: data[key] for key in allowed_fields if key in data}
-
+    update_data = {key: value for key, value in data.dict().items() if key != "phone" and value is not None}
     if not update_data:
-        return jsonify({"error": "請提供至少一個欄位"}), 400
+        raise HTTPException(status_code=400, detail="請提供至少一個欄位")
 
     try:
-        success = update_user_info(phone, **update_data)
-        return jsonify({"message": "更新成功"})
+        success = await update_user_info(data.phone, **update_data)
+        return {"message": "更新成功"} if success else {"message": "更新失敗"}
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
 
-@user_bp.route("/user/password", methods=["PATCH"])
-def change_password():
-    data = request.get_json()
-    phone = data.get("phone")
-    old_password = data.get("old_password")
-    new_password = data.get("new_password")
-    confirm_password = data.get("confirm_password")
-
-    if not all([phone, old_password, new_password, confirm_password]):
-        return jsonify({"error": "缺少必要參數"}), 400
-    if new_password != confirm_password:
-        return jsonify({"error": "新密碼與確認密碼不一致"}), 400
+@user_router.patch("/user/password")
+async def change_password(data: ChangePasswordRequest):
+    if data.new_password != data.confirm_password:
+        raise HTTPException(status_code=400, detail="新密碼與確認密碼不一致")
 
     try:
-        # 這裡呼叫你 service 層的 change_password 函式
-        change_user_password(phone, old_password, new_password)
-        return jsonify({"message": "密碼修改成功"})
+        success = await change_user_password(data.phone, data.old_password, data.new_password)
+        return {"message": "密碼修改成功"} if success else {"message": "密碼修改失敗"}
     except Exception as e:
-        return jsonify({"error": str(e)}), 400
+        raise HTTPException(status_code=400, detail=str(e))
 
-@user_bp.route("/user", methods=["GET"])
-def get_user():
-    phone = request.args.get("phone")
-    if not phone:
-        return jsonify({"error": "缺少 phone 參數"}), 400
-
+@user_router.get("/user")
+async def get_user(phone: str = Query(..., description="使用者電話")):
     try:
-        user = get_user_info(phone)
-        return jsonify(user)
+        user = await get_user_info(phone)
+        return user
     except ValueError as e:
-        return jsonify({"error": str(e)}), 404
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@user_bp.route("/user", methods=["DELETE"])
-def delete_user():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "缺少必要參數"}), 400
-    
-    missing = []
-    if not data.get("phone"):
-        missing.append("phone")
-    if missing:
-        return jsonify({"error": f"缺少參數: {', '.join(missing)}"}), 400
-
+@user_router.delete("/user")
+async def delete_user(data: DeleteUserRequest):
     try:
-        success = delete_user_account(data.get("phone"))
+        success = await delete_user_account(data.phone)
         if success:
-            return jsonify({"message": "刪除成功"})
+            return {"message": "刪除成功"}
         else:
-            return jsonify({"error": "刪除失敗，使用者不存在"}), 404
+            raise HTTPException(status_code=404, detail="刪除失敗，使用者不存在")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        raise HTTPException(status_code=500, detail=str(e))
