@@ -63,6 +63,9 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var monitorShouldRun = false
     private var monitorThread: Thread? = null
 
+    private var bgAudioRecord: AudioRecord? = null
+
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -137,20 +140,6 @@ class MainActivity : AppCompatActivity() {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
 
-        // 一次性重置：啟動時先刪掉已註冊聲紋（跑一次後請刪掉這段）
-        try {
-            // 如果 ElderEmbeddingStorage 是存這個路徑與檔名（預設為這個）
-            File(getExternalFilesDir(null), "elder_embedding.vec").delete()
-
-            // 若你有用 SharedPreferences 旗標，也順便清掉（沒有也不會壞）
-            getSharedPreferences("speaker", MODE_PRIVATE)
-                .edit().putBoolean("elder_registered", false).apply()
-
-            Log.d("MainActivity", "【一次性重置】已清除聲紋與註冊旗標")
-        } catch (e: Exception) {
-            Log.e("MainActivity", "一次性重置失敗", e)
-        }
-
         // 註冊狀態驅動 UI 與背景監聽
         setRegisteredUI(hasRegisteredElder())
     }
@@ -201,24 +190,49 @@ class MainActivity : AppCompatActivity() {
         monitorShouldRun = true
         monitorThread = thread(start = true, isDaemon = true) {
             val sampleRate = 16000
-            val frameMs = 1000L
-            val silenceNeed = 3
-            val silenceThreshold = 12.0
+            val frameMs = 250L
+            val silenceNeedFrames = 3
+            val hangoverFrames = 2                    // 尾巴最多補 0.5s
+            var nonElderEndFrames = 8                 // 2s 非長輩才收
+            val silentDbThreshold = -42f
+            val maxSegFrames = 120
+            val preFrames = 6                         // 1.5s pre-roll
+            val startStreakNeed = 2                   // 連續 0.5s 判長輩即可開段
 
             var silentFrames = 0
-            var nonElderFrames = 0
+            var nonElderFrames = 0                    // 連續非長輩幀
+            var nonSpeechFrames = 0                   // 連續「不像語音」幀
             var segFrames = 0
+            var elderStreak = 0
+            var elderFramesInSeg = 0
+            var tailFrames = 0                        // 已補的噪音尾巴幀數
+
+            val pre = ArrayDeque<ByteArray>(preFrames)
             currentSegment.clear()
 
+            fun isLikelySpeech(pcm: ByteArray): Boolean {
+                val db = calcRmsDb(pcm)
+                val zcr = zeroCrossRate(pcm)
+                return db > silentDbThreshold && zcr in 0.02f..0.25f
+            }
+
+            fun eligibleToSave(): Boolean {
+                if (currentSegment.isEmpty()) return false
+                val audible = isSegmentAudible(currentSegment, silentDbThreshold + 3f)
+                val ratio = if (segFrames > 0) elderFramesInSeg.toFloat() / segFrames else 0f
+                return audible && (elderFramesInSeg >= 4 || ratio >= 0.30f)
+            }
+
             fun finalizeSegment(reason: String) {
-                if (currentSegment.isNotEmpty()) {
+                if (eligibleToSave()) {
                     mergeAndSave(currentSegment)
-                    updateStatus("儲存聲音段落 ✔（$reason，長度約 ${segFrames}s）")
-                    currentSegment.clear()
-                    segFrames = 0
+                    updateStatus("儲存聲音段落（$reason，約 ${segFrames * frameMs} ms）")
+                } else {
+                    Log.d("VoiceMonitor", "未保存：整段無長輩語音或比例不足（$reason）")
                 }
-                silentFrames = 0
-                nonElderFrames = 0
+                currentSegment.clear(); pre.clear()
+                silentFrames = 0; nonElderFrames = 0; nonSpeechFrames = 0
+                segFrames = 0; elderStreak = 0; elderFramesInSeg = 0; tailFrames = 0
             }
 
             try {
@@ -226,72 +240,87 @@ class MainActivity : AppCompatActivity() {
                     val elder = ElderEmbeddingStorage.load(this@MainActivity)
                     if (!isValidEmbedding(elder)) {
                         updateStatus("尚未註冊長輩聲紋，待機中")
-                        silentFrames = 0
-                        nonElderFrames = 0
-                        currentSegment.clear()
+                        finalizeSegment("未註冊") // 清狀態
                         try { Thread.sleep(800) } catch (_: InterruptedException) { break }
                         continue
                     }
 
-                    updateStatus("正在錄音...")
-                    val pcmBuffer = ByteArrayOutputStream()
-                    val pcm = recordPcm(frameMs, pcmBuffer)
-                    val isSilent = isSilentPcm(pcm, silenceThreshold)
+                    val pcm = recordPcmFromMonitor(frameMs, sampleRate)
+                    val speech = isLikelySpeech(pcm)
+                    val isSilent = !speech && calcRmsDb(pcm) < silentDbThreshold
+
+                    // 維持 pre-roll（較長）
+                    if (pre.size == preFrames) pre.removeFirst()
+                    pre.addLast(pcm)
 
                     if (isSilent) {
-                        silentFrames++
-                        nonElderFrames = 0
-                        updateStatus("偵測到靜音（${silentFrames}/${silenceNeed}）")
+                        silentFrames++; nonElderFrames = 0; nonSpeechFrames++; elderStreak = 0
+                        updateStatus("偵測到靜音（${silentFrames}/${silenceNeedFrames}）")
                     } else {
                         silentFrames = 0
-                        // 建臨時檔做推論：放 cacheDir，結束一定刪掉
-                        val tempFile = File(cacheDir, "chunk_${System.currentTimeMillis()}.wav")
-                        try {
-                            saveAsWavFile(pcm, tempFile, sampleRate, 1, 16)
-                            val verifier = SpeakerVerifier(this@MainActivity)
-                            updateStatus("提取聲紋中...")
-                            val embedding = verifier.extractEmbedding(tempFile)
+                        nonSpeechFrames = if (speech) 0 else nonSpeechFrames + 1
 
-                            val isElder = if (isValidEmbedding(embedding) && isValidEmbedding(elder)) {
-                                verifier.isElderVoice(embedding)
-                            } else false
-
-                            updateStatus(if (isElder) "是長輩聲音" else "不是長輩聲音")
-
-                            if (isElder) {
-                                currentSegment.add(pcm)
-                                segFrames++
-                                nonElderFrames = 0
-                            } else {
-                                // 連續 2 秒不是長輩，就把已累積的段落存起來
-                                nonElderFrames++
+                        // 只有像語音的才跑聲紋
+                        val isElder = if (speech) {
+                            val tmp = File(cacheDir, "chunk_${System.currentTimeMillis()}.wav")
+                            try {
+                                saveAsWavFile(pcm, tmp, sampleRate, 1, 16)
+                                val v = SpeakerVerifier(this@MainActivity)
+                                val emb = v.extractEmbedding(tmp)
+                                isValidEmbedding(emb) && v.isElderVoice(emb)
+                            } finally {
+                                try { tmp.delete() } catch (_: Exception) {}
                             }
-                        } finally {
-                            // 確保不留垃圾檔
-                            if (tempFile.exists()) tempFile.delete()
+                        } else false
+
+                        if (isElder) {
+                            updateStatus("是長輩聲音")
+                            elderStreak++; nonElderFrames = 0; tailFrames = 0
+                            if (segFrames == 0) {
+                                if (elderStreak >= startStreakNeed) {
+                                    // 補 pre-roll（全部補，確保不吃開頭）
+                                    for (pr in pre) currentSegment.add(pr)
+                                    currentSegment.add(pcm)
+                                    segFrames++; elderFramesInSeg++
+                                }
+                            } else {
+                                currentSegment.add(pcm)
+                                segFrames++; elderFramesInSeg++
+                            }
+                        } else {
+                            updateStatus("不是長輩聲音")
+                            elderStreak = 0; nonElderFrames++
+
+                            if (segFrames > 0) {
+                                // 段已開始：只補少量尾巴，避免長噪音進段
+                                if (tailFrames < hangoverFrames) {
+                                    currentSegment.add(pcm); segFrames++; tailFrames++
+                                }
+                            }
                         }
                     }
 
-                    // 結段條件：達靜音門檻 或 連續 2 秒不是長輩
-                    if ((silentFrames >= silenceNeed || nonElderFrames >= 2) && currentSegment.isNotEmpty()) {
-                        val reason = if (silentFrames >= silenceNeed) "靜音" else "非長輩"
+                    val endBySilence  = silentFrames >= (silenceNeedFrames + hangoverFrames)
+                    // 非長輩要同時「不像語音」一段時間，才視為真的離開
+                    val endByNonElder = nonElderFrames >= 8 && nonSpeechFrames >= 4
+                    val endByMax      = segFrames >= maxSegFrames
+
+                    if ((endBySilence || endByNonElder || endByMax) && segFrames > 0) {
+                        val reason = when {
+                            endByMax     -> "達最大長度"
+                            endBySilence -> "靜音"
+                            else         -> "非長輩/非語音"
+                        }
                         finalizeSegment(reason)
                     }
-
-                    try { Thread.sleep(200) } catch (_: InterruptedException) { break }
                 }
-            } catch (e: InterruptedException) {
+            } catch (_: InterruptedException) {
                 Log.d("VoiceMonitor", "監聽執行緒中斷（正常結束）")
             } catch (e: Exception) {
                 Log.e("VoiceMonitor", "背景監聽發生錯誤", e)
                 updateStatus("背景監聽錯誤：${e.message ?: e.javaClass.simpleName}")
             } finally {
-                // 若停止時還有未存的片段，幫你收尾存檔
-                if (currentSegment.isNotEmpty()) {
-                    mergeAndSave(currentSegment)
-                    Log.d("VoiceMonitor", "停止前收尾：已儲存最後一段")
-                    currentSegment.clear()
-                }
+                if (currentSegment.isNotEmpty()) finalizeSegment("停止前收尾")
                 if (!monitorShouldRun) {
                     updateStatus(if (hasRegisteredElder()) "已註冊，待機中" else "請先註冊聲音")
                 }
@@ -303,6 +332,13 @@ class MainActivity : AppCompatActivity() {
         monitorShouldRun = false
         monitorThread?.interrupt()
         monitorThread = null
+        try {
+            bgAudioRecord?.stop()
+        } catch (_: Exception) {}
+        try {
+            bgAudioRecord?.release()
+        } catch (_: Exception) {}
+        bgAudioRecord = null
     }
 
     // 一鍵重置：清除已註冊聲紋與狀態
@@ -332,46 +368,72 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "已重置為未註冊狀態", Toast.LENGTH_SHORT).show()
     }
 
-    private fun recordPcm(durationMs: Long, output: ByteArrayOutputStream): ByteArray {
-        val sampleRate = 16000
-        val bufferSize = AudioRecord.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-
-        val recorder = AudioRecord(
-            MediaRecorder.AudioSource.MIC,
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT,
-            bufferSize
-        )
-
-        val buffer = ByteArray(bufferSize)
-        recorder.startRecording()
-        val start = System.currentTimeMillis()
-
-        while (System.currentTimeMillis() - start < durationMs) {
-            val read = recorder.read(buffer, 0, buffer.size)
-            if (read > 0) output.write(buffer, 0, read)
+    private fun zeroCrossRate(pcm: ByteArray): Float {
+        var crossings = 0
+        var prev = 0
+        var i = 0
+        if (pcm.size < 4) return 0f
+        fun sampleAt(j: Int): Int {
+            val lo = pcm[j].toInt() and 0xFF
+            val hi = pcm[j + 1].toInt()
+            return (hi shl 8) or lo
         }
-
-        recorder.stop()
-        recorder.release()
-
-        return output.toByteArray()
+        prev = sampleAt(0)
+        i = 2
+        var count = 1
+        while (i + 1 < pcm.size) {
+            val cur = sampleAt(i)
+            if ((prev >= 0 && cur < 0) || (prev < 0 && cur >= 0)) crossings++
+            prev = cur
+            i += 2
+            count++
+        }
+        return crossings.toFloat() / maxOf(1, count - 1)
     }
+
+    private fun calcRmsDb(pcm: ByteArray): Float {
+        var sumSq = 0.0
+        var count = 0
+        var i = 0
+        while (i + 1 < pcm.size) {
+            val lo = pcm[i].toInt() and 0xFF
+            val hi = pcm[i + 1].toInt()
+            val s = (hi shl 8) or lo
+            val f = s / 32768f
+            sumSq += (f * f)
+            count++
+            i += 2
+        }
+        val rms = kotlin.math.sqrt((sumSq / maxOf(1, count))).toFloat()
+        // 20*log10(rms) = 20 * ln(rms)/ln(10)
+        val eps = 1e-8f
+        val ln10 = 2.302585092994046f
+        return 20f * (kotlin.math.ln(rms + eps) / ln10)
+    }
+
+    private fun isSegmentAudible(segments: List<ByteArray>, minRmsDb: Float = -42f): Boolean {
+        val total = segments.sumOf { it.size }
+        if (total <= 2) return false
+        val out = ByteArrayOutputStream(total)
+        for (s in segments) out.write(s)
+        val db = calcRmsDb(out.toByteArray())
+        Log.d("VoiceMonitor", "segment RMS dB=$db (min=$minRmsDb)")
+        return db > minRmsDb
+    }
+
 
     private fun mergeAndSave(segments: List<ByteArray>) {
         val merged = ByteArrayOutputStream()
         for (s in segments) merged.write(s)
 
-        val file = File(getExternalFilesDir(null), "merged_${System.currentTimeMillis()}.wav")
-        saveAsWavFile(merged.toByteArray(), file, 16000, 1, 16)
+        val dir = getExternalFilesDir(null) ?: filesDir
+        dir.mkdirs()
+        val file = File(dir, "merged_${System.currentTimeMillis()}.wav")
 
-        Log.d("VoiceMonitor", "已合併並儲存聲音段：${file.name}")
+        saveAsWavFile(merged.toByteArray(), file, 16000, 1, 16)
+        Log.d("VoiceMonitor", "已合併並儲存聲音段：${file.absolutePath}")
     }
+
 
     private fun isSilentPcm(pcm: ByteArray, threshold: Double): Boolean {
         if (pcm.isEmpty()) return true
@@ -438,21 +500,60 @@ class MainActivity : AppCompatActivity() {
         val builder = AlertDialog.Builder(this)
             .setTitle("確認聲音樣本")
             .setMessage("要播放剛錄製的聲音嗎？")
-            .setPositiveButton("播放", null)        // 先設 null，等 show 後接手點擊，不自動關閉
-            .setNegativeButton("重新錄製", null)     // 同上
-            .setNeutralButton("確認儲存", null)      // 同上
+            .setPositiveButton("播放", null)       // 先設 null，show 後再接手
+            .setNegativeButton("重新錄製", null)
+            .setNeutralButton("確認儲存", null)
 
         val dialog = builder.create()
         dialog.setCanceledOnTouchOutside(false)
 
         dialog.setOnShowListener {
             var player: MediaPlayer? = null
+
             fun stopPlayer() {
                 try { player?.stop() } catch (_: Exception) {}
                 try { player?.release() } catch (_: Exception) {}
                 player = null
             }
 
+            dialog.setOnDismissListener { stopPlayer() }
+
+            // 播放：不關閉對話框，播完可直接按「確認儲存」
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                try {
+                    stopPlayer()
+                    player = MediaPlayer().apply {
+                        setDataSource(wavFile.absolutePath)
+                        prepare()
+                        start()
+                        setOnCompletionListener {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "播放結束，可按「確認儲存」或「重新錄製」",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    Toast.makeText(this@MainActivity, "播放失敗：${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            // 重新錄製：關掉對話框，恢復灰底 UI，再開始錄
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                stopPlayer()
+                dialog.dismiss()
+
+                recordVoiceButton.setBackgroundResource(R.drawable.mic_circle_background)
+                isVoiceRecording = true
+
+                recordAndShowDialog {
+                    recordVoiceButton.setBackgroundResource(android.R.color.transparent)
+                    isVoiceRecording = false
+                }
+            }
+
+            // 確認儲存：背景執行、存前驗證、存後讀回驗證
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
                 val btnP = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val btnN = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
@@ -487,7 +588,7 @@ class MainActivity : AppCompatActivity() {
                         if (ok) {
                             setRegisteredUI(true)
                             dialog.dismiss()
-                            Toast.makeText(this@MainActivity, "已儲存聲紋 ✔", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "已儲存聲紋", Toast.LENGTH_SHORT).show()
                         } else {
                             Toast.makeText(this@MainActivity, "儲存失敗：$msg", Toast.LENGTH_LONG).show()
                             btnP.isEnabled = true; btnN.isEnabled = true; btnU.isEnabled = true
@@ -495,37 +596,21 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
             }
-
-            // 重新錄製：先關掉對話框與播放器，然後套用與首頁一致的灰底 UI，再開始錄
-            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
-                stopPlayer()
-                dialog.dismiss()
-
-                // 與點擊麥克風一致的 UI 狀態
-                recordVoiceButton.setBackgroundResource(R.drawable.mic_circle_background)
-                isVoiceRecording = true
-
-                recordAndShowDialog {
-                    recordVoiceButton.setBackgroundResource(android.R.color.transparent)
-                    isVoiceRecording = false
-                }
-            }
-
-            // 確認儲存：存 embedding -> 切到已註冊 UI -> 關閉
-            dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
-                stopPlayer()
-                val verifier = SpeakerVerifier(this)
-                val embedding = verifier.extractEmbedding(wavFile)
-                ElderEmbeddingStorage.save(this, embedding)
-                setRegisteredUI(true)
-                dialog.dismiss()
-            }
         }
 
         dialog.show()
     }
 
-    private fun saveAsWavFile(pcm: ByteArray, file: File, sampleRate: Int, channels: Int, bitsPerSample: Int) {
+    private fun saveAsWavFile(
+        pcm: ByteArray,
+        file: File,
+        sampleRate: Int,
+        channels: Int,
+        bitsPerSample: Int
+    ) {
+        // 寫檔前確保父資料夾存在
+        file.parentFile?.mkdirs()
+
         val byteRate = sampleRate * channels * bitsPerSample / 8
         val header = ByteArrayOutputStream()
 
@@ -651,4 +736,44 @@ class MainActivity : AppCompatActivity() {
         audioRecord?.stop()
         audioRecord?.release()
     }
+    private fun ensureMonitorRecorder(sampleRate: Int): AudioRecord {
+        var r = bgAudioRecord
+        val minBuf = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+        if (r == null || r.state != AudioRecord.STATE_INITIALIZED) {
+            val bufSize = maxOf(minBuf, sampleRate / 5 * 2) // 至少 ~200ms buffer
+            r = AudioRecord(
+                MediaRecorder.AudioSource.MIC,
+                sampleRate,
+                AudioFormat.CHANNEL_IN_MONO,
+                AudioFormat.ENCODING_PCM_16BIT,
+                bufSize
+            )
+            r.startRecording()
+            bgAudioRecord = r
+            Log.d("VoiceMonitor", "bgAudioRecord started. minBuf=$minBuf, useBuf=$bufSize")
+        } else if (r.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            r.startRecording()
+        }
+        return r
+    }
+
+    // 連續從同一支 recorder 讀滿指定時長的 PCM
+    private fun recordPcmFromMonitor(durationMs: Long, sampleRate: Int): ByteArray {
+        val r = ensureMonitorRecorder(sampleRate)
+        val bytesToRead = ((sampleRate * durationMs) / 1000L * 2L).toInt() // 16-bit mono
+        val out = ByteArray(bytesToRead)
+        var off = 0
+        while (off < bytesToRead && monitorShouldRun) {
+            val n = r.read(out, off, bytesToRead - off)
+            if (n > 0) off += n
+            else if (n == 0) Thread.yield()
+            else { Log.e("VoiceMonitor", "AudioRecord read error: $n"); break }
+        }
+        return if (off == bytesToRead) out else out.copyOf(off)
+    }
+
 }
