@@ -4,7 +4,7 @@ from pathlib import Path
 from openai import OpenAI
 from datetime import datetime
 import os
-from ..utils import generate_daily_summary
+from ..utils.news_utils import generate_daily_summary
 
 news_voice_router = APIRouter()
 

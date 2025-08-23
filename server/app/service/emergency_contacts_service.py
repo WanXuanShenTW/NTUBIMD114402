@@ -43,8 +43,13 @@ async def add_contact_by_phone(user_phone, contact_phone, priority, relationship
         except Exception as e:
             raise DatabaseError(f"新增照護關係時發生錯誤: {e}")
 
-
-async def get_contact_relations(user_phone: int):
+async def get_contact_relations(user_phone: int, role: int = None) -> list:
+    """
+    根據使用者電話取得照護關係列表。
+    :param user_phone: 使用者電話
+    :param role: 可選，若提供則只返回特定角色的聯絡人
+    :return: 照護關係列表，每個元素包含聯絡人資訊
+    """
     async with Database.connection() as conn:
         user = await select_user_by_phone(conn, user_phone)
         if not user:
@@ -62,7 +67,7 @@ async def get_contact_relations(user_phone: int):
             async with conn.cursor(aiomysql.DictCursor) as cursor:
                 query = "SELECT * FROM emergency_contacts WHERE contact_id = %s"
                 await cursor.execute(query, (user_id,))
-                contacts_as_contact = list(await cursor.fetchall())  # ✅ 強制轉 list
+                contacts_as_contact = list(await cursor.fetchall())
         except Exception as e:
             print(f"[ERROR] 查詢照護關係失敗: {e}")
 
@@ -98,8 +103,12 @@ async def get_contact_relations(user_phone: int):
             }
             result.append(contact_info)
 
-        return result
+        # ⬇️ 這裡做條件過濾
+        if role is not None:
+            # 支援 role 為 int 或 str（習慣上資料庫 role_id 多為 int）
+            result = [c for c in result if c["role_id"] == role]
 
+        return result
 
 async def remove_contact(user_phone: int, contact_phone: int) -> str:
     async with Database.connection() as conn:
@@ -136,3 +145,4 @@ async def remove_contact(user_phone: int, contact_phone: int) -> str:
             return "刪除成功"
         except Exception as e:
             raise DatabaseError(f"刪除照護關係時發生錯誤: {e}")
+

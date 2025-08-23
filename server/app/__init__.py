@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.db import Database
+from .routes.ws_pose_router import ws_pose_router
 from .routes.video_routes import video_router
 from .routes.fall_routes import fall_router
 from .routes.gait_routes import gait_router
@@ -13,7 +14,7 @@ from .routes.reels_routes import reels_router
 from .routes.auth_routes import auth_router
 from .routes.emergency_contacts_routes import contact_router 
 
-# ✅ 壽命管理：啟動與關閉時處理連線池
+# 啟動與關閉時處理連線池
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await Database.init_pool()
@@ -32,4 +33,5 @@ def create_app():
     app.include_router(reels_router)
     app.include_router(auth_router)
     app.include_router(contact_router)
+    app.include_router(ws_pose_router)
     return app

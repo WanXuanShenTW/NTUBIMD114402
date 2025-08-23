@@ -32,10 +32,13 @@ async def create_contact(data: CreateContactRequest):
         raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
 
 @contact_router.get("/contact")
-async def get_contacts(user_phone: str = Query(..., description="使用者電話")):
+async def get_contacts(
+    user_phone: str = Query(..., description="使用者電話"),
+    role: int = Query(None, description="要過濾的角色ID（選填）")
+):
     try:
-        print(f"[DEBUG] 查詢 user_phone={user_phone}")
-        contacts = await get_contact_relations(user_phone)
+        print(f"[DEBUG] 查詢 user_phone={user_phone}, role={role}")
+        contacts = await get_contact_relations(user_phone, role)
         return contacts
     except ValueError as ve:
         print(f"[ERROR] ValueError: {ve}")
@@ -46,7 +49,6 @@ async def get_contacts(user_phone: str = Query(..., description="使用者電話
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
 
-
 @contact_router.delete("/contact")
 async def delete_contact(data: DeleteContactRequest):
     try:
@@ -56,3 +58,4 @@ async def delete_contact(data: DeleteContactRequest):
         raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+    
