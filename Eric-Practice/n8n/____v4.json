@@ -1,0 +1,124 @@
+{
+  "name": "骨架分析v4",
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=你是「單一人類姿態判斷器」。\n\nN = {{$json.frames.length}}\n\n請對 frames[0..N-1] 的每一幀各輸出一個物件；最後「只回傳一個 JSON 陣列」（長度必須等於 N）。不得輸出任何解釋或多餘文字。\n\n【輸入 frames】（僅供閱讀，不得複製到輸出）\n{{ JSON.stringify($json.frames) }}\n\n【每幀可用欄位】\n- type: \"keyframe\" | \"delta\"\n- angles.left_knee / angles.right_knee / angles.torso_tilt（度，0~180）\n- height（0~1，越大越直）\n- com_dx, com_dy（相對上一幀重心位移，像素；y 向下為正）\n- angle_change（相對上一幀角度變化）\n- height_change（相對上一幀 height 變化）\n- person.h（人框高度，像素）\n\n【輸出格式（嚴格）】\n- 回傳一個 JSON 陣列，長度 = N。\n- 陣列中每個物件只包含兩個鍵，且鍵序為：\n  {\"status\":\"站立|坐下|蹲下\",\"dangerous\":true|false}\n\n【共同變數】\n- minKnee = min(angles.left_knee, angles.right_knee)；若缺視為未知。\n- tilt = angles.torso_tilt；若缺視為未知。\n- hNow = person.h；若缺則以上一幀 hNow 代用；仍缺則以 1 代用。\n- 第 0 幀：com_dx=0、com_dy=0、height_change=0、angle_change 視為 0；dangerous 一律 false。\n- 姿態分類的優先順序：蹲下 > 坐下 > 站立（避免模糊時誤判成站立）。\n\n【單幀姿態分類（靜態判斷，優先使用角度，其次參考 height 與 tilt）】\n1) 蹲下：\n   - 若 minKnee < 100\n   - 或 (tilt ≥ 60 且 height < 0.80)\n   → \"蹲下\"\n2) 坐下：\n   - 若 minKnee 在 [100,160) 且 tilt < 60\n   - 或 height 在 [0.55,0.85) 且 tilt < 45\n   → \"坐下\"\n3) 站立：\n   - 若 minKnee ≥ 165 且 tilt ≤ 15 且 height ≥ 0.68\n   - 或（資料略差）minKnee ≥ 160 且 tilt ≤ 20\n   → \"站立\"\n4) 若以上皆不滿足：以最近條件挑選\n\n【危險（跌倒）｜僅 i>0】\n定義（混合絕對與相對門檻）：\n  hPrev = 上一幀的 person.h（若缺則以 hNow 代用）\n  hRef  = max(hNow, hPrev)\n  downFast     = com_dy ≥ max(20, 0.18 * hRef)            # 重心快速下移\n  tiltHigh     = tilt ≥ 65\n  tiltGain     = angle_change.torso_tilt ≥ 20\n  kneeCollapse = (angle_change.left_knee ≤ -25 或 angle_change.right_knee ≤ -25 或 minKnee < 90)\n  heightDrop   = height_change ≤ -0.07\n  lateralSmall = |com_dx| ≤ 0.6 * hRef                     # 橫移不大（避免橫向位移誤報）\n規則：\n  若 downFast 且 tiltHigh 且 tiltGain 且 lateralSmall 且 (kneeCollapse 或 heightDrop)\n  → dangerous = true\n  否則 → dangerous = false\n第 0 幀 dangerous = false。\n\n【缺值處理】\n- 角度缺失時，以 tilt 與 height 判斷；仍遵循優先順序：站立 > 坐下 > 蹲下。\n- 無法滿足跌倒條件時，dangerous = false。\n\n【現在只回傳結果 JSON 陣列】\n",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        520,
+        320
+      ],
+      "id": "6629f41b-bd2b-41fe-a03b-d9abc25b9c04",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -20,
+        340
+      ],
+      "id": "c747ab01-0779-4c21-bf55-642e034d7d8e",
+      "name": "When chat message received",
+      "webhookId": "6f947406-5520-4884-b66c-3f24d4122572"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// ------------------------------\n// 1) 讀取輸入\n// ------------------------------\n// 期待 items[0].json.chatInput 是「字串化的原始偵測陣列」（每幀一個物件：objects/boxes/keypoints）\n// 例如：const frames = JSON.parse(items[0].json.chatInput);\nconst frames = JSON.parse(items[0].json.chatInput);\n\n// ------------------------------\n// 2) 工具函式\n// ------------------------------\nfunction clamp(v, lo, hi){ return Math.max(lo, Math.min(hi, v)); }\n\nfunction dist(p1, p2){\n  const dx = p1[0] - p2[0], dy = p1[1] - p2[1];\n  return Math.sqrt(dx*dx + dy*dy);\n}\n\n// 穩定夾角（0..180°）：使用 atan2(abs(cross), dot) 對 0°/180° 穩定\nfunction angleAtStable(a, b, c){\n  if (!a || !b || !c) return NaN;\n  const ux = a[0] - b[0], uy = a[1] - b[1];\n  const vx = c[0] - b[0], vy = c[1] - b[1];\n  const dot   = ux*vx + uy*vy;\n  const cross = ux*vy - uy*vx; // 2D 外積 z 分量\n  const ang   = Math.atan2(Math.abs(cross), dot); // 0..π\n  return ang * 180 / Math.PI;\n}\n\n// 中心點 / 中點\nfunction center(b){\n  return [ (b[0]+b[2])/2, (b[1]+b[3])/2 ];\n}\nfunction mid(a, b){\n  return [ (a[0]+b[0])/2, (a[1]+b[1])/2 ];\n}\n\n// 重心（所有可用 keypoint 平均）\nfunction calcCOM(kps){\n  let sx = 0, sy = 0, n = 0;\n  for (const p of kps||[]){\n    if (Array.isArray(p) && isFinite(p[0]) && isFinite(p[1])){\n      sx += p[0]; sy += p[1]; n++;\n    }\n  }\n  if (n === 0) return [NaN, NaN];\n  return [ +(sx/n).toFixed(2), +(sy/n).toFixed(2) ];\n}\n\n// 軀幹傾角（肩中點→髖中點向量，相對垂直方向的偏斜角度 0..180，越小越直立）\nfunction torsoTiltDeg(kps){\n  const L_SH = kps?.[5],  R_SH = kps?.[6];\n  const L_H  = kps?.[11], R_H  = kps?.[12];\n  if (!L_SH || !R_SH || !L_H || !R_H) return NaN;\n  const sh = mid(L_SH, R_SH);\n  const hip = mid(L_H, R_H);\n  const vx = sh[0] - hip[0], vy = sh[1] - hip[1];\n  // 與垂直上方向 (0,-1) 的夾角\n  const dot = (0*vx) + (-1*vy);\n  const mag = Math.sqrt(vx*vx + vy*vy);\n  if (mag === 0) return NaN;\n  const cos = clamp(dot / mag, -1, 1);\n  return +(Math.acos(cos) * 180 / Math.PI).toFixed(1);\n}\n\n// 取人框：優先 objects.person；否則退回 boxes[0]\nfunction personBox(frame){\n  const objs = frame.objects || [];\n  const cand = objs.filter(o => o.class_name === 'person');\n  if (cand.length > 0){\n    cand.sort((a,b) => (b.confidence||0) - (a.confidence||0));\n    const b = cand[0].bbox;\n    return { bbox: [b[0], b[1], b[2], b[3]], conf: +(cand[0].confidence||0).toFixed(2) };\n  }\n  if (Array.isArray(frame.boxes) && frame.boxes.length>0){\n    const b = frame.boxes[0];\n    return { bbox: [b[0], b[1], b[2], b[3]], conf: 1.0 };\n  }\n  return null;\n}\n\n// ------------------------------\n// 3) 主流程：產生 results（keyframe + delta）\n// ------------------------------\nconst results = [];\n\nframes.forEach((frame, idx) => {\n  const kps = (frame.keypoints && frame.keypoints[0]) ? frame.keypoints[0] : null;\n  const pbox = personBox(frame);\n\n  // Person 幾何\n  const person = pbox ? {\n    bbox: pbox.bbox,\n    conf: pbox.conf,\n    cx: +center(pbox.bbox)[0].toFixed(2),\n    cy: +center(pbox.bbox)[1].toFixed(2),\n    w: +(pbox.bbox[2]-pbox.bbox[0]).toFixed(2),\n    h: +(pbox.bbox[3]-pbox.bbox[1]).toFixed(2),\n  } : null;\n\n  // 姿態特徵\n  let angles = null, height_norm = null, com = null;\n  if (kps && person){\n    const left_knee  = angleAtStable(kps[11], kps[13], kps[15]); // L-hip, L-knee, L-ankle\n    const right_knee = angleAtStable(kps[12], kps[14], kps[16]); // R-hip, R-knee, R-ankle\n    const tilt = torsoTiltDeg(kps);\n\n    // 以「肩中點 ↔ 踝中點」長度 / 人框高 作為相對高度 proxy（越接近 1 越直立）\n    const shouldersMid = mid(kps[5], kps[6]);\n    const anklesMid    = mid(kps[15], kps[16]);\n    const seg = dist(shouldersMid, anklesMid);\n    height_norm = person.h > 0 ? clamp(seg / person.h, 0, 1) : 0;\n\n    angles = {\n      left_knee:  isFinite(left_knee)  ? +left_knee.toFixed(1)  : null,\n      right_knee: isFinite(right_knee) ? +right_knee.toFixed(1) : null,\n      torso_tilt: isFinite(tilt)       ? +tilt.toFixed(1)       : null,\n    };\n\n    com = calcCOM(kps);\n  }\n\n  if (idx === 0){\n    results.push({\n      json: {\n        type: \"keyframe\",\n        frame: idx,\n        person,\n        angles,\n        height: +(+height_norm||0).toFixed(2),\n        com\n      }\n    });\n  } else {\n    const prev = results[idx-1].json;\n    results.push({\n      json: {\n        type: \"delta\",\n        frame: idx,\n        person,\n        angles,\n        height: +(+height_norm||0).toFixed(2),\n        com,\n        com_dx: (isFinite(com?.[0]) && isFinite(prev.com?.[0])) ? +(com[0]-prev.com[0]).toFixed(2) : null,\n        com_dy: (isFinite(com?.[1]) && isFinite(prev.com?.[1])) ? +(com[1]-prev.com[1]).toFixed(2) : null,\n        angle_change: (angles && prev.angles) ? {\n          left_knee:  (isFinite(angles.left_knee)  && isFinite(prev.angles?.left_knee))  ? +(angles.left_knee  - prev.angles.left_knee ).toFixed(1) : null,\n          right_knee: (isFinite(angles.right_knee) && isFinite(prev.angles?.right_knee)) ? +(angles.right_knee - prev.angles.right_knee).toFixed(1) : null,\n          torso_tilt: (isFinite(angles.torso_tilt) && isFinite(prev.angles?.torso_tilt)) ? +(angles.torso_tilt - prev.angles.torso_tilt).toFixed(1) : null\n        } : null,\n        height_change: (isFinite(prev.height) && isFinite(height_norm)) ? +(+height_norm - +prev.height).toFixed(2) : null\n      }\n    });\n  }\n});\n\nreturn [{ json: { frames: results.map(r => r.json), n: results.length } }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        340
+      ],
+      "id": "0f3620a0-7056-4ba4-be0d-3e06de337f98",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        540
+      ],
+      "id": "59412e5d-4681-4e92-8574-00b70acb5771",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "AI Agent1": {
+      "main": [
+        []
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5f501a63-972b-443f-9d56-4eaf5dd7daa5",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "hs6NnGOZ4RZNqewk",
+  "tags": []
+}
