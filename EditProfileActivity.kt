@@ -7,26 +7,34 @@ import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.media3.common.util.UnstableApi
 import com.example.myapplication.model.*
 import com.example.myapplication.network.RetrofitClient
 import retrofit2.Call
 import retrofit2.Callback
 import retrofit2.Response
 
+@UnstableApi
 class EditProfileActivity : AppCompatActivity() {
 
     private lateinit var editName: EditText
+    private lateinit var spinnerRole: Spinner
+    private lateinit var editLineId: EditText
     private lateinit var textPhone: TextView
-    private lateinit var textUserId: TextView
     private lateinit var btnSave: Button
-    private lateinit var btnCancel: ImageView
-    private lateinit var btnEdit: TextView
+    private lateinit var btnCancel: ImageView   // 左上角返回圖示 or 取消編輯
+    private lateinit var btnEdit: TextView      // 右上角「編輯」字樣
     private lateinit var btnChangePassword: Button
     private lateinit var btnDeleteAccount: Button
     private lateinit var loadingProgress: ProgressBar
 
-    private var userId: Int = -1
     private var currentPhone: String = ""
+
+    // 編輯狀態 & 原始值（用於取消編輯時還原）
+    private var isEditing = false
+    private var originalName = ""
+    private var originalLineId = ""
+    private var originalRolePos = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,8 +43,9 @@ class EditProfileActivity : AppCompatActivity() {
         Log.d("Lifecycle", "EditProfileActivity onCreate 呼叫中")
 
         editName = findViewById(R.id.editName)
+        spinnerRole = findViewById(R.id.spinnerRole)
+        editLineId = findViewById(R.id.editLineId)
         textPhone = findViewById(R.id.textPhone)
-        textUserId = findViewById(R.id.textUserId)
         btnSave = findViewById(R.id.btnSave)
         btnCancel = findViewById(R.id.btnCancel)
         btnEdit = findViewById(R.id.btnEdit)
@@ -45,17 +54,24 @@ class EditProfileActivity : AppCompatActivity() {
         loadingProgress = findViewById(R.id.loadingProgress)
 
         val sharedPref = getSharedPreferences("smartcare_pref", MODE_PRIVATE)
-        userId = sharedPref.getInt("user_id", -1)
         currentPhone = sharedPref.getString("phone", "") ?: ""
-        Log.d("ProfileDebug", "sharedPref user_id=$userId phone=$currentPhone")
+        Log.d("ProfileDebug", "sharedPref phone=$currentPhone")
 
         val currentName = sharedPref.getString("username", "")
         editName.setText(currentName)
         textPhone.text = currentPhone
-        textUserId.text = userId.toString()
 
+        // 初始化角色下拉選單
+        val roleAdapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, listOf("家屬", "醫護人員"))
+        roleAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinnerRole.adapter = roleAdapter
+        spinnerRole.isEnabled = false
+
+        // 初始狀態：非編輯
         toggleEditMode(false)
+        snapshotCurrentFieldsAsOriginal()
 
+        // 載入使用者資料
         if (currentPhone.isNotEmpty()) {
             loadingProgress.visibility = View.VISIBLE
             Log.d("ProfileDebug", "呼叫 getUser API")
@@ -63,19 +79,30 @@ class EditProfileActivity : AppCompatActivity() {
                 .enqueue(object : Callback<LoginResponse> {
                     override fun onResponse(call: Call<LoginResponse>, response: Response<LoginResponse>) {
                         loadingProgress.visibility = View.GONE
-                        Log.d("ProfileDebug", "getUser HTTP=${response.code()} body=${response.body()} error=${response.errorBody()?.string()}")
-                        if (response.isSuccessful && response.body() != null) {
-                            val userInfo = response.body()!!
-                            editName.setText(userInfo.name)
-                            textPhone.text = userInfo.phone
-                            currentPhone = userInfo.phone
+                        Log.d("ProfileDebug", "getUser HTTP=${response.code()} body=${response.body()} err=${response.errorBody()?.string()}")
 
-                            userId = userInfo.user_id
-                            textUserId.text = userId.toString()
-                        } else {
-                            Toast.makeText(this@EditProfileActivity, "載入失敗：${response.code()}", Toast.LENGTH_SHORT).show()
+                        val u = response.body() ?: run {
+                            Toast.makeText(this@EditProfileActivity, "查無此用戶", Toast.LENGTH_SHORT).show()
+                            return
                         }
+
+                        editName.setText(u.name ?: "")
+                        val ph = u.phone ?: ""
+                        textPhone.text = ph
+                        if (ph.isNotEmpty()) currentPhone = ph
+                        editLineId.setText(u.lineId ?: "")
+
+                        val rolePosition = when (u.roleId) {
+                            2 -> 0 // 家屬
+                            3 -> 1 // 醫護人員
+                            else -> 0
+                        }
+                        spinnerRole.setSelection(rolePosition)
+
+                        // 以 API 回傳為準，更新「原始值」
+                        snapshotCurrentFieldsAsOriginal()
                     }
+
                     override fun onFailure(call: Call<LoginResponse>, t: Throwable) {
                         loadingProgress.visibility = View.GONE
                         Log.d("ProfileDebug", "getUser onFailure ${t.message}")
@@ -84,68 +111,98 @@ class EditProfileActivity : AppCompatActivity() {
                 })
         }
 
+        // ===== 點擊事件 =====
+
+        // 右上角「編輯」
         btnEdit.setOnClickListener {
-            Log.d("ClickDebug", "點擊了 +編輯")
+            isEditing = true
             toggleEditMode(true)
-            btnSave.visibility = View.VISIBLE
-            btnSave.isEnabled = true
-            Toast.makeText(this, "已啟用編輯模式", Toast.LENGTH_SHORT).show()
         }
 
+        // 左上角返回圖示：若在編輯中→取消編輯並還原；否則→直接關閉頁面
         btnCancel.setOnClickListener {
-            Log.d("ClickDebug", "點擊了 返回")
-            finish()
+            if (isEditing) {
+                restoreOriginalFields()
+                isEditing = false
+                toggleEditMode(false)
+            } else {
+                finish()
+            }
         }
 
         btnSave.setOnClickListener {
-            Log.d("ClickDebug", "點擊了 儲存")
-            val newName = editName.text.toString()
+            val newName = editName.text.toString().trim()
+            val newLineId = editLineId.text.toString().trim()
+            val newRoleId = when (spinnerRole.selectedItemPosition) {
+                0 -> 2 // 家屬
+                1 -> 3 // 醫護人員
+                else -> 2
+            }
+
             if (newName.isEmpty()) {
-                Toast.makeText(this, "請輸入完整資訊", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "姓名不可為空", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
 
-            val updateRequest = UpdateUserRequest(
-                phone = currentPhone,
-                name = newName,
-                password = null
-            )
-            Log.d("UpdateDebug", "準備呼叫 updateUser PATCH JSON=$updateRequest")
-            btnSave.isEnabled = false
             loadingProgress.visibility = View.VISIBLE
+            btnSave.isEnabled = false
 
-            RetrofitClient.apiService.updateUser(updateRequest)
+            val req = UpdateUserRequest(
+                phone = currentPhone,
+                name  = newName,
+                lineId = newLineId,
+                roleId = newRoleId
+            )
+
+            RetrofitClient.apiService.updateUser(req)
                 .enqueue(object : Callback<UpdateUserResponse> {
-                    override fun onResponse(call: Call<UpdateUserResponse>, response: Response<UpdateUserResponse>) {
+                    override fun onResponse(
+                        call: Call<UpdateUserResponse>,
+                        response: Response<UpdateUserResponse>
+                    ) {
                         loadingProgress.visibility = View.GONE
                         btnSave.isEnabled = true
-                        Log.d("UpdateDebug", "updateUser HTTP=${response.code()} body=${response.body()} error=${response.errorBody()?.string()}")
-                        if (response.isSuccessful && response.body() != null) {
-                            Toast.makeText(this@EditProfileActivity, "修改成功！", Toast.LENGTH_SHORT).show()
-                            sharedPref.edit()
+
+                        if (response.isSuccessful) {
+                            Toast.makeText(this@EditProfileActivity, "已更新", Toast.LENGTH_SHORT).show()
+
+                            // 同步本地快取
+                            getSharedPreferences("smartcare_pref", MODE_PRIVATE)
+                                .edit()
                                 .putString("username", newName)
-                                .putString("phone", currentPhone)
+                                .putString("line_id", newLineId)
                                 .apply()
+
+                            // 關閉編輯模式
+                            snapshotCurrentFieldsAsOriginal()
+                            isEditing = false
                             toggleEditMode(false)
+
+                            // 重新拉最新資料（以伺服器為準）
+                            fetchAndFill()
                         } else {
-                            Toast.makeText(this@EditProfileActivity, "修改失敗：${response.code()}", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(
+                                this@EditProfileActivity,
+                                "更新失敗：${response.code()}",
+                                Toast.LENGTH_SHORT
+                            ).show()
                         }
                     }
 
                     override fun onFailure(call: Call<UpdateUserResponse>, t: Throwable) {
                         loadingProgress.visibility = View.GONE
                         btnSave.isEnabled = true
-                        Log.d("UpdateDebug", "updateUser onFailure ${t.message}")
                         Toast.makeText(this@EditProfileActivity, "連線失敗：${t.message}", Toast.LENGTH_SHORT).show()
                     }
                 })
-        }
+            }
 
         btnChangePassword.setOnClickListener {
             Log.d("ClickDebug", "點擊了 修改密碼")
             startActivity(Intent(this, ChangePasswordActivity::class.java))
         }
 
+        // 刪除帳號
         btnDeleteAccount.setOnClickListener {
             Log.d("ClickDebug", "點擊了 刪除帳號")
             AlertDialog.Builder(this)
@@ -183,16 +240,79 @@ class EditProfileActivity : AppCompatActivity() {
         }
     }
 
+    private fun fetchAndFill() {
+        if (currentPhone.isEmpty()) return
+        loadingProgress.visibility = View.VISIBLE
+        RetrofitClient.apiService.getUser(currentPhone)
+            .enqueue(object : Callback<LoginResponse> {
+                override fun onResponse(call: Call<LoginResponse>, response: Response<LoginResponse>) {
+                    loadingProgress.visibility = View.GONE
+                    val u = response.body() ?: run {
+                        Toast.makeText(this@EditProfileActivity, "查無此用戶", Toast.LENGTH_SHORT).show()
+                        return
+                    }
+                    editName.setText(u.name ?: "")
+                    val ph = u.phone ?: ""
+                    textPhone.text = ph
+                    if (ph.isNotEmpty()) currentPhone = ph
+                    editLineId.setText(u.lineId ?: "")
+
+                    val rolePosition = when (u.roleId) {
+                        2 -> 0 // 家屬
+                        3 -> 1 // 醫護人員
+                        else -> 0
+                    }
+                    spinnerRole.setSelection(rolePosition)
+
+                    snapshotCurrentFieldsAsOriginal()
+                }
+
+                override fun onFailure(call: Call<LoginResponse>, t: Throwable) {
+                    loadingProgress.visibility = View.GONE
+                    Toast.makeText(this@EditProfileActivity, "連線失敗：${t.message}", Toast.LENGTH_SHORT).show()
+                }
+            })
+    }
+
+    // 依編輯狀態切換 UI
     private fun toggleEditMode(isEditable: Boolean) {
         editName.isEnabled = isEditable
-        if (isEditable) {
-            btnSave.visibility = View.VISIBLE
-            btnChangePassword.visibility = View.VISIBLE
-            btnDeleteAccount.visibility = View.VISIBLE
+        spinnerRole.isEnabled = isEditable
+        editLineId.isEnabled = isEditable
+
+        btnSave.visibility = if (isEditable) View.VISIBLE else View.GONE
+        btnSave.isEnabled = isEditable
+
+        btnEdit.visibility = if (isEditable) View.GONE else View.VISIBLE
+
+        btnChangePassword.visibility = if (isEditable) View.VISIBLE else View.GONE
+        btnChangePassword.isEnabled = isEditable
+        btnDeleteAccount.visibility = if (isEditable) View.VISIBLE else View.GONE
+        btnDeleteAccount.isEnabled = isEditable
+    }
+
+    // 記錄目前欄位作為「原始值」
+    private fun snapshotCurrentFieldsAsOriginal() {
+        originalName = editName.text?.toString() ?: ""
+        originalLineId = editLineId.text?.toString() ?: ""
+        originalRolePos = spinnerRole.selectedItemPosition
+    }
+
+    // 還原到「原始值」
+    private fun restoreOriginalFields() {
+        editName.setText(originalName)
+        editLineId.setText(originalLineId)
+        spinnerRole.setSelection(originalRolePos)
+    }
+
+    // 實體返回鍵：編輯中先取消；否則直接返回
+    override fun onBackPressed() {
+        if (isEditing) {
+            restoreOriginalFields()
+            isEditing = false
+            toggleEditMode(false)
         } else {
-            btnSave.visibility = View.GONE
-            btnChangePassword.visibility = View.GONE
-            btnDeleteAccount.visibility = View.GONE
+            super.onBackPressed()
         }
     }
 }
