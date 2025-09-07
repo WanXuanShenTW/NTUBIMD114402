@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-JSON → CNN+LSTM 推論（常數版，直接改檔頭即可）
-- 用『影片級 JSON』(pose_json, object_json) 做滑動視窗推論，不需要原始影像。
-- 結構與你的訓練程式一致，能直接載入 best.pt 或 epoch ckpt。
+JSON → CNN+LSTM 推論（加入：半視窗(10)卡爾曼濾波 + 第一幀完整檢查 + 每5幀平移）
+- 與訓練版前置處理一致：先以『1~10』初始化 KF，之後每 5 幀平移『5~15』『10~20』；
+  在 buffer=20 固定後，每次更新都等效於持續使用最後『10~20』的狀態做平滑。
+- 僅在當前 20 幀中的『第一幀』具備完整骨架時才做一次推論；否則跳過。
+- 不改動模型與輸出格式。
 
-如何使用：
-1) 在檔頭填好 MODEL_PATH / CLASSES_PATH 與兩個 JSON 路徑 (POSE_JSON / OBJECT_JSON)。
-2) OBJECT_CLASSES 要與訓練時一致（例如只用 "tv" 就改成 ["tv"]）。
-3) 直接執行：python json_infer.py
-4) 若要輸出 CSV，設 OUT_CSV = "preds.csv"。
+使用方式：
+1) 改檔頭常數（MODEL_PATH / CLASSES_PATH / POSE_JSON / OBJECT_JSON / 物件類別等）。
+2) 直接執行：python cnn_lstm_loader.py
 """
 
 import os, json
@@ -23,8 +23,10 @@ MODEL_PATH      = "outputs/models/test/best.pt"       # best.pt（state_dict）�
 CLASSES_PATH    = "outputs/models/test/classes.json"   # 若載入 best.pt 需提供類別清單
 
 # 你的兩支影片級 JSON（list 形式；索引=幀號）
-POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_009.json"       # boxes + keypoints
-OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/fall/fall_009.json"     # objects/detections（可為 None）
+# POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_009.json"       # boxes + keypoints
+# OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/fall/fall_009.json"     # objects/detections（可為 None）
+POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/normal/normal_002.json"       # boxes + keypoints
+OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/normal/normal_002.json"     # objects/detections（可為 None）
 OUT_CSV         = None                                  # 例如 "preds.csv"；不要輸出就設 None
 
 # Relation Map 與物件通道（需與訓練一致）
@@ -36,9 +38,17 @@ OBJECT_CLASSES  = ["bed", "chair"]          # 只要 tv 就寫 ["tv"]；若不�
 LSTM_HIDDEN     = 256
 BIDIRECTIONAL   = False
 TEMPORAL_POOL   = "attn"          # "last" | "mean" | "attn"
-DROPOUT         = 0.3
 WINDOW          = 20              # 每段片段幀數
-STRIDE          = 5               # 視窗滑動步幅
+STRIDE          = 5               # 視窗滑動步幅（同上線每 5 幀更新）
+DROPOUT         = 0.3
+
+# ===== 前置：KF 與完整性判斷（與訓練一致） =====
+ENABLE_KALMAN               = True
+KALMAN_HALF_SLIDE           = True   # 1~10 初始化；之後每 5 幀用 5~15、10~20 覆蓋後段
+REQUIRE_FULL_FIRST_FRAME    = True   # 視窗第一幀必須完整，否則此視窗不推論
+HALF_LEN_OVERRIDE           = None   # 預設用 WINDOW//2 (=10)，可改成其他整數
+KP_CONF_TH                  = 0.4    # keypoint 信心門檻（僅供有 conf 資料時使用）
+SIGMA_KP                    = 3.0
 
 # ===================== Relation Map（與訓練一致） =====================
 COCO_EDGES = [
@@ -105,9 +115,9 @@ def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
         for i, kp in enumerate(kps[:num_kp]):
             try:
                 conf = float(kp.get('conf', kp.get('confidence',1.0)))
-                if conf < 0.4: continue
+                if conf < cfg.kp_conf_th: continue
                 x = (float(kp['x'])/img_w)*W; y = (float(kp['y'])/img_h)*H
-                draw_gaussian(canvas[ch+i], x, y, 3.0, mag=conf)
+                draw_gaussian(canvas[ch+i], x, y, cfg.sigma_kp, mag=conf)
             except Exception:
                 pass
     ch += num_kp
@@ -125,14 +135,18 @@ def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
         for e_idx,(a,b) in enumerate(COCO_EDGES):
             x1,y1,c1 = pts[a]; x2,y2,c2 = pts[b]
             if x1 is None or x2 is None: continue
-            if min(c1,c2) < 0.4: continue
+            if min(c1,c2) < cfg.kp_conf_th: continue
             cv2.line(canvas[ch+e_idx], (x1,y1), (x2,y2), 1.0, 1)
     ch += num_edges
     # 5) objects
     if num_obj_ch>0 and objects:
         name_to_idx = {n:i for i,n in enumerate(cfg.object_classes)}
         for det in objects:
-            cname = str(det.get('class_name', det.get('name', det.get('label','')))).strip()
+            cname = None
+            for key in ("cls_name","class_name","name","label"):
+                val = det.get(key)
+                if isinstance(val,str) and val.strip():
+                    cname = val.strip(); break
             if cname not in name_to_idx: continue
             bxyxy = _bbox_xyxy_from_any(det.get('bbox') or det.get('xyxy') or det.get('box') or det.get('bbox_xyxy'))
             if bxyxy is None: continue
@@ -187,6 +201,16 @@ def read_any_json(path: Optional[str]):
 # Pose record → (bbox, keypoints[17], img_w, img_h)
 
 def extract_pose_from_record(rec: dict) -> Tuple[Optional[List[float]], List[Dict], float, float]:
+    # 支援通用格式（boxes/keypoints），也容忍 person 格式
+    if isinstance(rec, dict) and rec.get("persons"):
+        person = max(rec.get("persons", []), key=lambda x: x.get("score", 0.0))
+        bbox = person.get("bbox")
+        kps  = person.get("keypoints") or []
+        kps_list = ([{"x": float(k.get("x",0.0)), "y": float(k.get("y",0.0)), "conf": float(k.get("conf", k.get("confidence",1.0)))} for k in kps[:17]] if kps else [])
+        img_w = rec.get("image_size",{}).get("width", 640.0) or 640.0
+        img_h = rec.get("image_size",{}).get("height",480.0) or 480.0
+        return bbox, kps_list, float(img_w), float(img_h)
+
     boxes = (rec.get('boxes') if isinstance(rec, dict) else None) or []
     kps_all = (rec.get('keypoints') if isinstance(rec, dict) else None) or []
     # 選最大的 bbox 當主體
@@ -217,21 +241,146 @@ def extract_pose_from_record(rec: dict) -> Tuple[Optional[List[float]], List[Dic
 
 def extract_objects_from_record(rec: dict) -> List[dict]:
     objs = (rec.get('objects') if isinstance(rec, dict) else None) \
-        or rec.get('detections') if isinstance(rec, dict) else None \
-        or rec.get('boxes') if isinstance(rec, dict) else None \
-        or rec.get('bboxes') if isinstance(rec, dict) else None \
-        or rec.get('predictions') if isinstance(rec, dict) else None
+        or (rec.get('detections') if isinstance(rec, dict) else None) \
+        or (rec.get('boxes') if isinstance(rec, dict) else None) \
+        or (rec.get('bboxes') if isinstance(rec, dict) else None) \
+        or (rec.get('predictions') if isinstance(rec, dict) else None)
     if objs is None:
         return []
     out = []
     for o in objs:
         if not isinstance(o, dict):
             continue
-        name = o.get('class_name', o.get('name', o.get('label','')))
+        name = None
+        for key in ("cls_name","class_name","name","label"):
+            val = o.get(key)
+            if isinstance(val,str) and val.strip():
+                name = val.strip(); break
         bbox = o.get('bbox') or o.get('xyxy') or o.get('box') or o.get('bbox_xyxy')
         if name is None or bbox is None:
             continue
-        out.append({'class_name': str(name), 'bbox': bbox})
+        out.append({'class_name': name, 'bbox': bbox})
+    return out
+
+# =============== 骨架完整性（第一幀用） ===============
+
+def frame_has_full_skeleton(bbox, kps, *, kp_need=17, require_bbox=True):
+    if require_bbox and bbox is None:
+        return False
+    cnt = 0
+    for j in range(min(17, len(kps))):
+        x = kps[j].get('x', None); y = kps[j].get('y', None)
+        if x is None or y is None: continue
+        if not np.isfinite(x) or not np.isfinite(y): continue
+        conf = float(kps[j].get('conf', kps[j].get('confidence', 1.0)))
+        if conf < KP_CONF_TH: continue
+        cnt += 1
+    return cnt >= kp_need
+
+# ===================== Kalman Filter（2D 常速模型，一點一濾） =====================
+class Kalman2D:
+    def __init__(self, x=0.0, y=0.0, var_pos=1.0, var_vel=1.0, var_meas=4.0):
+        # 狀態: [x, y, vx, vy]
+        self.F = np.array([[1, 0, 1, 0],
+                           [0, 1, 0, 1],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]], dtype=np.float32)
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]], dtype=np.float32)
+        self.Q = np.diag([var_pos, var_pos, var_vel, var_vel]).astype(np.float32)
+        self.R = np.diag([var_meas, var_meas]).astype(np.float32)
+        self.x = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+        self.P = np.eye(4, dtype=np.float32) * 10.0
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+    def update(self, z):
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + (K @ y)
+        I = np.eye(4, dtype=np.float32)
+        self.P = (I - K @ self.H) @ self.P
+    def get_xy(self):
+        return float(self.x[0, 0]), float(self.x[1, 0])
+
+
+def _kf_run_on_segment(kps_seq, require_full_first=True):
+    L = len(kps_seq)
+    if L == 0:
+        return []
+    # 第一幀完整性（必要時）
+    if require_full_first:
+        bbox_dummy = [0,0,1,1]  # 只檢查 keypoints
+        if not frame_has_full_skeleton(bbox_dummy, kps_seq[0], kp_need=17, require_bbox=False):
+            return None
+    # 初始化 17 個關節 KF
+    J = 17
+    filters = []
+    first = kps_seq[0]
+    for j in range(J):
+        if j < len(first) and ('x' in first[j]) and ('y' in first[j]):
+            kf = Kalman2D(first[j]['x'], first[j]['y'], var_pos=1e-2, var_vel=1e-1, var_meas=4.0)
+        else:
+            kf = Kalman2D(0.0, 0.0, var_pos=1e-2, var_vel=1e-1, var_meas=4.0)
+        filters.append(kf)
+    out = []
+    for t in range(L):
+        frame = kps_seq[t]
+        smoothed = []
+        for j in range(J):
+            kf = filters[j]
+            kf.predict()
+            if j < len(frame) and ('x' in frame[j]) and ('y' in frame[j]):
+                conf = float(frame[j].get('conf', frame[j].get('confidence', 1.0)))
+                if conf >= KP_CONF_TH:
+                    z = np.array([[float(frame[j]['x'])],[float(frame[j]['y'])]], dtype=np.float32)
+                    kf.update(z)
+            x,y = kf.get_xy()
+            smoothed.append({'x': x, 'y': y, 'conf': float(frame[j].get('conf',1.0)) if j < len(frame) else 0.0})
+        out.append(smoothed)
+    return out
+
+
+def kalman_smooth_kps(window_kps, *, half_slide=True, half_len=10, require_full_first=True, step=5):
+    """半視窗 KF（對 20 幀做 1~10；接著 5~15、10~20，只覆蓋各段最後 step 幀）"""
+    T = len(window_kps)
+    if T == 0:
+        return window_kps
+    if not half_slide:
+        seq = _kf_run_on_segment(window_kps, require_full_first=require_full_first)
+        return seq if seq is not None else window_kps
+
+    half_len = int(half_len) if half_len else max(1, T//2)
+    step = int(step)
+
+    out = [None]*T
+
+    # 段 0：0~half_len-1 → 全覆蓋
+    seg0 = _kf_run_on_segment(window_kps[0:half_len], require_full_first=require_full_first)
+    if seg0 is None:
+        return window_kps  # 交由上游決定是否丟棄
+    for t in range(min(half_len, T)):
+        out[t] = seg0[t]
+
+    # 後續：每 step 開新段 [s:s+half_len)，只覆蓋尾端 step 幀
+    s = step
+    while s + half_len <= T:
+        seg = _kf_run_on_segment(window_kps[s:s+half_len], require_full_first=require_full_first)
+        if seg is not None:
+            a = s + half_len - step
+            b = s + half_len
+            for t_rel, t_abs in enumerate(range(a, b)):
+                if 0 <= t_abs < T:
+                    out[t_abs] = seg[half_len - step + t_rel]
+        s += step
+
+    # 補洞
+    if any(x is None for x in out):
+        fb = _kf_run_on_segment(window_kps, require_full_first=False) or window_kps
+        for i in range(T):
+            if out[i] is None:
+                out[i] = fb[i]
     return out
 
 # ===================== 模型（與訓練一致） =====================
@@ -250,7 +399,7 @@ class SpaceCNN(nn.Module):
         return self.fc(self.net(x).flatten(1))
 
 class TemporalHead(nn.Module):
-    def __init__(self, in_dim, num_classes, mode="mean", dropout=0.0):
+    def __init__(self, in_dim, num_classes, mode="attn", dropout=0.0):
         super().__init__()
         self.mode = mode
         self.drop = nn.Dropout(dropout) if dropout>0 else nn.Identity()
@@ -271,7 +420,7 @@ class TemporalHead(nn.Module):
 
 class CNNLSTM(nn.Module):
     def __init__(self, in_ch, num_classes, cnn_out=256, lstm_h=256, lstm_layers=2,
-                 bidirectional=True, temporal_pool="mean", dropout=0.3):
+                 bidirectional=False, temporal_pool="attn", dropout=0.3):
         super().__init__()
         self.cnn = SpaceCNN(in_ch, cnn_out)
         self.lstm = nn.LSTM(cnn_out, lstm_h, lstm_layers, batch_first=True, bidirectional=bidirectional)
@@ -285,15 +434,12 @@ class CNNLSTM(nn.Module):
 
 # ===================== 推論主流程 =====================
 
-def run_on_json(pose_json: str, object_json: Optional[str]=None) -> list:
+def run_on_json(pose_json: str, object_json: Optional[str]=None):
     poses = read_any_json(pose_json)
     objs  = read_any_json(object_json) if object_json else None
-    
-#===================== 檢查 =====================
+
     T = len(poses)
-    expected = (T - WINDOW) // STRIDE + 1 if T >= WINDOW else 0
-    print(f"[Debug] T={T}, window={WINDOW}, stride={STRIDE}, expected={expected}")
-#===================== 檢查 =====================
+    print(f"[Debug] T={T}, window={WINDOW}, stride={STRIDE}")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # 計算輸入通道數（與訓練一致）
@@ -336,18 +482,37 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None) -> list:
             return extract_objects_from_record(objs[i])
         return []
 
-    # slide
-    T = len(poses)
     results = []
     with torch.no_grad():
         for start in range(0, max(0, T - WINDOW + 1), STRIDE):
-            clips = []
+            parsed = []
             for i in range(start, start + WINDOW):
                 bbox, kps, img_w, img_h = extract_pose_from_record(poses[i])
                 dets = get_obj(i)
-                rel = rasterize_frame(bbox, kps, dets, img_w, img_h,
-                                      RelationMapConfig(H=H,W=W,include_bone_lines=INCLUDE_BONE_LINES,object_classes=OBJECT_CLASSES))
-                clips.append(rel)
+                parsed.append((bbox, kps, dets, img_w, img_h))
+
+            # 第一幀完整性檢查（不完整就跳過這個 20 幀結果）
+            if REQUIRE_FULL_FIRST_FRAME:
+                bbox0, kps0, _, _, _ = parsed[0]
+                if not frame_has_full_skeleton(bbox0, kps0, kp_need=17, require_bbox=True):
+                    continue
+
+            # 半視窗 KF 平滑
+            if ENABLE_KALMAN:
+                window_kps = [kps for (_, kps, _, _, _) in parsed]
+                half_len = int(HALF_LEN_OVERRIDE) if HALF_LEN_OVERRIDE else max(1, WINDOW//2)
+                smoothed = kalman_smooth_kps(window_kps,
+                                             half_slide=KALMAN_HALF_SLIDE,
+                                             half_len=half_len,
+                                             require_full_first=True,
+                                             step=STRIDE)
+                parsed = [(bbox, smoothed[i], dets, img_w, img_h) for i,(bbox, _, dets, img_w, img_h) in enumerate(parsed)]
+
+            # 轉 relation maps
+            cfg = RelationMapConfig(H=H, W=W, sigma_kp=SIGMA_KP, kp_conf_th=KP_CONF_TH,
+                                     include_bone_lines=INCLUDE_BONE_LINES, object_classes=OBJECT_CLASSES)
+            clips = [rasterize_frame(bbox, kps, dets, img_w, img_h, cfg) for (bbox,kps,dets,img_w,img_h) in parsed]
+
             x = torch.from_numpy(np.stack(clips)).unsqueeze(0).float().to(device)  # (1,T,C,H,W)
             logits = model(x)
             prob = torch.softmax(logits, dim=1).cpu().numpy()[0]
@@ -377,7 +542,8 @@ def save_results_csv(results: list, out_csv: str, class_names: List[str]):
 if __name__ == '__main__':
     results, classes = run_on_json(POSE_JSON, OBJECT_JSON)
     for r in results:
-        print(f"frames {r['start_frame']:>5}-{r['end_frame']:<5} | pred={r['pred']} | probs={np.round(r['probs'],3)}")
+        import numpy as _np
+        print(f"frames {r['start_frame']:>5}-{r['end_frame']:<5} | pred={r['pred']} | probs={_np.round(r['probs'],3)}")
     if OUT_CSV:
         save_results_csv(results, OUT_CSV, classes)
         print(f"Saved CSV: {OUT_CSV}")

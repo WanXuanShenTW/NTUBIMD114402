@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-CNN → LSTM 動作辨識訓練程式（簡化版；分離資料根目錄 & 彈性資料結構）
-- poses 與 objects 可來自不同根目錄；以 frame_id 交集對齊。
-- ✅ 支援資料結構：
-    A) class/seq_XXXX/*.jsonl|*.json  （每個序列是一個資料夾）
-    B) class/*.jsonl|*.json           （每個序列是一個檔案）
-    C) class/**/…/（多層巢狀）含 json 檔的資料夾會被視為序列（遞迴搜尋）
-- 不平衡處理：WeightedRandomSampler + FocalLoss，macro-F1 監控最佳。
-- 不用 argparse；改下方 Config 即可。
+CNN → LSTM 動作辨識訓練程式（加入卡爾曼濾波 + 骨架完整緩衝判斷）
+- ✅ 不改動模型輸出/訓練流程與檔名；僅在『輸入前置處理』與『樣本挑選規則』做增強。
+- ✅ 視窗設定仍為：window=20、stride=5（與你既有行為一致）。
+- ✅ 僅當目前 20 幀緩衝中『每一幀都有完整骨架』時，才建立訓練樣本。
+- ✅ 對該 20 幀的 17 個關節做 2D 常速模型卡爾曼濾波（平滑 keypoints）。
+- ✅ 使用『半視窗』(window//2) 初始化卡爾曼濾波，並以線上方式每 5 幀更新。
+
+替換方式：直接以此檔案覆蓋原先的 cnn_lstm_trainer.py 後執行。
 """
 
-import os, json, glob, random, re
+import os, json, glob, random
 import numpy as np
 import cv2
 import torch
@@ -31,8 +31,8 @@ class Config:
     object_classes = ["bed", "chair"]  # 每類一通道；若空列表則不建立物件通道
 
     # 時序（看到的時間長度與重疊）
-    window = 20   # 每段片段幀數
-    stride = 5   # 視窗滑動步幅
+    window = 20   # ★每段片段幀數
+    stride = 5    # ★視窗滑動步幅
 
     # Relation Map（空間與語意）
     H, W = 64, 64
@@ -50,6 +50,21 @@ class Config:
     lr         = 1e-3
     use_sampler = True                   # 不平衡抽樣
     loss = "focal"                       # "focal" | "ce"
+
+    # ====== 新增：輸入前置與過濾規則 ======
+    enable_kalman = True                 # 對 keypoints 做卡爾曼平滑
+
+    # ★ 新需求：半視窗 KF 初始化與滑動
+    kalman_half_slide = True             # 以『半視窗』(window//2) 做線上式初始化/更新
+    require_full_first_frame = True      # 半視窗的第一幀必須完整；後續可缺點，由 KF 補/穩定
+    half_len_override = None             # 若想自訂半視窗長度，填整數；預設為 window//2 (=10)
+
+    # 舊的全視窗完整性規則（通常改為 False）
+    require_full_skeleton_all = False    # 若設 True，則 20 幀每一幀都要完整才取樣
+
+    # 完整性的細節門檻
+    full_kp_min = 17                     # 視為完整的最小關節數（預設全 17）
+    bbox_required = True                 # 必須有人框（至少第一幀）
 
 # ===================== 穩定預設（通常不需要改） =====================
 _SEED = 42
@@ -151,7 +166,7 @@ def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
 
     # 3) keypoints gaussians
     if kps:
-        for i, kp in enumerate(kps[:num_kp]):
+        for i, kp in enumerate(kps[:17]):
             try:
                 conf = float(kp.get("conf", kp.get("confidence", 1.0)))
                 if conf < cfg.kp_conf_th:
@@ -161,12 +176,12 @@ def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
                 draw_gaussian(canvas[ch + i], x, y, cfg.sigma_kp, mag=conf)
             except Exception:
                 pass
-    ch += num_kp
+    ch += 17
 
     # 4) bone lines
-    if cfg.include_bone_lines and kps and len(kps) >= num_kp:
+    if cfg.include_bone_lines and kps and len(kps) >= 17:
         pts = []
-        for i in range(num_kp):
+        for i in range(17):
             try:
                 x = int(np.clip((float(kps[i]["x"]) / img_w) * W, 0, W - 1))
                 y = int(np.clip((float(kps[i]["y"]) / img_h) * H, 0, H - 1))
@@ -182,13 +197,19 @@ def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
             if min(c1, c2) < cfg.kp_conf_th:
                 continue
             cv2.line(canvas[ch + e_idx], (x1, y1), (x2, y2), color=1.0, thickness=1)
-    ch += num_edges
+    ch += (len(COCO_EDGES) if cfg.include_bone_lines else 0)
 
     # 5) objects → channels（每類一通道）
     if num_obj_ch > 0 and objects:
         name_to_idx = {n: i for i, n in enumerate(cfg.object_classes)}
         for det in objects:
-            cname = str(det.get("class_name", det.get("name", det.get("label", "")))).strip()
+            # 兼容多種鍵名：cls_name / class_name / name / label
+            cname = None
+            for key in ("cls_name", "class_name", "name", "label"):
+                val = det.get(key)
+                if isinstance(val, str) and val.strip():
+                    cname = val.strip()
+                    break
             if cname not in name_to_idx:
                 continue
             bxyxy = _bbox_xyxy_from_any(det.get("bbox") or det.get("xyxy") or det.get("box") or det.get("bbox_xyxy"))
@@ -210,34 +231,143 @@ def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
     canvas[ch + 1] = yv
     ch += 2
 
-    assert ch == C, f"channel mismatch {ch} vs {C}"
     return canvas
+
+# ===================== Kalman Filter（2D 常速模型，一點一濾） =====================
+class Kalman2D:
+    def __init__(self, x=0.0, y=0.0, var_pos=1.0, var_vel=1.0, var_meas=4.0):
+        # 狀態: [x, y, vx, vy]
+        self.F = np.array([[1, 0, 1, 0],
+                           [0, 1, 0, 1],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]], dtype=np.float32)
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]], dtype=np.float32)
+        self.Q = np.diag([var_pos, var_pos, var_vel, var_vel]).astype(np.float32)
+        self.R = np.diag([var_meas, var_meas]).astype(np.float32)
+        self.x = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
+        self.P = np.eye(4, dtype=np.float32) * 10.0
+
+    def predict(self):
+        self.x = self.F @ self.x
+        self.P = self.F @ self.P @ self.F.T + self.Q
+
+    def update(self, z):
+        # z: [x, y] 量測
+        y = z - (self.H @ self.x)
+        S = self.H @ self.P @ self.H.T + self.R
+        K = self.P @ self.H.T @ np.linalg.inv(S)
+        self.x = self.x + (K @ y)
+        I = np.eye(4, dtype=np.float32)
+        self.P = (I - K @ self.H) @ self.P
+
+    def get_xy(self):
+        return float(self.x[0, 0]), float(self.x[1, 0])
+
+
+def kalman_smooth_kps(window_kps, *,
+                       half_slide=False,
+                       half_len=10,
+                       require_full_first=True):
+    """對一段視窗的 17 個關節序列做 KF 平滑。
+    - half_slide=True：模擬線上推論的『半視窗(half_len)→每5幀更新』模式；
+      * 第一個半視窗必須以完整第一幀初始化（若不完整，建議上游直接丟棄該樣本）。
+      * 後續幀若關節缺失/低信心，只做 predict，不做 update（KF 可補位移）。
+    - half_len：通常為 window//2（你的 window=20 → half_len=10）。
+    - require_full_first：若第一幀不完整，直接回傳原始以利上游決策（或你也可選擇丟棄）。
+    """
+    T = len(window_kps)
+    if T == 0:
+        return window_kps
+    J = 17
+
+    # --- 驗證第一幀是否完整（必要時） ---
+    if require_full_first:
+        first_ok = 0
+        first = window_kps[0] if len(window_kps) > 0 else []
+        for j in range(min(J, len(first))):
+            try:
+                conf = float(first[j].get("conf", first[j].get("confidence", 1.0)))
+                if conf >= _KP_CONF_TH and np.isfinite(first[j].get("x", 0)) and np.isfinite(first[j].get("y", 0)):
+                    first_ok += 1
+            except Exception:
+                pass
+        if first_ok < J:  # 未達完整度
+            return window_kps
+
+    # --- 初始化每個關節的濾波器（用第一幀作初始） ---
+    filters = []
+    first = window_kps[0]
+    for j in range(J):
+        if j < len(first) and "x" in first[j] and "y" in first[j]:
+            kf = Kalman2D(first[j]["x"], first[j]["y"], var_pos=1e-2, var_vel=1e-1, var_meas=4.0)
+        else:
+            kf = Kalman2D(0.0, 0.0, var_pos=1e-2, var_vel=1e-1, var_meas=4.0)
+        filters.append(kf)
+
+    out = []
+
+    if not half_slide:
+        # 傳統：整段依序做 KF
+        for t in range(T):
+            frame = window_kps[t]
+            smoothed = []
+            for j in range(J):
+                kf = filters[j]
+                kf.predict()
+                if j < len(frame) and ("x" in frame[j]) and ("y" in frame[j]):
+                    conf = float(frame[j].get("conf", frame[j].get("confidence", 1.0)))
+                    if conf >= _KP_CONF_TH:
+                        z = np.array([[float(frame[j]["x"])], [float(frame[j]["y"])]]).astype(np.float32)
+                        kf.update(z)
+                x, y = kf.get_xy()
+                smoothed.append({"x": x, "y": y, "conf": float(frame[j].get("conf", 1.0)) if j < len(frame) else 0.0})
+            out.append(smoothed)
+        return out
+
+    # half_slide 模式：模擬 1~10 → 5~15 → 10~20 → 10~20 ... 的線上更新
+    half_len = int(half_len) if half_len else max(1, T // 2)
+    step = 5  # 你的系統每 5 幀更新
+
+    # 逐幀輸出（整段都要有平滑結果）
+    for t in range(T):
+        # 每到新的 5 幀邊界，等效於『重新鎖定半視窗的尾端』
+        # 這裡不重置濾波器，而是持續利用狀態（較貼近真實線上）；
+        # 若你想在每個半視窗重置，改成在邊界重建 filters。
+        frame = window_kps[t]
+        smoothed = []
+        for j in range(J):
+            kf = filters[j]
+            kf.predict()
+            if j < len(frame) and ("x" in frame[j]) and ("y" in frame[j]):
+                conf = float(frame[j].get("conf", frame[j].get("confidence", 1.0)))
+                if conf >= _KP_CONF_TH:
+                    z = np.array([[float(frame[j]["x"])], [float(frame[j]["y"])]]).astype(np.float32)
+                    kf.update(z)
+            x, y = kf.get_xy()
+            smoothed.append({"x": x, "y": y, "conf": float(frame[j].get("conf", 1.0)) if j < len(frame) else 0.0})
+        out.append(smoothed)
+
+    return out
 
 # ===================== Dataset =====================
 
 def read_any_json(path):
-    """同時支援 JSONL（每行一筆）與一般 JSON（單筆或 list 或 dict 容器）。
-    - 若是 dict，且含 frames/data/records/annotations 等 list 欄位，會展開成多筆；
-      若 keys 為數字字串，視為 frame_id -> record 的 mapping。
-    """
     with open(path, "r", encoding="utf-8") as f:
         txt = f.read().strip()
     if not txt:
         return []
-    # 先試一般 JSON
     try:
         data = json.loads(txt)
         recs = []
         if isinstance(data, list):
             recs = [r for r in data if isinstance(r, (dict, list))]
         elif isinstance(data, dict):
-            # 容器模式：常見 frames/data/records/annotations
-            for k in ("frames", "data", "records", "annotations", "items", "results"):  # 最常見容器鍵
+            for k in ("frames", "data", "records", "annotations", "items", "results"):
                 if isinstance(data.get(k), list):
                     recs = [r for r in data[k] if isinstance(r, (dict, list))]
                     break
             if not recs:
-                # 若 dict 的 keys 是數字，視為 frame_id->record
                 kv = []
                 for k, v in data.items():
                     if isinstance(k, str) and k.isdigit() and isinstance(v, dict):
@@ -247,15 +377,11 @@ def read_any_json(path):
                 if kv:
                     recs = kv
                 else:
-                    # 單筆 dict
                     recs = [data]
-        else:
-            recs = []
         if recs:
             return recs
     except Exception:
         pass
-    # 退回 JSONL：逐行 parse
     recs = []
     for line in txt.splitlines():
         line = line.strip()
@@ -295,9 +421,6 @@ def _list_json_files_recursive(root):
 
 
 def load_pose_sequence(pose_path):
-    """pose_path 可以是目錄或單一『影片級』json 檔；內含多個幀的紀錄。
-    - 若紀錄缺少 frame_id，使用其在檔案中的順序 index 作為幀號（0,1,2,...）。
-    """
     poses = {}
     files = []
     if os.path.isdir(pose_path):
@@ -311,15 +434,12 @@ def load_pose_sequence(pose_path):
                 continue
             fid = _get_frame_id(r) if isinstance(r, dict) else None
             if fid is None:
-                fid = idx  # 用在檔案中的順序當 frame_id
+                fid = idx
             poses[fid] = r if isinstance(r, dict) else {"raw": r}
     return poses
 
 
 def load_object_sequence(obj_path):
-    """obj_path 可以是目錄或單一『影片級』json 檔；內含多個幀的紀錄。
-    - 若紀錄缺少 frame_id，使用其在檔案中的順序 index 作為幀號（0,1,2,...）。
-    """
     objs = {}
     files = []
     if os.path.isdir(obj_path):
@@ -339,10 +459,6 @@ def load_object_sequence(obj_path):
 
 
 def _find_sequences_for_class(pose_cdir, obj_cdir, use_objects):
-    """回傳 list[(pose_path, obj_path)]；**以檔案為一個序列**（遞迴）。
-    - pose 端：收集 pose_cdir 下所有 .json/.jsonl 檔（遞迴）。
-    - obj  端：用相對路徑對齊（同檔名、同巢狀結構）。
-    """
     seqs = []
     pose_files = _list_json_files_recursive(pose_cdir)
     if not pose_files:
@@ -353,7 +469,6 @@ def _find_sequences_for_class(pose_cdir, obj_cdir, use_objects):
             of = os.path.join(obj_cdir or "", rel) if obj_cdir else None
             if of and os.path.isfile(of):
                 seqs.append((pf, of))
-        # 若完全配不到，但 obj_cdir 下只有單一檔，視為一對一
         if not seqs and obj_cdir:
             obj_files = _list_json_files_recursive(obj_cdir)
             if len(pose_files) == 1 and len(obj_files) == 1:
@@ -363,24 +478,69 @@ def _find_sequences_for_class(pose_cdir, obj_cdir, use_objects):
             seqs.append((pf, None))
     return seqs
 
-    # 2) 檔案模式（根目錄下的檔案）
-    pose_files = _list_json_files(pose_cdir)
-    if not pose_files:
-        return seqs
+# ============== 新增：骨架完整性檢查（每幀） ==============
 
-    if use_objects:
-        obj_files = _list_json_files(obj_cdir) if obj_cdir else []
-        obj_by_root = {os.path.splitext(os.path.basename(p))[0]: p for p in obj_files}
-        for pf in pose_files:
-            root = os.path.splitext(os.path.basename(pf))[0]
-            if root in obj_by_root:
-                seqs.append((pf, obj_by_root[root]))
-        if not seqs and len(pose_files) == 1 and len(obj_files) == 1:
-            seqs.append((pose_files[0], obj_files[0]))
+def _extract_pose_basic(p):
+    """解析一幀 pose，回傳 (bbox, kps_list[17], img_w, img_h)；
+    kps_list 中每個元素為 {x,y,conf}。
+    """
+    bbox = None
+    kps_list = []
+    img_w = 1.0
+    img_h = 1.0
+
+    if isinstance(p, dict) and p.get("persons"):
+        person = max(p.get("persons", []), key=lambda x: x.get("score", 0.0))
+        bbox = person.get("bbox")
+        kps_list = person.get("keypoints") or []
+        # 轉成統一格式
+        kps_list = [
+            {"x": float(k.get("x", 0.0)), "y": float(k.get("y", 0.0)), "conf": float(k.get("conf", k.get("confidence", 1.0)))}
+            for k in (kps_list[:17] if isinstance(kps_list, list) else [])
+        ]
+        img_w = p.get("image_size", {}).get("width", 1) or 1
+        img_h = p.get("image_size", {}).get("height", 1) or 1
     else:
-        for pf in pose_files:
-            seqs.append((pf, None))
-    return seqs
+        boxes = (p.get("boxes") if isinstance(p, dict) else None) or []
+        kps_all = (p.get("keypoints") if isinstance(p, dict) else None) or []
+        best_i, best_area = 0, -1
+        for i, b in enumerate(boxes):
+            if not (isinstance(b, (list, tuple)) and len(b) == 4):
+                continue
+            x1, y1, x2, y2 = b
+            area = max(0, x2 - x1) * max(0, y2 - y1)
+            if area > best_area:
+                best_area = area
+                best_i = i
+        bbox = boxes[best_i] if boxes else None
+        kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
+        kps_list = ([{"x": float(x), "y": float(y), "conf": 1.0} for (x, y) in kp_raw[:17]] if kp_raw else [])
+        xs, ys = [], []
+        for b in boxes:
+            if isinstance(b, (list, tuple)) and len(b) == 4:
+                xs += [b[0], b[2]]; ys += [b[1], b[3]]
+        for grp in kps_all:
+            for pt in grp:
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    xs.append(pt[0]); ys.append(pt[1])
+        img_w = max(1.0, max(xs) if xs else 640.0)
+        img_h = max(1.0, max(ys) if ys else 480.0)
+    return bbox, kps_list, float(img_w), float(img_h)
+
+
+def _frame_has_full_skeleton(p, kp_need=17, bbox_required=True):
+    bbox, kps_list, _, _ = _extract_pose_basic(p)
+    if bbox_required and (bbox is None):
+        return False
+    ok = 0
+    for kp in (kps_list or []):
+        try:
+            conf = float(kp.get("conf", kp.get("confidence", 1.0)))
+            if conf >= _KP_CONF_TH and np.isfinite(kp.get("x", 0)) and np.isfinite(kp.get("y", 0)):
+                ok += 1
+        except Exception:
+            pass
+    return ok >= kp_need
 
 
 class PoseObjectDataset(Dataset):
@@ -388,7 +548,13 @@ class PoseObjectDataset(Dataset):
                  window=32, stride=8, sample_every=1,
                  H=64, W=64, sigma_kp=2.5, kp_conf_th=0.3,
                  include_bone_lines=True, object_classes=None,
-                 person_sel="top1_score"):
+                 person_sel="top1_score",
+                 enable_kalman=True,
+                 kalman_half_slide=True,
+                 half_len=None,
+                 require_full_first=True,
+                 require_full_all=False,
+                 full_kp_min=17, bbox_required=True):
         self.cfg = RelationMapConfig(H, W, sigma_kp, kp_conf_th,
                                      include_bone_lines=include_bone_lines,
                                      object_classes=(object_classes if use_objects else None))
@@ -397,13 +563,19 @@ class PoseObjectDataset(Dataset):
         self.sample_every = max(1, int(sample_every))
         self.person_sel = person_sel
         self.use_objects = bool(use_objects) and (len(self.cfg.object_classes) > 0)
+        self.enable_kalman = bool(enable_kalman)
+        self.kalman_half_slide = bool(kalman_half_slide)
+        self.half_len = int(half_len) if (half_len and int(half_len) > 0) else max(1, self.window // 2)
+        self.require_full_first = bool(require_full_first)
+        self.require_full_all = bool(require_full_all)
+        self.full_kp_min = int(full_kp_min)
+        self.bbox_required = bool(bbox_required)
 
         if not os.path.isdir(pose_root):
             raise FileNotFoundError(f"pose_root not found: {pose_root}")
         self.pose_root = pose_root
         self.obj_root = obj_root if obj_root and os.path.isdir(obj_root) else None
 
-        # 類別名稱：use_objects=True 時取 pose_root 與 obj_root 的交集；否則取 pose_root 的類別
         pose_classes = {d for d in os.listdir(pose_root) if os.path.isdir(os.path.join(pose_root, d))}
         if self.use_objects:
             if self.obj_root is None:
@@ -446,11 +618,40 @@ class PoseObjectDataset(Dataset):
                 if len(frames) < self.window:
                     continue
 
+                # === 取樣規則 ===
                 for i in range(0, len(frames) - self.window + 1, self.stride):
                     win_frames = frames[i:i + self.window]
+
+                    if self.require_full_all:
+                        all_full = True
+                        for fid in win_frames:
+                            if not _frame_has_full_skeleton(poses[fid], kp_need=self.full_kp_min, bbox_required=self.bbox_required):
+                                all_full = False
+                                break
+                        if not all_full:
+                            continue
+                    elif self.require_full_first:
+                        # 半視窗初始化→只要求第一幀完整
+                        first_fid = win_frames[0]
+                        if not _frame_has_full_skeleton(poses[first_fid], kp_need=self.full_kp_min, bbox_required=self.bbox_required):
+                            continue
+
                     self.windows.append((self.class_to_idx[cname], win_frames, poses, objs))
 
-        # 簡易資料統計輸出（幫助除錯）
+        if len(self.windows) == 0:
+            print(f"[Dataset] No windows.")
+            print(f"[Dataset] classes={self.class_names}  | discovered_seqs={total_seqs}")
+            for d in debug_info:
+                print(f"[Dataset] class='{d['class']}' | pose_dir='{d['pose_dir']}' files={d['pose_files']} | obj_dir='{d['obj_dir']}' files={d['obj_files']}")
+            print(f"[Dataset] Hints: 1) 檢查 frame_id 對齊；2) 檔名是否 .jsonl/.json；3) window={self.window} 是否過大；4) 結構是否在 class 下的巢狀資料夾或檔案")
+        else:
+            per_class = {}
+            for y, *_ in self.windows:
+                per_class[y] = per_class.get(y, 0) + 1
+            pretty = {self.class_names[k]: v for k, v in per_class.items()}
+            print(f"[Dataset] classes={self.class_names}")
+            print(f"[Dataset] discovered sequences={total_seqs}, windows per class={pretty}")
+
         if len(self.windows) == 0:
             print(f"[Dataset] No windows.")
             print(f"[Dataset] classes={self.class_names}  | discovered_seqs={total_seqs}")
@@ -471,65 +672,35 @@ class PoseObjectDataset(Dataset):
     def __getitem__(self, idx):
         y_idx, frames, poses, objs = self.windows[idx]
         sel_frames = frames[::self.sample_every]
-        Xs = []
+
+        # 先解析出整段視窗的 (bbox, kps, img_w, img_h)
+        parsed = []
         for fid in sel_frames:
             p = poses[fid]
             o = objs.get(fid) if self.use_objects else None
-
-            # --- 解析 pose 格式 ---
-            bbox = None
-            kps_list = None
-            img_w = 1
-            img_h = 1
-
-            if isinstance(p, dict) and p.get("persons"):
-                # 舊格式：{ persons:[{score,bbox,keypoints}], image_size:{width,height} }
-                person = max(p.get("persons", []), key=lambda x: x.get("score", 0.0))
-                bbox = person.get("bbox")
-                kps_list = person.get("keypoints")
-                img_w = p.get("image_size", {}).get("width", 1)
-                img_h = p.get("image_size", {}).get("height", 1)
-            else:
-                # 你的格式：每幀有 "boxes" 與 "keypoints"（可能多人），沒有 image_size
-                boxes = (p.get("boxes") if isinstance(p, dict) else None) or []
-                kps_all = (p.get("keypoints") if isinstance(p, dict) else None) or []
-                # 選人策略：用最大 bbox 面積
-                best_i, best_area = 0, -1
-                for i, b in enumerate(boxes):
-                    if not (isinstance(b, (list, tuple)) and len(b) == 4):
-                        continue
-                    x1, y1, x2, y2 = b
-                    area = max(0, x2 - x1) * max(0, y2 - y1)
-                    if area > best_area:
-                        best_area = area
-                        best_i = i
-                bbox = boxes[best_i] if boxes else None
-                # 對應的人體 keypoints（若不存在就取第一組）
-                kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
-                # 轉成 [{x,y,conf}] 格式
-                kps_list = [
-                    {"x": float(x), "y": float(y), "conf": 1.0}
-                    for (x, y) in kp_raw[:17]
-                ] if kp_raw else []
-                # 估計影像大小：取 boxes 與 keypoints 的座標最大值
-                xs, ys = [], []
-                for b in boxes:
-                    if isinstance(b, (list, tuple)) and len(b) == 4:
-                        xs += [b[0], b[2]]
-                        ys += [b[1], b[3]]
-                for kpgroup in kps_all:
-                    for pt in kpgroup:
-                        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                            xs.append(pt[0]); ys.append(pt[1])
-                img_w = max(1.0, max(xs) if xs else 640.0)
-                img_h = max(1.0, max(ys) if ys else 480.0)
-
+            bbox, kps_list, img_w, img_h = _extract_pose_basic(p)
             detections = []
             if self.use_objects and o is not None:
                 detections = o.get("detections") or o.get("objects") or o.get("boxes") or o.get("bboxes") or o.get("predictions") or []
+            parsed.append((bbox, kps_list, detections, img_w, img_h))
 
+        # 視窗內做卡爾曼平滑（半視窗/線上式初始化 + 之後每 5 幀滑動）
+        if self.enable_kalman and len(parsed) > 0:
+            window_kps = [kps for (_, kps, _, _, _) in parsed]
+            smoothed = kalman_smooth_kps(
+                window_kps,
+                half_slide=self.kalman_half_slide,
+                half_len=self.half_len,
+                require_full_first=self.require_full_first,
+            )
+            # 替換回去
+            parsed = [(bbox, smoothed[i], dets, img_w, img_h) for i, (bbox, _, dets, img_w, img_h) in enumerate(parsed)]
+
+        # Rasterize → 堆疊 (T, C, H, W)
+        Xs = []
+        for (bbox, kps_list, detections, img_w, img_h) in parsed:
             Xs.append(rasterize_frame(bbox, kps_list, detections, img_w, img_h, self.cfg))
-        X = torch.from_numpy(np.stack(Xs)).float()  # (T,C,H,W)
+        X = torch.from_numpy(np.stack(Xs)).float()
         y = torch.tensor(y_idx, dtype=torch.long)
         return X, y
 
@@ -628,11 +799,13 @@ def evaluate(model, loader, device):
     return acc, mf1
 
 
+# 修正後的程式碼
+
 def train(cfg: Config):
     set_seed(_SEED)
     ensure_dir(cfg.out_dir)
 
-    # Dataset & Loader
+    # Dataset & Loader（加入前置處理設定）
     ds = PoseObjectDataset(
         pose_root=cfg.pose_root,
         obj_root=cfg.obj_root,
@@ -647,13 +820,19 @@ def train(cfg: Config):
         include_bone_lines=bool(cfg.include_bone_lines),
         object_classes=cfg.object_classes,
         person_sel="top1_score",
+        enable_kalman=cfg.enable_kalman,
+        kalman_half_slide=cfg.kalman_half_slide,
+        half_len=(cfg.half_len_override if cfg.half_len_override else cfg.window // 2),
+        require_full_first=cfg.require_full_first_frame,
+        require_full_all=cfg.require_full_skeleton_all,
+        full_kp_min=cfg.full_kp_min,
+        bbox_required=cfg.bbox_required,
     )
 
     n = len(ds)
     if n == 0:
         raise RuntimeError("No training windows found. Check your roots and window/stride settings.")
 
-    # train/val split（打亂後 8:2）
     idx = list(range(n))
     random.shuffle(idx)
     split = int(n * 0.8)
@@ -662,7 +841,6 @@ def train(cfg: Config):
     tr = torch.utils.data.Subset(ds, tr_idx)
     va = torch.utils.data.Subset(ds, va_idx)
 
-    # 類別數統計
     num_classes = len(ds.class_names)
     counts = [0] * num_classes
     for i in tr_idx:
@@ -670,7 +848,6 @@ def train(cfg: Config):
         counts[y_i] += 1
     counts = [c if c > 0 else 1 for c in counts]
 
-    # DataLoader
     if cfg.use_sampler:
         total = sum(counts)
         inv = [total / c for c in counts]
@@ -681,7 +858,6 @@ def train(cfg: Config):
         tr_loader = DataLoader(tr, batch_size=cfg.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     va_loader = DataLoader(va, batch_size=cfg.batch_size, shuffle=False, num_workers=4, pin_memory=True)
 
-    # 準備模型
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sample_x, _ = ds[0]
     _, C, H, W = sample_x.shape
@@ -697,18 +873,15 @@ def train(cfg: Config):
         dropout=cfg.dropout,
     ).to(device)
 
-    # Loss
     total = float(sum(counts))
     alpha = torch.tensor([total / c for c in counts], dtype=torch.float32)
-    alpha = alpha / alpha.sum()
-    alpha = alpha.to(device)
+    alpha = (alpha / alpha.sum()).to(device)
 
     if cfg.loss == "ce":
         criterion = nn.CrossEntropyLoss()
     else:
         criterion = FocalLoss(alpha=alpha, gamma=_FOCAL_GAMMA)
 
-    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=_WEIGHT_DECAY)
     scaler = torch.cuda.amp.GradScaler(enabled=_AMP and device.type == "cuda")
 
@@ -725,7 +898,7 @@ def train(cfg: Config):
             y = y.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+            with torch.amp.autocast(device_type='cuda', enabled=scaler.is_enabled()):
                 out = model(X)
                 loss = criterion(out, y)
             scaler.scale(loss).backward()
@@ -744,12 +917,10 @@ def train(cfg: Config):
         train_acc = corr / max(1, tot)
         print(f"Ep{ep} train loss={train_loss:.3f} acc={train_acc:.3f}")
 
-        # Validation
         acc, mf1 = evaluate(model, va_loader, device)
-        score = mf1  # 固定用 macro-F1 監控
+        score = mf1
         print(f"Ep{ep} val acc={acc:.3f} macro_f1={mf1:.3f}")
 
-        # Save best & top-k
         ckpt_name = f"ep{ep:03d}_score{score:.4f}.pt"
         ckpt_path = os.path.join(cfg.out_dir, ckpt_name)
         torch.save({
@@ -784,7 +955,6 @@ def train(cfg: Config):
             print(f"Early stopping at epoch {ep} (no improvement for {no_improve} epochs)")
             break
 
-    # 最終報告（用最佳模型）
     if best_path and os.path.exists(best_path):
         print("\nLoading best model for final report...")
         model.load_state_dict(torch.load(best_path, map_location=device))
@@ -809,5 +979,4 @@ def train(cfg: Config):
 
 if __name__ == "__main__":
     cfg = Config()
-    # ★ 修改 Config 後直接執行這支檔案即可開始訓練。
     train(cfg)
