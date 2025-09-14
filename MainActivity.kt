@@ -1,69 +1,428 @@
-@file:OptIn(androidx.media3.common.util.UnstableApi::class)
-
 package com.example.myapplication
 
-import android.Manifest
-import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.os.Build
+import android.os.Bundle
+import android.os.SystemClock
+import android.util.Log
+import android.view.View
+import android.widget.*
+import androidx.appcompat.app.AppCompatActivity
+import androidx.appcompat.widget.SwitchCompat
+import androidx.camera.core.*
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import java.nio.ByteBuffer
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import kotlin.math.min
+import org.json.JSONArray
+import org.json.JSONObject
+import android.view.Surface
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaPlayer
 import android.media.MediaRecorder
-import android.os.Bundle
-import android.util.Log
-import android.view.View
-import android.widget.ImageButton
-import android.widget.ImageView
-import android.widget.Toast
-import androidx.appcompat.app.AlertDialog
-import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.Preview
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
-import androidx.camera.video.*
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
-import java.io.*
-import java.util.Date
-import java.util.Locale
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import kotlin.concurrent.thread
-import android.os.Build
 import android.speech.SpeechRecognizer
 import android.speech.RecognizerIntent
 import android.speech.RecognitionListener
 import android.os.Handler
 import android.os.Looper
-import java.text.SimpleDateFormat
+import android.content.Intent
 import android.content.ComponentName
 import android.speech.RecognitionService
 import android.media.AudioManager
+import java.io.*
+import androidx.appcompat.app.AlertDialog
 import android.content.Context
+import android.Manifest
+import kotlin.concurrent.thread
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.graphics.Paint
+import android.view.Gravity
+import androidx.core.view.updateLayoutParams
+import android.widget.FrameLayout
+import kotlin.math.roundToInt
+
+
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var previewView: PreviewView
-    private lateinit var recordIndicator: View
-    private lateinit var headerOverlay: View
-    private lateinit var backButton: ImageView
+    private lateinit var overlayView: View
+    private lateinit var btnStartInfer: Button
+    private lateinit var btnStopInfer: Button
+    private lateinit var btnBackToImage: Button
+    private lateinit var seekFps: SeekBar
+    private lateinit var tvFpsValue: TextView
+    private lateinit var switchRenderBoxes: SwitchCompat
+    private lateinit var switchObjectDetect: SwitchCompat
+    private lateinit var switchPoseDetect: SwitchCompat
+    private lateinit var classes: List<String>
+
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var imageAnalysis: ImageAnalysis? = null
     private lateinit var cameraExecutor: ExecutorService
+
+    // FPS 控制
+    private var targetFps: Int = 10
+    private var allowProcess = false
+    private var lastProcessTimeMs = 0L
+
+    companion object {
+        private const val CAMERA_PERMISSION_CODE = 1001
+        private val REQUIRED_PERMISSIONS = arrayOf(android.Manifest.permission.CAMERA)
+        private const val TAG = "CameraDetect"
+
+        const val ACTION_STT_UPDATE = "com.example.myapplication.ACTION_STT_UPDATE"
+        const val EXTRA_STT_TEXT = "EXTRA_STT_TEXT"
+        const val EXTRA_STT_IS_PARTIAL = "EXTRA_STT_IS_PARTIAL"
+
+        const val MIC_PERMISSION_CODE = 2002
+    }
+
+    // --- ONNX 相關 ---
+    private lateinit var ortEnv: ai.onnxruntime.OrtEnvironment
+    private lateinit var objSession: ai.onnxruntime.OrtSession
+    private lateinit var poseSession: ai.onnxruntime.OrtSession
+    private val objDetector = ObjectDetector()
+    private val poseDetector = PoseDetector()
+
+    private lateinit var ws: WsManager
+    private var frameId: Long = 0
+    // 把你的 WS 位址換成實際值（支援 ws:// 或 wss://）
+    private val WS_URL = "wss://518b99a27170.ngrok-free.app/ws/pose?user_id=3"
+
+    private lateinit var switchSendWs: SwitchCompat
+    @Volatile private var sendWsEnabled = false
+    // 是否在 overlay 繪製（用來測吞吐）
+    @Volatile private var renderEnabled = true
+
+    // 開關：執行哪種偵測
+    @Volatile private var objectDetectEnabled = true
+    @Volatile private var poseDetectEnabled = false
+
+    // === 語音 / STT ===
+    private lateinit var headerOverlay: View
     private lateinit var recordVoiceButton: ImageButton
+    private lateinit var statusText: TextView
 
-    private var videoCapture: VideoCapture<Recorder>? = null
-    private var recording: Recording? = null
-    private var isOverlayVisible = false
-    private var isRecording = false
-    private var isVoiceRecording = false
+    private var stt: SpeechRecognizer? = null
+    private var pausedByPlayback = false
+    private var isSttRunning = false
+    private var sttLoopEnabled = false
+    private var sttLastEventTs = 0L
+    private val sttHandler = Handler(Looper.getMainLooper())
 
+    private lateinit var voiceStatus: TextView
+    private lateinit var inferenceStatus: TextView
+
+    @Volatile private var sttReady = false
+    @Volatile private var partialFlushed = false
+    @Volatile private var sttEmitAllowed = false
+    @Volatile private var sttGateDeadline = 0L
+    @Volatile private var sttTriggeredByMonitor = false
+    @Volatile private var sttOneShot = false
+
+    private var sttLang = "zh-Hant-TW"
+    private var noMatchStreak = 0
+    private var clientErrStreak = 0
+    private var useMinimalSttIntent = false
+    private var isGoogleStt = false
+
+    private var lastPartialWritten: String = ""
+    private var lastPartialWrittenAt: Long = 0L
+    private val partialWriteMinIntervalMs = 250L
+    private var sttLastPartial: String = ""
+
+    private fun Int.dp(): Int = (this * resources.displayMetrics.density).toInt()
+
+    // === 背景長輩聲音監聽 ===
+    @Volatile private var monitorShouldRun = false
+    private var monitorThread: Thread? = null
     private var audioRecord: AudioRecord? = null
-    private val REQUEST_CODE_PERMISSIONS = 1001
-    private val REQUIRED_PERMISSIONS = arrayOf(
-        Manifest.permission.CAMERA,
-        Manifest.permission.RECORD_AUDIO
-    )
+    private var bgAudioRecord: AudioRecord? = null
+    private var isVoiceRecording = false
+    private var previousEmbedding: FloatArray? = null
+    private var currentSegment = mutableListOf<ByteArray>()
+    private var lastSegmentTime = 0L
+    @Volatile private var lastElderAt = 0L
+    private val unlockStreakNeed = 2
+    private val minElderFramesToUnlock = 6
+    private val emitHoldMs = 3000L
 
+    private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    private var playbackFocusRequest: android.media.AudioFocusRequest? = null
+
+
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        // 綁定 View
+        previewView        = findViewById(R.id.previewView)
+        overlayView        = findViewById(R.id.overlayView)
+        btnStartInfer      = findViewById(R.id.btnStartInfer)
+        btnStopInfer       = findViewById(R.id.btnStopInfer)
+        btnBackToImage     = findViewById(R.id.btnBackToImage)
+        seekFps            = findViewById(R.id.seekFps)
+        tvFpsValue         = findViewById(R.id.tvFpsValue)
+        switchRenderBoxes  = findViewById(R.id.switchRenderBoxes)
+        switchObjectDetect = findViewById(R.id.switchObjectDetect)
+        switchPoseDetect   = findViewById(R.id.switchPoseDetect)
+        classes = readClasses()
+        recordVoiceButton = findViewById(R.id.saveVoiceButton)
+        statusText = findViewById(R.id.statusText)
+        inferenceStatus = findViewById(R.id.inferenceStatus)
+        inferenceStatus.bringToFront()
+
+
+        // 先初始化 Camera 執行緒，避免 startCamera() 尚未就緒
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // ONNX Sessions（放這裡即可）
+        ortEnv = ai.onnxruntime.OrtEnvironment.getEnvironment()
+        objSession  = ortEnv.createSession(readRawModel(R.raw.yolov8n), ai.onnxruntime.OrtSession.SessionOptions())
+        poseSession = ortEnv.createSession(readRawModel(R.raw.yolov8n_pose), ai.onnxruntime.OrtSession.SessionOptions())
+
+        // 語音按鈕
+        recordVoiceButton.setOnClickListener {
+            if (hasRegisteredElder()) {
+                Toast.makeText(this, "已註冊：長按可重置", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (!isVoiceRecording) {
+                isVoiceRecording = true
+                setRegisteringUI(true)
+                recordAndShowDialog {
+                    isVoiceRecording = false
+                    updateStatus("錄音完成，請確認聲音樣本")
+                    setRegisteringUI(false)
+                }
+            }
+        }
+
+        setRegisteredUI(hasRegisteredElder())
+
+        // 權限：相機（單獨處理）
+        if (hasCameraPermission()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.CAMERA),
+                CAMERA_PERMISSION_CODE
+            )
+        }
+
+        // 權限：麥克風（單獨處理）
+        if (hasAudioPermission()) {
+            startSttIfPermitted()
+        } else {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                MIC_PERMISSION_CODE
+            )
+        }
+
+        // FPS SeekBar（1~30，預設10）
+        seekFps.max = 30
+        seekFps.progress = targetFps
+        tvFpsValue.text = "$targetFps fps"
+        seekFps.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                val p = progress.coerceIn(1, 30)
+                targetFps = p
+                tvFpsValue.text = "$p fps"
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        })
+
+        // 顯示框（整體渲染）開關
+        renderEnabled = switchRenderBoxes.isChecked
+        switchRenderBoxes.setOnCheckedChangeListener { _, isChecked ->
+            renderEnabled = isChecked
+            if (!isChecked) overlayView.overlay.clear()
+        }
+
+        // 模式開關：物件 / 骨架
+        objectDetectEnabled = switchObjectDetect.isChecked
+        poseDetectEnabled   = switchPoseDetect.isChecked
+        switchObjectDetect.setOnCheckedChangeListener { _, isChecked -> objectDetectEnabled = isChecked }
+        switchPoseDetect.setOnCheckedChangeListener   { _, isChecked -> poseDetectEnabled   = isChecked }
+
+        btnBackToImage.setOnClickListener { finish() }
+        btnStartInfer.setOnClickListener {
+            allowProcess = true
+            lastProcessTimeMs = 0L
+            Toast.makeText(this, "開始以 $targetFps fps 擷取幀", Toast.LENGTH_SHORT).show()
+        }
+        btnStopInfer.setOnClickListener {
+            allowProcess = false
+            Toast.makeText(this, "已停止擷取幀", Toast.LENGTH_SHORT).show()
+        }
+
+        // WebSocket
+        ws = WsManager(WS_URL)
+        switchSendWs = findViewById(R.id.switchSendWs)
+        sendWsEnabled = switchSendWs.isChecked
+        switchSendWs.setOnCheckedChangeListener { _, isChecked ->
+            sendWsEnabled = isChecked
+            if (isChecked) {
+                ws.connect(
+                    onState = { ok, err -> if (!ok) Log.w(TAG, "WS connect failed: $err") },
+                    onMessage = { msg -> handleServerMessage(msg) }
+                )
+            } else {
+                ws.close()
+            }
+        }
+    }
+
+    // ===== 權限 =====
+    private fun allPermissionsGranted() =
+        REQUIRED_PERMISSIONS.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+
+    private fun requestCameraPermission() {
+        ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, CAMERA_PERMISSION_CODE)
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+
+        when (requestCode) {
+            CAMERA_PERMISSION_CODE -> {
+                val camOk = hasCameraPermission()
+                val micOk = hasAudioPermission()
+
+                if (camOk) {
+                    startCamera()
+                } else {
+                    Toast.makeText(this, "未授權相機，無法開啟預覽", Toast.LENGTH_SHORT).show()
+                    finish()
+                    return
+                }
+
+                // 有麥克風就開 STT；沒有就繼續顯示提示（不結束 app）
+                if (micOk) {
+                    startSttIfPermitted()
+                } else {
+                    Toast.makeText(this, "未授權麥克風，語音辨識將無法使用", Toast.LENGTH_SHORT).show()
+                }
+            }
+
+            MIC_PERMISSION_CODE -> {
+                if (hasAudioPermission()) {
+                    startSttIfPermitted()
+                    Toast.makeText(this, "已授權麥克風", Toast.LENGTH_SHORT).show()
+                } else {
+                    Toast.makeText(this, "未授權麥克風，無法錄音/辨識", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun hasAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun hasCameraPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+
+    // ===== CameraX: Preview + Analysis =====
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            try {
+                cameraProvider = cameraProviderFuture.get()
+
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+
+                val selector = CameraSelector.DEFAULT_BACK_CAMERA
+
+                imageAnalysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .setTargetRotation(safeRotation())
+                    .build().apply {
+                        setAnalyzer(cameraExecutor) { imageProxy -> analyzeFrame(imageProxy) }
+                    }
+
+                cameraProvider?.unbindAll()
+                cameraProvider?.bindToLifecycle(this, selector, preview, imageAnalysis)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "startCamera error", e)
+                Toast.makeText(this, "相機初始化失敗：${e.message}", Toast.LENGTH_SHORT).show()
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun analyzeFrame(image: ImageProxy) {
+        try {
+            val now = SystemClock.elapsedRealtime()
+            val interval = (1000L / targetFps.coerceAtLeast(1))
+            val shouldProcess = allowProcess && (now - lastProcessTimeMs >= interval)
+
+            if (shouldProcess) {
+                lastProcessTimeMs = now
+                val bmp = imageProxyToBitmapRGBA(image)
+                processFrame(bmp)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "analyzeFrame error", e)
+        } finally {
+            image.close()
+        }
+    }
+
+    // 將 ImageProxy (RGBA_8888) 轉 Bitmap（處理 rowStride 補齊 + 旋正）
+    private fun imageProxyToBitmapRGBA(image: ImageProxy): Bitmap {
+        val plane = image.planes[0]
+        val srcW = image.width
+        val srcH = image.height
+        val rowStride = plane.rowStride
+        val pixelStride = plane.pixelStride
+
+        val buffer = plane.buffer
+        buffer.rewind()
+
+        val bmp = Bitmap.createBitmap(srcW, srcH, Bitmap.Config.ARGB_8888)
+        if (rowStride == srcW * pixelStride) {
+            bmp.copyPixelsFromBuffer(buffer)
+        } else {
+            val row = ByteArray(rowStride)
+            var y = 0
+            while (y < srcH) {
+                buffer.get(row, 0, rowStride)
+                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(row, 0, srcW * pixelStride))
+                y++
+            }
+        }
+
+        val degrees = image.imageInfo.rotationDegrees
+        if (degrees == 0) return bmp
+        val m = android.graphics.Matrix().apply { postRotate(degrees.toFloat()) }
+        val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+        if (rotated != bmp) bmp.recycle()
+        return rotated
+    }
+
+    // ===== 檔案與廣播 =====
     private fun transcriptFile(): File =
         File(getExternalFilesDir(null) ?: filesDir, "stt_transcript.jsonl")
 
@@ -75,238 +434,67 @@ class MainActivity : AppCompatActivity() {
             put("type", type)  // "final" 或 "partial"
         }
         val f = transcriptFile()
-        android.util.Log.d("STT", "appendTranscript -> ${f.absolutePath}  type=$type  text=$text")
-        java.io.FileOutputStream(f, /* append = */ true).bufferedWriter(Charsets.UTF_8).use {
+        Log.d("STT", "appendTranscript -> ${f.absolutePath}  type=$type  text=$text")
+        FileOutputStream(f, /* append = */ true).bufferedWriter(Charsets.UTF_8).use {
             it.appendLine(obj.toString())
         }
-    }
-
-    private fun startSttLoop() {
-        if (sttLoopEnabled) return
-        sttLoopEnabled = true
-
-        sttEmitAllowed = true
-        sttGateDeadline = 0L
-        sttTriggeredByMonitor = false
-        sttOneShot = false
-        sttLastPartial = ""
-
-        stopBackgroundVoiceMonitor()
-        if (stt == null) initStt()
-        updateStatus("辨識中…")
-
-        // 立刻啟動（你已改對）
-        sttHandler.post { startSttOnce() }
-        sttHandler.removeCallbacks(sttWatchdog)
-        sttHandler.postDelayed(sttWatchdog, 4000L)
-    }
-
-    private fun startSttIfPermitted() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED) {
-            startSttLoop()
-        } else {
-            updateStatus("等待麥克風授權…")
-        }
-    }
-
-    private var previousEmbedding: FloatArray? = null
-    private var currentSegment = mutableListOf<ByteArray>()
-    private var lastSegmentTime = 0L
-    private lateinit var statusText: android.widget.TextView
-    private var sttLastPartial: String = ""
-
-    @Volatile private var monitorShouldRun = false
-
-    private var monitorThread: Thread? = null
-
-    private var bgAudioRecord: AudioRecord? = null
-
-    private var stt: SpeechRecognizer? = null
-    private var isSttRunning = false
-    private var sttLoopEnabled = false
-    private var sttLastEventTs = 0L
-    private val sttHandler = Handler(Looper.getMainLooper())
-
-    @Volatile private var videoLoopEnabled = false      // 是否持續輪錄
-    @Volatile private var isStartingRecording = false   // 正在呼叫 start 的過程
-    @Volatile private var sttTriggeredByMonitor = false  // 這次 STT 是被背景偵測觸發
-    @Volatile private var sttOneShot = false             // 這次只做一輪（句子結束就停）
-    private val videoHandler = Handler(Looper.getMainLooper())
-    private val videoStartRunnable = Runnable { tryStartRecording() }
-    @Volatile private var sttReady = false
-    @Volatile private var partialFlushed = false
-    @Volatile private var sttEmitAllowed = false
-    @Volatile private var sttGateDeadline = 0L
-    private val unlockStreakNeed = 2
-    @Volatile private var lastElderAt = 0L
-    private val emitHoldMs = 3000L
-    private val minElderFramesToUnlock = 6
-
-    private var sttLang = "zh-TW"
-    private var noMatchStreak = 0
-
-    private var clientErrStreak = 0         // 連續 ERROR_CLIENT 次數
-    private var useMinimalSttIntent = false // 是否改用極簡 Intent
-
-    private var isGoogleStt = false
-
-    private var lastPartialWritten: String = ""
-    private var lastPartialWrittenAt: Long = 0L
-    private val partialWriteMinIntervalMs = 250L
-
-    private fun scheduleNextClip(delayMs: Long = 0L) {
-        videoHandler.removeCallbacks(videoStartRunnable)
-        if (videoLoopEnabled) videoHandler.postDelayed(videoStartRunnable, delayMs)
-    }
-
-    private val sttWatchdog = object : Runnable {
-        override fun run() {
-            if (!sttLoopEnabled) return
-            val now = System.currentTimeMillis()
-            // 超過 8 秒沒事件或目前沒在跑 → 重啟一次
-            if (!isSttRunning || now - sttLastEventTs > 8000L) {
-                try { stt?.cancel() } catch (_: Exception) {}
-                startSttOnce()
-            }
-            sttHandler.postDelayed(this, 4000L)
-        }
-    }
-
-    companion object {
-        const val ACTION_STT_UPDATE = "com.example.myapplication.ACTION_STT_UPDATE"
-        const val EXTRA_STT_TEXT = "EXTRA_STT_TEXT"
-        const val EXTRA_STT_IS_PARTIAL = "EXTRA_STT_IS_PARTIAL"
     }
 
     private fun broadcastStt(text: String, partial: Boolean) {
         if (text.isBlank()) return
         val intent = Intent(ACTION_STT_UPDATE).apply {
-            setPackage(packageName)                 // 限定接收者在同包
+            setPackage(packageName)
             putExtra(EXTRA_STT_TEXT, text)
             putExtra(EXTRA_STT_IS_PARTIAL, partial)
         }
         sendBroadcast(intent)
     }
 
-    private fun touchLastElder() {
-        lastElderAt = System.currentTimeMillis()
-    }
-
-    private fun startSttFromMonitor() {
-        stopBackgroundVoiceMonitor()
-
-        sttReady = false
-        sttTriggeredByMonitor = true
-        sttOneShot = true
-        sttLoopEnabled = true
-
-        touchLastElder()
-
-        if (stt == null) initStt()
-        updateStatus("辨識中…")
-
-        // 立刻啟動
-        sttHandler.post { startSttOnce() }
-        sttHandler.removeCallbacks(sttWatchdog)
-        sttHandler.postDelayed(sttWatchdog, 4000L)
-    }
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        Log.d("DeviceABI", "Supported ABIs: ${Build.SUPPORTED_ABIS.joinToString()}")
-
-        window.decorView.systemUiVisibility = (
-                View.SYSTEM_UI_FLAG_FULLSCREEN or
-                        View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or
-                        View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                )
-        setContentView(R.layout.activity_main)
-
-        previewView = findViewById(R.id.previewView)
-        recordIndicator = findViewById(R.id.recordIndicator)
-        headerOverlay = findViewById(R.id.headerOverlay)
-        backButton = findViewById(R.id.backButton)
-        recordVoiceButton = findViewById(R.id.saveVoiceButton)
-        statusText = findViewById(R.id.statusText)
-
-        recordVoiceButton.setOnClickListener {
-            // 已註冊：不觸發錄音，改提示「長按可重置」
-            if (hasRegisteredElder()) {
-                Toast.makeText(this, "已註冊：長按可重置", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!isVoiceRecording) {
-                recordVoiceButton.setBackgroundResource(R.drawable.mic_circle_background)
-                isVoiceRecording = true
-                recordAndShowDialog {
-                    recordVoiceButton.setBackgroundResource(android.R.color.transparent)
-                    isVoiceRecording = false
-                }
-            }
-        }
-
-        // 長按麥克風 → 重置註冊
-        recordVoiceButton.setOnLongClickListener {
-            AlertDialog.Builder(this)
-                .setTitle("重置長輩聲音")
-                .setMessage("確定要清除已註冊的聲紋嗎？")
-                .setPositiveButton("清除") { _, _ -> resetRegistration() }
-                .setNegativeButton("取消", null)
-                .show()
-            true
-        }
-
-        previewView.setOnClickListener {
-            isOverlayVisible = !isOverlayVisible
-            if (isOverlayVisible) {
-                headerOverlay.apply {
-                    alpha = 0f
-                    visibility = View.VISIBLE
-                    animate().alpha(1f).setDuration(300).start()
-                }
-            } else {
-                headerOverlay.animate().alpha(0f).setDuration(300).withEndAction {
-                    headerOverlay.visibility = View.GONE
-                }.start()
-            }
-        }
-
-        backButton.setOnClickListener {
-            val intent = Intent(this, DashboardActivity::class.java)
-            intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
-            startActivity(intent)
-        }
-
-        cameraExecutor = Executors.newSingleThreadExecutor()
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-        }
-
-        // 註冊狀態驅動 UI 與背景監聽
-        setRegisteredUI(hasRegisteredElder())
-        if (allPermissionsGranted()) {
-            startCamera()
-            startSttIfPermitted()          // ★ 取得錄音權限後才啟 STT
-        } else {
-            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-        }
-        setRegisteredUI(hasRegisteredElder())
-    }
-
+    // ===== UI & 狀態 =====
     private fun updateStatus(text: String) {
-        runOnUiThread {
-            statusText.text = "狀態：$text"
-        }
+        runOnUiThread { statusText.text = "狀態：$text" }
     }
+
+    private fun touchLastElder() { lastElderAt = System.currentTimeMillis() }
 
     private fun isDevicePlaying(): Boolean {
         val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         return am.isMusicActive
     }
+
+    // ===== STT 初始化與 Intent =====
+    private fun pickRecognizer(): ComponentName? {
+        val pm = packageManager
+        val query = pm.queryIntentServices(
+            Intent(RecognitionService.SERVICE_INTERFACE),
+            PackageManager.MATCH_ALL
+        )
+        val realStt = query.filter { it.serviceInfo.permission == "android.permission.BIND_SPEECH_RECOGNITION_SERVICE" }
+        val google = realStt.firstOrNull {
+            it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" ||
+                    it.serviceInfo.packageName == "com.google.android.apps.gsa"
+        }
+        val chosen = google ?: realStt.firstOrNull()
+        return chosen?.let { ComponentName(it.serviceInfo.packageName, it.serviceInfo.name) }
+    }
+
+    private fun buildSttIntent(): Intent =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            // 先固定一個語言讓流程穩定；通了再考慮動態切換
+            sttLang = "zh-Hant-TW"
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            }
+            if (isGoogleStt) {
+                putExtra("android.speech.extra.DICTATION_MODE", true)
+            }
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+            // 靜音時間維持系統預設（更容易成功）
+        }
 
     private fun initStt() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
@@ -336,7 +524,7 @@ class MainActivity : AppCompatActivity() {
                 sttReady = true
 
                 updateStatus("請開始說話")
-
+                showMicListeningIcon()
                 touchLastElder()
 
                 if (sttTriggeredByMonitor) {
@@ -447,7 +635,6 @@ class MainActivity : AppCompatActivity() {
                 Log.e("STT", "onError=$error (${sttErrorName(error)})")
 
                 when (error) {
-                    // 客戶端錯誤：維持你原本的 reset 流程
                     SpeechRecognizer.ERROR_CLIENT -> {
                         clientErrStreak++
                         sttEmitAllowed = false
@@ -467,26 +654,19 @@ class MainActivity : AppCompatActivity() {
                             if (sttLoopEnabled) sttHandler.postDelayed({ startSttOnce() }, 1000)
                         }
                     }
-
-                    // 這兩種最常見：聽不到或太短 → 簡單延遲再啟，不再切語言
                     SpeechRecognizer.ERROR_NO_MATCH,
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
                         noMatchStreak++
                         if (sttLoopEnabled) sttHandler.postDelayed({ startSttOnce() }, 600)
                     }
-
-                    // 麥克風暫時被占：冷卻一下再試
                     SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
                         if (sttLoopEnabled) sttHandler.postDelayed({ startSttOnce() }, 700)
                     }
-
-                    // 伺服器類：照你原本邏輯 reset
                     SpeechRecognizer.ERROR_SERVER -> {
                         sttEmitAllowed = false
                         sttGateDeadline = 0L
                         safeResetStt(1000)
                     }
-
                     else -> {
                         if (sttLoopEnabled) sttHandler.postDelayed({ startSttOnce() }, 1000)
                     }
@@ -497,114 +677,6 @@ class MainActivity : AppCompatActivity() {
                 sttLastEventTs = System.currentTimeMillis()
             }
         })
-    }
-
-    private fun forceReleaseMic() {
-        try { audioRecord?.stop() } catch (_: Exception) {}
-        try { audioRecord?.release() } catch (_: Exception) {}
-        audioRecord = null
-
-        try { bgAudioRecord?.stop() } catch (_: Exception) {}
-        try { bgAudioRecord?.release() } catch (_: Exception) {}
-        bgAudioRecord = null
-
-        monitorShouldRun = false
-    }
-
-    private fun pickRecognizer(): ComponentName? {
-        val pm = packageManager
-        val query = pm.queryIntentServices(
-            Intent(RecognitionService.SERVICE_INTERFACE),
-            PackageManager.MATCH_ALL
-        )
-        val realStt = query.filter { it.serviceInfo.permission == "android.permission.BIND_SPEECH_RECOGNITION_SERVICE" }
-        val google = realStt.firstOrNull {
-            it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" ||
-                    it.serviceInfo.packageName == "com.google.android.apps.gsa"
-        }
-        val chosen = google ?: realStt.firstOrNull()
-        return chosen?.let { ComponentName(it.serviceInfo.packageName, it.serviceInfo.name) }
-    }
-
-    private fun buildSttIntent(): Intent =
-        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-
-            // 先固定一個語言讓流程穩定；通了再考慮動態切換
-            sttLang = "zh-Hant-TW"           // 或 "cmn-Hant-TW" 二擇一
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
-
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-
-            // 一些裝置需要 calling package 才會穩
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            }
-
-            if (isGoogleStt) {
-                putExtra("android.speech.extra.DICTATION_MODE", true)
-            }
-
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
-
-            // ⚠️ 先不要設定靜音時間，先用系統預設（更容易成功）
-            // putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 2000)
-            // putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1500)
-            // putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 1200)
-        }
-
-    override fun onResume() {
-        super.onResume()
-        videoLoopEnabled = false
-        if (allPermissionsGranted()) {
-            if (videoCapture == null) startCamera()
-        } else {
-            updateStatus("等待授權中…")
-        }
-    }
-
-    override fun onPause() {
-        super.onPause()
-
-        sttEmitAllowed = false
-        sttGateDeadline = 0L
-
-        videoLoopEnabled = false
-        videoHandler.removeCallbacksAndMessages(null)
-
-        try { recording?.stop() } catch (_: Exception) {}
-        try { recording?.close() } catch (_: Exception) {}
-        recording = null
-        isRecording = false
-        isStartingRecording = false
-
-        try { ProcessCameraProvider.getInstance(this).get().unbindAll() } catch (_: Exception) {}
-        videoCapture = null
-
-        stopBackgroundVoiceMonitor()
-
-        if (sttLoopEnabled) stopSttLoop()
-    }
-
-    private fun stopSttLoop() {
-        sttLoopEnabled = false
-        isSttRunning = false
-        sttOneShot = false
-        sttTriggeredByMonitor = false
-
-        sttEmitAllowed = false
-        sttGateDeadline = 0L
-
-        if (sttLastPartial.isNotBlank() && !partialFlushed) {
-            partialFlushed = true
-            sttLastPartial = ""
-        }
-        sttHandler.removeCallbacksAndMessages(null)
-        try { stt?.stopListening() } catch (_: Exception) {}
-        try { stt?.cancel() } catch (_: Exception) {}
-        // 這會在 ~600ms 後依註冊狀態恢復背景監聽（不會搶麥）
-        sttHandler.postDelayed({ setRegisteredUI(hasRegisteredElder()) }, 600L)
     }
 
     private fun sttErrorName(code: Int) = when (code) {
@@ -623,7 +695,6 @@ class MainActivity : AppCompatActivity() {
     private fun safeResetStt(delay: Long) {
         sttEmitAllowed = false
         sttGateDeadline = 0L
-
         try { stt?.cancel() } catch (_: Exception) {}
         try { stt?.destroy() } catch (_: Exception) {}
         stt = null
@@ -633,8 +704,79 @@ class MainActivity : AppCompatActivity() {
         }, delay)
     }
 
+    // ===== STT 流程控制 =====
+    private fun showMicListeningIcon() {
+        if (!isVoiceRecording) {
+            recordVoiceButton.setImageResource(R.drawable.ic_mic_registered)
+        }
+    }
+
+    private fun startSttLoop() {
+        if (sttLoopEnabled) return
+        sttLoopEnabled = true
+        showMicListeningIcon()
+
+        sttEmitAllowed = true
+        sttGateDeadline = 0L
+        sttTriggeredByMonitor = false
+        sttOneShot = false
+        sttLastPartial = ""
+
+        stopBackgroundVoiceMonitor()
+        if (stt == null) initStt()
+        updateStatus("辨識中…")
+
+        sttHandler.post { startSttOnce() }
+        sttHandler.removeCallbacks(sttWatchdog)
+        sttHandler.postDelayed(sttWatchdog, 4000L)
+    }
+
+    private fun startSttIfPermitted() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            == PackageManager.PERMISSION_GRANTED) {
+            startSttLoop()
+            showMicListeningIcon()
+        } else {
+            updateStatus("等待麥克風授權…")
+        }
+    }
+
+    private fun startSttFromMonitor() {
+        stopBackgroundVoiceMonitor()
+
+        sttReady = false
+        sttTriggeredByMonitor = true
+        sttOneShot = true
+        sttLoopEnabled = true
+
+        touchLastElder()
+
+        if (stt == null) initStt()
+        updateStatus("辨識中…")
+
+        sttHandler.post { startSttOnce() }
+        sttHandler.removeCallbacks(sttWatchdog)
+        sttHandler.postDelayed(sttWatchdog, 4000L)
+    }
+
+    private val sttWatchdog = object : Runnable {
+        override fun run() {
+            if (!sttLoopEnabled) return
+            val now = System.currentTimeMillis()
+            if (!isSttRunning || now - sttLastEventTs > 8000L) {
+                try { stt?.cancel() } catch (_: Exception) {}
+                startSttOnce()
+            }
+            sttHandler.postDelayed(this, 4000L)
+        }
+    }
+
     private fun startSttOnce() {
         if (!sttLoopEnabled || isSttRunning) return
+        if (!hasAudioPermission()) {
+            updateStatus("等待麥克風授權…")
+            return
+        }
         partialFlushed = false
         val recognizer = stt ?: return
         try {
@@ -650,45 +792,71 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun isValidEmbedding(e: FloatArray?): Boolean {
-        if (e == null || e.isEmpty()) return false
-        var norm = 0.0
-        for (v in e) {
-            if (v.isNaN()) return false
-            norm += (v * v)
+    private fun stopSttLoop() {
+        sttLoopEnabled = false
+        isSttRunning = false
+        sttOneShot = false
+        sttTriggeredByMonitor = false
+
+        sttEmitAllowed = false
+        sttGateDeadline = 0L
+
+        if (sttLastPartial.isNotBlank() && !partialFlushed) {
+            partialFlushed = true
+            sttLastPartial = ""
         }
-        return norm > 1e-6
+        sttHandler.removeCallbacksAndMessages(null)
+        try { stt?.stopListening() } catch (_: Exception) {}
+        try { stt?.cancel() } catch (_: Exception) {}
+        // 約 600ms 後依註冊狀態恢復背景監聽（不會搶麥）
+        sttHandler.postDelayed({ setRegisteredUI(hasRegisteredElder()) }, 600L)
     }
 
-    private fun hasRegisteredElder(): Boolean {
-        val e = ElderEmbeddingStorage.load(this)
-        val ok = isValidEmbedding(e)
-        val norm2 = e?.fold(0.0) { acc, v -> acc + v * v } ?: -1.0
-        Log.d("RegCheck", "hasRegisteredElder? len=${e?.size ?: -1}, norm2=$norm2, ok=$ok")
-        return ok
+    // ===== 麥克風搶占管理 =====
+    private fun forceReleaseMic() {
+        try { audioRecord?.stop() } catch (_: Exception) {}
+        try { audioRecord?.release() } catch (_: Exception) {}
+        audioRecord = null
+
+        try { bgAudioRecord?.stop() } catch (_: Exception) {}
+        try { bgAudioRecord?.release() } catch (_: Exception) {}
+        bgAudioRecord = null
+
+        monitorShouldRun = false
     }
 
-    private fun setRegisteredUI(registered: Boolean) {
-        if (registered) {
-            recordVoiceButton.setImageResource(R.drawable.ic_mic_registered)
-            recordVoiceButton.setBackgroundResource(R.drawable.mic_registered_background)
-            recordVoiceButton.isEnabled = true
-            recordVoiceButton.isLongClickable = true
-            if (sttLoopEnabled) {
-                updateStatus("辨識中…")   //STT 開著 → 顯示辨識中
-            } else {
-                updateStatus("已註冊，待機中")
-                if (!monitorShouldRun) startBackgroundVoiceMonitor()
-            }
-        } else {
-            recordVoiceButton.setImageResource(R.drawable.ic_mic_white)
-            recordVoiceButton.setBackgroundResource(android.R.color.transparent)
-            recordVoiceButton.isEnabled = true
-            updateStatus("請先註冊聲音")
-            stopBackgroundVoiceMonitor()
+    private fun pauseVoiceStuffForPlayback() {
+        // 播放前停掉 STT 與背景監聽並釋放 MIC，避免搶資源
+        pausedByPlayback = sttLoopEnabled
+        if (sttLoopEnabled) stopSttLoop()
+        stopBackgroundVoiceMonitor()
+        forceReleaseMic()
+    }
+
+    private fun resumeVoiceStuffAfterPlayback() {
+        // 播放結束後恢復原本語音狀態
+        if (pausedByPlayback) startSttIfPermitted() else setRegisteredUI(hasRegisteredElder())
+        pausedByPlayback = false
+    }
+
+    private fun placeServerBarBelowHud() {
+        // 這兩個數字要和 addTextOverlay 裡的 textSize / pad 一致
+        val hudTextSizePx = 32f
+        val hudPadPx = 10f
+
+        val p = Paint().apply { textSize = hudTextSizePx; isAntiAlias = true }
+        val fm = p.fontMetrics
+        val hudHeightPx = ((fm.bottom - fm.top) + 2f * hudPadPx).roundToInt()
+
+        // 把「伺服器：」這條往下擺在 HUD 正下方，再加 8dp 的距離
+        inferenceStatus.updateLayoutParams<FrameLayout.LayoutParams> {
+            gravity = Gravity.TOP or Gravity.START
+            topMargin = hudHeightPx + 8.dp()
+            leftMargin = 5.dp() // 你原本的左邊距
         }
     }
 
+    // ===== 背景長輩聲音監聽 =====
     private fun startBackgroundVoiceMonitor() {
         if (monitorShouldRun) return
         monitorShouldRun = true
@@ -702,8 +870,8 @@ class MainActivity : AppCompatActivity() {
             val maxSegFrames = 120
             val preFrames = 15                 // ≈2.4s pre-roll
             val startStreakNeed = 1            // 開段門檻
-            val unlockStreakNeed = 2           // 解鎖需連續長輩幀數（可調 2~3）
-            val minElderFramesToUnlock = 4     // ✅ 解鎖需累積長輩幀數（4 幀 ≈ 640ms）
+            val unlockStreakNeed = 2           // 解鎖需連續長輩幀數
+            val minElderFramesToUnlock = 4     // 解鎖需累積長輩幀數（≈640ms）
 
             var silentFrames = 0
             var nonElderFrames = 0
@@ -742,7 +910,6 @@ class MainActivity : AppCompatActivity() {
                 segFrames = 0; elderStreak = 0; elderFramesInSeg = 0; tailFrames = 0
                 sttRequested = false
 
-                // 只有在沒有 STT 正在跑時才關掉輸出閘門，避免擋到當輪 STT
                 if (!sttLoopEnabled || !isSttRunning) {
                     sttEmitAllowed = false
                     sttGateDeadline = 0L
@@ -804,11 +971,9 @@ class MainActivity : AppCompatActivity() {
                             nonElderFrames = 0
                             tailFrames = 0
 
-                            // 最近一次長輩時間
                             lastElderAt = System.currentTimeMillis()
 
                             if (segFrames == 0) {
-                                // —— 首段：達到開段門檻就把 pre-roll + 當前幀納入
                                 if (elderStreak >= startStreakNeed) {
                                     for (pr in pre) currentSegment.add(pr)
                                     currentSegment.add(pcm)
@@ -816,13 +981,12 @@ class MainActivity : AppCompatActivity() {
                                     elderFramesInSeg++
                                 }
                             } else {
-                                // 段中
                                 currentSegment.add(pcm)
                                 segFrames++
                                 elderFramesInSeg++
                             }
 
-                            // ✅ 更嚴格解鎖：連續幀 + 累積幀 + 無外放
+                            // 更嚴格解鎖：連續幀 + 累積幀 + 無外放
                             if (!sttEmitAllowed &&
                                 elderStreak >= unlockStreakNeed &&
                                 elderFramesInSeg >= minElderFramesToUnlock &&
@@ -832,13 +996,11 @@ class MainActivity : AppCompatActivity() {
                                 sttEmitAllowed = true
                                 Log.d("VoiceMonitor", "🔓 解鎖輸出（elderStreak=$elderStreak, elderFramesInSeg=$elderFramesInSeg）")
 
-                                // 立刻回補目前 partial，避免句首看起來消失
                                 if (justUnlocked && sttLastPartial.isNotBlank()) {
                                     broadcastStt(sttLastPartial, true)
                                     appendTranscript(sttLastPartial, "partial")
                                 }
 
-                                // ✅ 現在才啟 STT：先停監聽（釋放麥克風），再啟 STT
                                 if (!sttRequested) {
                                     sttRequested = true
                                     runOnUiThread {
@@ -849,8 +1011,7 @@ class MainActivity : AppCompatActivity() {
                             } else if (!sttEmitAllowed &&
                                 elderStreak >= unlockStreakNeed &&
                                 elderFramesInSeg >= minElderFramesToUnlock &&
-                                isDevicePlaying()
-                            ) {
+                                isDevicePlaying()) {
                                 Log.d("VoiceMonitor", "⏸ 裝置正在播放，暫不解鎖")
                             }
                         } else {
@@ -859,7 +1020,6 @@ class MainActivity : AppCompatActivity() {
                             nonElderFrames++
 
                             if (segFrames > 0) {
-                                // 段已開始：只補少量尾巴，避免長噪音進段
                                 if (tailFrames < hangoverFrames) {
                                     currentSegment.add(pcm)
                                     segFrames++
@@ -867,7 +1027,7 @@ class MainActivity : AppCompatActivity() {
                                 }
                             }
 
-                            // ✅ 連續非長輩幀達到門檻 → 主動關閘，避免外部語音接手
+                            // 連續非長輩幀達門檻 → 關閘避免外部語音接手
                             if (sttEmitAllowed && nonElderFrames >= 4) {
                                 sttEmitAllowed = false
                                 Log.d("VoiceMonitor", "🔒 關閉輸出（nonElderFrames=$nonElderFrames）")
@@ -911,26 +1071,125 @@ class MainActivity : AppCompatActivity() {
         bgAudioRecord = null
     }
 
-    // 一鍵重置：清除已註冊聲紋與狀態
-    private fun resetRegistration() {
-        try {
-            val f1 = File(getExternalFilesDir(null), "elder_embedding.vec")
-            if (f1.exists()) f1.delete()
-        } catch (e: Exception) {
-            Log.e("MainActivity", "刪除外部聲紋檔案失敗", e)
-        }
-        try {
-            val f2 = File(filesDir, "elder_embedding.vec")
-            if (f2.exists()) f2.delete()
-        } catch (e: Exception) {
-            Log.e("MainActivity", "刪除內部聲紋檔案失敗", e)
-        }
+    private fun hasMicPermission(): Boolean =
+        ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
 
-        stopBackgroundVoiceMonitor()
-        previousEmbedding = null
-        currentSegment.clear()
-        setRegisteredUI(false)
-        Toast.makeText(this, "已重置為未註冊狀態", Toast.LENGTH_SHORT).show()
+    private fun ensureMicPermissionOrAsk(): Boolean {
+        val ok = hasMicPermission()
+        if (!ok) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                MIC_PERMISSION_CODE
+            )
+        }
+        return ok
+    }
+
+    private fun ensureMonitorRecorder(sampleRate: Int): AudioRecord? {
+        // 先確認/請求權限
+        if (!ensureMicPermissionOrAsk()) return null
+
+        var r = bgAudioRecord
+        val minBuf = AudioRecord.getMinBufferSize(
+            sampleRate,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT
+        )
+
+        if (r == null || r.state != AudioRecord.STATE_INITIALIZED) {
+            val bufSize = maxOf(minBuf, sampleRate / 5 * 2) // ≈200ms buffer
+
+            val tmp = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    sampleRate,
+                    AudioFormat.CHANNEL_IN_MONO,
+                    AudioFormat.ENCODING_PCM_16BIT,
+                    bufSize
+                )
+            } catch (se: SecurityException) {
+                Log.e("VoiceMonitor", "AudioRecord ctor SecurityException: ${se.message}")
+                return null
+            } catch (e: Exception) {
+                Log.e("VoiceMonitor", "AudioRecord ctor failed: ${e.message}")
+                return null
+            }
+
+            if (tmp.state != AudioRecord.STATE_INITIALIZED) {
+                Log.e("VoiceMonitor", "AudioRecord init failed (state=${tmp.state}). Mic busy?")
+                try { tmp.release() } catch (_: Exception) {}
+                return null
+            }
+
+            try {
+                tmp.startRecording()
+            } catch (se: SecurityException) {
+                Log.e("VoiceMonitor", "startRecording SecurityException: ${se.message}")
+                try { tmp.release() } catch (_: Exception) {}
+                return null
+            } catch (e: IllegalStateException) {
+                Log.e("VoiceMonitor", "startRecording() failed: ${e.message}")
+                try { tmp.release() } catch (_: Exception) {}
+                return null
+            }
+
+            bgAudioRecord = tmp
+            r = tmp
+            Log.d("VoiceMonitor", "bgAudioRecord started. minBuf=$minBuf, useBuf=$bufSize")
+        } else if (r.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+            try {
+                r.startRecording()
+            } catch (se: SecurityException) {
+                Log.e("VoiceMonitor", "startRecording() SecurityException on existing recorder: ${se.message}")
+                try { r.release() } catch (_: Exception) {}
+                bgAudioRecord = null
+                return null
+            } catch (e: IllegalStateException) {
+                Log.e("VoiceMonitor", "startRecording() on existing recorder failed: ${e.message}")
+                try { r.release() } catch (_: Exception) {}
+                bgAudioRecord = null
+                return null
+            }
+        }
+        return r
+    }
+
+    private fun recordPcmFromMonitor(durationMs: Long, sampleRate: Int): ByteArray {
+        val r = ensureMonitorRecorder(sampleRate) ?: return ByteArray(0)
+        val bytesToRead = ((sampleRate * durationMs) / 1000L * 2L).toInt()
+        val out = ByteArray(bytesToRead)
+        var off = 0
+        while (off < bytesToRead && monitorShouldRun) {
+            val n = r.read(out, off, bytesToRead - off)
+            if (n > 0) off += n
+            else if (n == 0) Thread.yield()
+            else { Log.e("VoiceMonitor", "AudioRecord read error: $n"); break }
+        }
+        return if (off == bytesToRead) out else out.copyOf(off)
+    }
+
+    // ===== 音訊工具 =====
+    private fun calcRmsDb(pcm: ByteArray): Float {
+        var sumSq = 0.0
+        var count = 0
+        var i = 0
+        while (i + 1 < pcm.size) {
+            val lo = pcm[i].toInt() and 0xFF
+            val hi = pcm[i + 1].toInt()
+            val s = (hi shl 8) or lo
+            val f = s / 32768f
+            sumSq += (f * f)
+            count++
+            i += 2
+        }
+        val rms = kotlin.math.sqrt((sumSq / maxOf(1, count))).toFloat()
+        val eps = 1e-8f
+        val ln10 = 2.302585092994046f
+        return 20f * (kotlin.math.ln(rms + eps) / ln10)
     }
 
     private fun zeroCrossRate(pcm: ByteArray): Float {
@@ -952,25 +1211,6 @@ class MainActivity : AppCompatActivity() {
             count++
         }
         return crossings.toFloat() / maxOf(1, count - 1)
-    }
-
-    private fun calcRmsDb(pcm: ByteArray): Float {
-        var sumSq = 0.0
-        var count = 0
-        var i = 0
-        while (i + 1 < pcm.size) {
-            val lo = pcm[i].toInt() and 0xFF
-            val hi = pcm[i + 1].toInt()
-            val s = (hi shl 8) or lo
-            val f = s / 32768f
-            sumSq += (f * f)
-            count++
-            i += 2
-        }
-        val rms = kotlin.math.sqrt((sumSq / maxOf(1, count))).toFloat()
-        val eps = 1e-8f
-        val ln10 = 2.302585092994046f
-        return 20f * (kotlin.math.ln(rms + eps) / ln10)
     }
 
     private fun isSegmentAudible(segments: List<ByteArray>, minRmsDb: Float = -42f): Boolean {
@@ -1119,7 +1359,23 @@ class MainActivity : AppCompatActivity() {
         return avg < threshold
     }
 
+    // ===== 註冊/重置（錄音 + 播放 + 確認 + 儲存） =====
+    // REPLACE THIS WHOLE FUNCTION
     private fun recordAndShowDialog(onFinish: () -> Unit) {
+        // 停 STT / 背景監聽，釋放麥克風，避免資源互搶
+        if (sttLoopEnabled) stopSttLoop() else stopBackgroundVoiceMonitor()
+        forceReleaseMic()
+
+        if (!hasAudioPermission()) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA),
+                CAMERA_PERMISSION_CODE
+            )
+            Toast.makeText(this, "請先允許麥克風權限再進行錄音", Toast.LENGTH_SHORT).show()
+            return
+        }
+
         val sampleRate = 16000
         val channelConfig = AudioFormat.CHANNEL_IN_MONO
         val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -1136,32 +1392,110 @@ class MainActivity : AppCompatActivity() {
         val pcmData = ByteArrayOutputStream()
         val buffer = ByteArray(bufferSize)
 
-        audioRecord?.startRecording()
+        try {
+            try {
+                if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                    == PackageManager.PERMISSION_GRANTED
+                ) {
+                    audioRecord?.startRecording()
+                    runOnUiThread { updateStatus("錄音中…") }
+                } else {
+                    Toast.makeText(this, "請先允許麥克風權限", Toast.LENGTH_SHORT).show()
+                    return
+                }
+            } catch (e: SecurityException) {
+                Log.e("AudioRecord", "startRecording failed: ${e.message}")
+                Toast.makeText(this, "錄音失敗：${e.message}", Toast.LENGTH_SHORT).show()
+                return
+            }
 
+            runOnUiThread {
+                isVoiceRecording = true
+                updateStatus("錄音中…")
+                // 如需改圖示/底色，可在這裡做（避免用到你沒有的 drawable）
+                // recordVoiceButton.setImageResource(R.drawable.ic_stop_white)
+            }
+        } catch (e: SecurityException) {
+            Log.e("AudioRecord", "startRecording failed: ${e.message}")
+        }
+
+        // 固定時長錄音（無手動停止）
         thread {
-            val durationMillis = 10000L
+            val durationMillis = 10_000L
             val startTime = System.currentTimeMillis()
 
             while (System.currentTimeMillis() - startTime < durationMillis) {
                 val readBytes = audioRecord?.read(buffer, 0, buffer.size) ?: 0
-                if (readBytes > 0) {
-                    pcmData.write(buffer, 0, readBytes)
-                }
+                if (readBytes > 0) pcmData.write(buffer, 0, readBytes)
             }
 
-            audioRecord?.stop()
-            audioRecord?.release()
+            try { audioRecord?.stop() } catch (_: Exception) {}
+            try { audioRecord?.release() } catch (_: Exception) {}
+            audioRecord = null
 
             val wavFile = File(getExternalFilesDir(null), "elder_sample.wav")
             saveAsWavFile(pcmData.toByteArray(), wavFile, sampleRate, 1, 16)
 
             runOnUiThread {
+                isVoiceRecording = false
                 onFinish()
                 showConfirmDialog(wavFile)
             }
         }
     }
 
+
+    private fun requestPlaybackFocus(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attrs = android.media.AudioAttributes.Builder()
+                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
+                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            val req = android.media.AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(attrs)
+                .setOnAudioFocusChangeListener { /* no-op */ }
+                .build()
+            playbackFocusRequest = req
+            audioManager.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(
+                null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+    }
+
+    private fun abandonPlaybackFocus() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            playbackFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
+        playbackFocusRequest = null
+    }
+
+    // 錄音流程的 UI 控制（不再用深灰底）
+    private fun setRegisteringUI(registering: Boolean) {
+        if (registering) {
+            // 顯示狀態
+            updateStatus("註冊中…")
+            // 鎖住按鈕，避免連點
+            recordVoiceButton.isEnabled = false
+            // 確保沒有任何背景（拔掉深灰底）
+            recordVoiceButton.background = null
+            recordVoiceButton.setBackgroundResource(0)
+        } else {
+            // 錄音結束 → 回到一般狀態（依是否已註冊）
+            recordVoiceButton.isEnabled = true
+            recordVoiceButton.background = null
+            recordVoiceButton.setBackgroundResource(0)
+            // 可改成你要的提示文字
+            updateStatus(if (hasRegisteredElder()) "已註冊，待機中" else "請先註冊聲音")
+        }
+    }
+
+    // REPLACE THIS WHOLE FUNCTION
     private fun showConfirmDialog(wavFile: File) {
         val builder = AlertDialog.Builder(this)
             .setTitle("確認聲音樣本")
@@ -1175,49 +1509,81 @@ class MainActivity : AppCompatActivity() {
 
         dialog.setOnShowListener {
             var player: MediaPlayer? = null
+            val wasSttRunning = sttLoopEnabled
+            var resumeAllowed = true   // ← 重新錄製時設為 false，避免恢復 STT
 
             fun stopPlayer() {
-                try { player?.stop() } catch (_: Exception) {}
-                try { player?.release() } catch (_: Exception) {}
+                runCatching { player?.setOnCompletionListener(null) }
+                runCatching { player?.stop() }
+                runCatching { player?.release() }
                 player = null
+
+                // 只有在允許時才恢復 STT/背景監聽（重新錄製時不恢復）
+                if (resumeAllowed) {
+                    if (wasSttRunning) {
+                        sttHandler.postDelayed({ startSttIfPermitted() }, 150)
+                    } else {
+                        setRegisteredUI(hasRegisteredElder())
+                    }
+                }
             }
 
             dialog.setOnDismissListener { stopPlayer() }
 
+            // 播放
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 try {
                     stopPlayer()
+                    // 播放前先確保不會被 STT/監聽佔用麥克風
+                    if (sttLoopEnabled) stopSttLoop() else stopBackgroundVoiceMonitor()
+                    forceReleaseMic()
+
                     player = MediaPlayer().apply {
                         setDataSource(wavFile.absolutePath)
-                        prepare()
-                        start()
+                        setOnPreparedListener { start() }
                         setOnCompletionListener {
                             Toast.makeText(
                                 this@MainActivity,
                                 "播放結束，可按「確認儲存」或「重新錄製」",
                                 Toast.LENGTH_SHORT
                             ).show()
+                            stopPlayer()
                         }
+                        setOnErrorListener { _, what, extra ->
+                            Toast.makeText(
+                                this@MainActivity,
+                                "播放失敗（$what/$extra）",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            stopPlayer()
+                            true
+                        }
+                        prepareAsync()
                     }
                 } catch (e: Exception) {
                     Toast.makeText(this@MainActivity, "播放失敗：${e.message}", Toast.LENGTH_SHORT).show()
+                    stopPlayer()
                 }
             }
 
+            // 重新錄製
             dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                resumeAllowed = false   // ← 關掉自動恢復 STT
                 stopPlayer()
                 dialog.dismiss()
 
-                recordVoiceButton.setBackgroundResource(R.drawable.mic_circle_background)
+                // 立即切回錄製流程（固定時長錄完）
                 isVoiceRecording = true
-
+                updateStatus("註冊中…")
                 recordAndShowDialog {
-                    recordVoiceButton.setBackgroundResource(android.R.color.transparent)
                     isVoiceRecording = false
+                    updateStatus("錄音完成，請確認聲音樣本")
                 }
             }
 
+            // 確認儲存
             dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener {
+                stopPlayer()  // 儲存前確保已停止播放
                 val btnP = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
                 val btnN = dialog.getButton(AlertDialog.BUTTON_NEGATIVE)
                 val btnU = dialog.getButton(AlertDialog.BUTTON_NEUTRAL)
@@ -1229,7 +1595,6 @@ class MainActivity : AppCompatActivity() {
                     try {
                         val verifier = SpeakerVerifier(this@MainActivity)
                         val emb = verifier.extractEmbedding(wavFile)
-
                         fun n2(v: FloatArray) = v.fold(0.0) { a, x -> a + x * x }
                         Log.d("SaveEmbedding", "extracted len=${emb.size}, norm2=${n2(emb)}")
 
@@ -1238,7 +1603,6 @@ class MainActivity : AppCompatActivity() {
                         } else {
                             ElderEmbeddingStorage.save(this@MainActivity, emb)
                             val re = ElderEmbeddingStorage.load(this@MainActivity)
-                            Log.d("SaveEmbedding", "reloaded len=${re?.size ?: -1}, valid=${isValidEmbedding(re)}")
                             ok = isValidEmbedding(re)
                             if (!ok) msg = "存檔後讀回無效（檔案或路徑問題）"
                         }
@@ -1250,6 +1614,7 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         if (ok) {
                             setRegisteredUI(true)
+                            startSttIfPermitted()
                             dialog.dismiss()
                             Toast.makeText(this@MainActivity, "已儲存聲紋", Toast.LENGTH_SHORT).show()
                         } else {
@@ -1260,10 +1625,10 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-
         dialog.show()
     }
 
+    // ===== WAV 存檔 =====
     private fun saveAsWavFile(
         pcm: ByteArray,
         file: File,
@@ -1307,172 +1672,438 @@ class MainActivity : AppCompatActivity() {
         ((value.toInt() shr 8) and 0xff).toByte()
     )
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder()
-                .setTargetRotation(previewView.display.rotation)
-                .build()
-                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-            val recorder = Recorder.Builder()
-                .setQualitySelector(QualitySelector.from(Quality.SD))
-                .build()
-
-            videoCapture = VideoCapture.withOutput(recorder)
-
-            try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(
-                    this, CameraSelector.DEFAULT_BACK_CAMERA, preview, videoCapture
-                )
-                if (videoLoopEnabled) scheduleNextClip(200)
-            } catch (e: Exception) {
-                Log.e("CameraX", "啟動相機失敗", e)
-            }
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun tryStartRecording() {
-        val vc = this.videoCapture ?: return
-        if (!videoLoopEnabled) return
-        if (isStartingRecording || isRecording) return
-
-        isStartingRecording = true
-
-        val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault()).format(java.util.Date())
-        val videoFile = File(cacheDir, "video_$timestamp.mp4")
-        val outputOptions = FileOutputOptions.Builder(videoFile).build()
-
-        try {
-            recording = vc.output
-                .prepareRecording(this, outputOptions)
-                .start(ContextCompat.getMainExecutor(this)) { event ->
-                    when (event) {
-                        is VideoRecordEvent.Start -> {
-                            isStartingRecording = false
-                            isRecording = true
-                            Log.d("VideoCapture", "開始錄影：${videoFile.name}")
-
-                            videoHandler.postDelayed({
-                                try { recording?.stop() } catch (_: Exception) {}
-                            }, 5000)
-                        }
-                        is VideoRecordEvent.Finalize -> {
-                            isRecording = false
-                            recording = null
-                            val hadError = event.hasError()
-                            if (hadError) {
-                                Log.e("VideoCapture", "錄影失敗：${event.error}")
-                            } else {
-                                Log.d("VideoCapture", "錄影完成：${videoFile.absolutePath}")
-                            }
-                            if (videoLoopEnabled) scheduleNextClip(if (hadError) 500 else 120)
-                        }
-                    }
-                }
-        } catch (e: Exception) {
-            isStartingRecording = false
-            isRecording = false
-            Log.e("VideoCapture", "startRecording 失敗：${e.message}")
-            scheduleNextClip(600)
+    // ===== 聲紋狀態 =====
+    private fun isValidEmbedding(e: FloatArray?): Boolean {
+        if (e == null || e.isEmpty()) return false
+        var norm = 0.0
+        for (v in e) {
+            if (v.isNaN()) return false
+            norm += (v * v)
         }
+        return norm > 1e-6
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            if (allPermissionsGranted()) {
-                startCamera()
-                startSttIfPermitted()     // ★ 拿到授權後再啟 STT
+    private fun hasRegisteredElder(): Boolean {
+        val e = ElderEmbeddingStorage.load(this)
+        val ok = isValidEmbedding(e)
+        val norm2 = e?.fold(0.0) { acc, v -> acc + v * v } ?: -1.0
+        Log.d("RegCheck", "hasRegisteredElder? len=${e?.size ?: -1}, norm2=$norm2, ok=$ok")
+        return ok
+    }
+
+    private fun setRegisteredUI(registered: Boolean) {
+        if (isVoiceRecording) return
+
+        if (registered) {
+            recordVoiceButton.setImageResource(R.drawable.ic_mic_registered)
+            recordVoiceButton.setBackgroundResource(android.R.color.transparent)
+            recordVoiceButton.background = null
+            recordVoiceButton.isEnabled = true
+
+            recordVoiceButton.isLongClickable = true
+            recordVoiceButton.setOnLongClickListener {
+                AlertDialog.Builder(this)
+                    .setTitle("重置長輩聲音")
+                    .setMessage("確定要清除已註冊的聲紋嗎？")
+                    .setPositiveButton("清除") { _, _ -> resetRegistration() }
+                    .setNegativeButton("取消", null)
+                    .show()
+                true
+            }
+
+            if (sttLoopEnabled) {
+                updateStatus("辨識中…")
             } else {
-                updateStatus("未授權麥克風/相機")
+                updateStatus("已註冊，待機中")
+                if (!monitorShouldRun) startBackgroundVoiceMonitor()
             }
+        } else {
+            recordVoiceButton.setImageResource(R.drawable.ic_mic_white)
+            recordVoiceButton.setBackgroundResource(android.R.color.transparent)
+            recordVoiceButton.isEnabled = true
+            updateStatus("請先註冊聲音")
+            stopBackgroundVoiceMonitor()
+
+            recordVoiceButton.isLongClickable = false
+            recordVoiceButton.setOnLongClickListener(null)
         }
+    }
+
+    // 一鍵重置：清除已註冊聲紋與狀態
+    private fun resetRegistration() {
+        try {
+            val f1 = File(getExternalFilesDir(null), "elder_embedding.vec")
+            if (f1.exists()) f1.delete()
+        } catch (e: Exception) {
+            Log.e("CameraDetectActivity", "刪除外部聲紋檔案失敗", e)
+        }
+        try {
+            val f2 = File(filesDir, "elder_embedding.vec")
+            if (f2.exists()) f2.delete()
+        } catch (e: Exception) {
+            Log.e("CameraDetectActivity", "刪除內部聲紋檔案失敗", e)
+        }
+
+        stopBackgroundVoiceMonitor()
+        previousEmbedding = null
+        currentSegment.clear()
+        setRegisteredUI(false)
+        Toast.makeText(this, "已重置為未註冊狀態", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        setRegisteredUI(hasRegisteredElder())
+        if (hasAudioPermission() && !sttLoopEnabled && !isSttRunning) {
+            startSttIfPermitted()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // === 語音 ===
+        sttEmitAllowed = false
+        sttGateDeadline = 0L
+        try { stt?.stopListening() } catch (_: Exception) {}
+        try { stt?.cancel() } catch (_: Exception) {}
+        if (sttLoopEnabled) stopSttLoop()
+        stopBackgroundVoiceMonitor()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-
-        sttEmitAllowed = false
-        sttGateDeadline = 0L
-
-        stopSttLoop()
-        try { stt?.destroy() } catch (_: Exception) {}
-        stopBackgroundVoiceMonitor()
+        cameraProvider?.unbindAll()
+        imageAnalysis?.clearAnalyzer()
         cameraExecutor.shutdown()
-        try { recording?.close() } catch (_: Exception) {}
-
+        // === 語音 ===
+        try { stt?.destroy() } catch (_: Exception) {}
+        stt = null
+        stopBackgroundVoiceMonitor()
         try { audioRecord?.stop() } catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
+        try { bgAudioRecord?.stop() } catch (_: Exception) {}
+        try { bgAudioRecord?.release() } catch (_: Exception) {}
+        bgAudioRecord = null
     }
 
-    private fun ensureMonitorRecorder(sampleRate: Int): AudioRecord? {
-        var r = bgAudioRecord
-        val minBuf = AudioRecord.getMinBufferSize(
-            sampleRate,
-            AudioFormat.CHANNEL_IN_MONO,
-            AudioFormat.ENCODING_PCM_16BIT
+    private fun readRawModel(resId: Int): ByteArray =
+        resources.openRawResource(resId).use { it.readBytes() }
+
+    private fun readClasses(): List<String> =
+        resources.openRawResource(R.raw.classes).bufferedReader().readLines()
+
+    /** 將「原圖座標」轉成 overlay 畫面座標（與 PreviewView: fitCenter 一致） */
+    private fun calcFitCenter(vw: Int, vh: Int, srcW: Int, srcH: Int): Triple<Float, Float, Float> {
+        val r = min(vw / srcW.toFloat(), vh / srcH.toFloat())
+        val padX = (vw - srcW * r) / 2f
+        val padY = (vh - srcH * r) / 2f
+        return Triple(r, padX, padY)
+    }
+
+    /** 畫物件框 */
+    private fun drawDetectionsOnOverlay(view: View, srcW: Int, srcH: Int, boxes: Array<FloatArray>) {
+        if (!renderEnabled) return
+        val vw = view.width.coerceAtLeast(1)
+        val vh = view.height.coerceAtLeast(1)
+        val (r, padX, padY) = calcFitCenter(vw, vh, srcW, srcH)
+
+        val d = object : android.graphics.drawable.Drawable() {
+            private val boxPaint = android.graphics.Paint().apply {
+                style = android.graphics.Paint.Style.STROKE; strokeWidth = 4f
+                color = android.graphics.Color.GREEN; isAntiAlias = true
+            }
+            private val textPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.WHITE; textSize = 28f; isAntiAlias = true
+            }
+            private val bgPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(160, 0, 0, 0)
+            }
+            override fun draw(canvas: android.graphics.Canvas) {
+                for (b in boxes) {
+                    val cx = b[0] * r + padX; val cy = b[1] * r + padY
+                    val w = b[2] * r; val h = b[3] * r
+                    val left = cx - w/2f; val top = cy - h/2f
+                    val right = cx + w/2f; val bottom = cy + h/2f
+                    canvas.drawRect(left, top, right, bottom, boxPaint)
+
+                    val clsId = b[5].toInt()
+                    val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
+                    val label = "$name:${"%.2f".format(b[4])}"
+                    val pad = 6f
+                    val tw = textPaint.measureText(label)
+                    val fm = textPaint.fontMetrics
+                    val th = fm.bottom - fm.top
+                    var bgTop = top - th - 2*pad
+                    var bgBottom = top
+                    if (bgTop < 0) { bgTop = top; bgBottom = top + th + 2*pad }
+                    canvas.drawRect(left, bgTop, left + tw + 2*pad, bgBottom, bgPaint)
+                    canvas.drawText(label, left + pad, bgBottom - pad - fm.bottom, textPaint)
+                }
+            }
+            override fun setAlpha(alpha: Int) {}
+            override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+            @Deprecated("Deprecated in Java")
+            override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
+        }.apply { setBounds(0, 0, vw, vh) }
+
+        view.overlay.add(d)
+    }
+
+    /** 畫骨架（盒+關節+連線） */
+    private fun drawPoseOnOverlay(view: View, srcW: Int, srcH: Int, poses: List<Pose>) {
+        if (!renderEnabled) return
+        val vw = view.width.coerceAtLeast(1)
+        val vh = view.height.coerceAtLeast(1)
+        val (r, padX, padY) = calcFitCenter(vw, vh, srcW, srcH)
+
+        val edges = arrayOf(
+            intArrayOf(5,6), intArrayOf(5,7), intArrayOf(7,9),
+            intArrayOf(6,8), intArrayOf(8,10), intArrayOf(5,11),
+            intArrayOf(6,12), intArrayOf(11,12), intArrayOf(11,13),
+            intArrayOf(13,15), intArrayOf(12,14), intArrayOf(14,16),
+            intArrayOf(0,5), intArrayOf(0,6), intArrayOf(0,1),
+            intArrayOf(0,2), intArrayOf(1,3), intArrayOf(2,4)
         )
 
-        if (r == null || r.state != AudioRecord.STATE_INITIALIZED) {
-            val bufSize = maxOf(minBuf, sampleRate / 5 * 2) // ≈200ms buffer
-            val tmp = AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufSize
+        val d = object : android.graphics.drawable.Drawable() {
+            private val kpPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.CYAN; style = android.graphics.Paint.Style.FILL; isAntiAlias = true
+            }
+            private val linePaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.GREEN; strokeWidth = 4f; style = android.graphics.Paint.Style.STROKE; isAntiAlias = true
+            }
+            private val boxPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.MAGENTA; strokeWidth = 3f; style = android.graphics.Paint.Style.STROKE; isAntiAlias = true
+            }
+            override fun draw(canvas: android.graphics.Canvas) {
+                for (p in poses) {
+                    val cx = p.box[0] * r + padX; val cy = p.box[1] * r + padY
+                    val w  = p.box[2] * r;       val h  = p.box[3] * r
+                    val l = cx - w/2f; val t = cy - h/2f; val rt = cx + w/2f; val b = cy + h/2f
+                    canvas.drawRect(l, t, rt, b, boxPaint)
+
+                    for (e in edges) {
+                        val a = p.keypoints[e[0]]
+                        val bpt = p.keypoints[e[1]]
+                        if (a[2] > 0.5f && bpt[2] > 0.5f) {
+                            canvas.drawLine(a[0]*r+padX, a[1]*r+padY, bpt[0]*r+padX, bpt[1]*r+padY, linePaint)
+                        }
+                    }
+                    for (kp in p.keypoints) {
+                        if (kp[2] > 0.5f) canvas.drawCircle(kp[0]*r+padX, kp[1]*r+padY, 4f, kpPaint)
+                    }
+                }
+            }
+            override fun setAlpha(alpha: Int) {}
+            override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+            @Deprecated("Deprecated in Java")
+            override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
+        }.apply { setBounds(0, 0, vw, vh) }
+
+        view.overlay.add(d)
+    }
+    override fun onStart() {
+        super.onStart()
+        if (sendWsEnabled) {
+            ws.connect(
+                onState = { ok, err -> if (!ok) Log.w(TAG, "WS connect failed: $err") },
+                onMessage = { msg -> handleServerMessage(msg) }
             )
-
-            if (tmp.state != AudioRecord.STATE_INITIALIZED) {
-                Log.e("VoiceMonitor", "AudioRecord init failed (state=${tmp.state}). Mic busy?")
-                try { tmp.release() } catch (_: Exception) {}
-                return null
-            }
-
-            try {
-                tmp.startRecording()
-            } catch (e: IllegalStateException) {
-                Log.e("VoiceMonitor", "startRecording() failed: ${e.message}")
-                try { tmp.release() } catch (_: Exception) {}
-                return null
-            }
-
-            bgAudioRecord = tmp
-            r = tmp
-            Log.d("VoiceMonitor", "bgAudioRecord started. minBuf=$minBuf, useBuf=$bufSize")
-        } else if (r.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
-            try {
-                r.startRecording()
-            } catch (e: IllegalStateException) {
-                Log.e("VoiceMonitor", "startRecording() on existing recorder failed: ${e.message}")
-                try { r.release() } catch (_: Exception) {}
-                bgAudioRecord = null
-                return null
-            }
         }
-        return r
+    }
+    override fun onStop() {
+        super.onStop()
+        ws.close()
     }
 
-    private fun recordPcmFromMonitor(durationMs: Long, sampleRate: Int): ByteArray {
-        val r = ensureMonitorRecorder(sampleRate) ?: return ByteArray(0)
-        val bytesToRead = ((sampleRate * durationMs) / 1000L * 2L).toInt()
-        val out = ByteArray(bytesToRead)
-        var off = 0
-        while (off < bytesToRead && monitorShouldRun) {
-            val n = r.read(out, off, bytesToRead - off)
-            if (n > 0) off += n
-            else if (n == 0) Thread.yield()
-            else { Log.e("VoiceMonitor", "AudioRecord read error: $n"); break }
+    private fun safeRotation(): Int {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            this.display?.rotation?.let { return it }
         }
-        return if (off == bytesToRead) out else out.copyOf(off)
+        @Suppress("DEPRECATION")
+        try { return windowManager.defaultDisplay.rotation } catch (_: Throwable) {}
+        previewView.display?.rotation?.let { return it }
+        return Surface.ROTATION_0
+    }
+
+    private fun addTextOverlay(view: View, text: String) {
+        if (!renderEnabled) return
+        val vw = view.width.coerceAtLeast(1)
+        val vh = view.height.coerceAtLeast(1)
+        val d = object : android.graphics.drawable.Drawable() {
+            private val pad = 10f
+            private val textPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.WHITE
+                textSize = 32f
+                isAntiAlias = true
+            }
+            private val bgPaint = android.graphics.Paint().apply {
+                color = android.graphics.Color.argb(150, 0, 0, 0)
+                isAntiAlias = true
+            }
+            override fun draw(canvas: android.graphics.Canvas) {
+                val fm = textPaint.fontMetrics
+                val th = fm.bottom - fm.top
+                val tw = textPaint.measureText(text)
+                val left = pad
+                val top = pad
+                canvas.drawRect(left - pad, top - th - pad, left + tw + pad, top + pad, bgPaint)
+                canvas.drawText(text, left, top - fm.top, textPaint)
+            }
+            override fun setAlpha(alpha: Int) {}
+            override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
+            override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
+        }.apply { setBounds(0, 0, vw, vh) }
+        view.overlay.add(d)
+    }
+
+    private fun processFrame(bitmap: Bitmap) {
+        var objRes: ObjectResult? = null
+        var poseRes: PoseResult? = null
+        var objMs = -1L
+        var poseMs = -1L
+
+        if (objectDetectEnabled) {
+            val t0 = SystemClock.elapsedRealtime()
+            objRes = objDetector.detect(bitmap, ortEnv, objSession)
+            objMs = SystemClock.elapsedRealtime() - t0
+        }
+        if (poseDetectEnabled) {
+            val t0 = SystemClock.elapsedRealtime()
+            poseRes = poseDetector.detect(bitmap, ortEnv, poseSession)
+            poseMs = SystemClock.elapsedRealtime() - t0
+        }
+
+        // 1~60 循環
+        frameId = (frameId % 60) + 1
+
+        // —— 送 WS：每幀都送（就算沒偵測，也送空） —— //
+        if (sendWsEnabled) {
+            // 直接把可能為 null 的結果交給 builder（builder 內部負責輸出空陣列）
+            val poseJsonStr = buildPoseJson(frameId, bitmap, poseRes).toString()
+            val objJsonStr  = buildObjectJson(frameId, bitmap, objRes).toString()
+
+            // 先 pose 後 object（貼齊後端測試腳本）
+            try {
+                Log.d(TAG, "WS SEND pose len=${poseJsonStr.length}, last='${poseJsonStr.lastOrNull()}'")
+                ws.send(poseJsonStr)
+
+                Log.d(TAG, "WS SEND obj  len=${objJsonStr.length}, last='${objJsonStr.lastOrNull()}'")
+                ws.send(objJsonStr)
+            } catch (e: Exception) {
+                Log.e(TAG, "WS send error", e)
+            }
+        }
+
+
+        // Debug Log：每幀列出結果
+        Log.d(TAG, "obj=${objRes?.outputBox?.size ?: 0} (${objMs}ms), " +
+                "pose=${poseRes?.poses?.size ?: 0} (${poseMs}ms) frame=$frameId")
+
+        // —— Overlay 與 HUD（維持原行為：只有開啟的才畫） —— //
+        runOnUiThread {
+            overlayView.overlay.clear()
+            objRes?.let { drawDetectionsOnOverlay(overlayView, bitmap.width, bitmap.height, it.outputBox) }
+            poseRes?.let { drawPoseOnOverlay(overlayView, bitmap.width, bitmap.height, it.poses) }
+
+            val hud = buildString {
+                if (objectDetectEnabled) append("OBJ:${objRes?.outputBox?.size ?: 0} ${if (objMs>=0) "${objMs}ms" else ""}   ")
+                if (poseDetectEnabled)   append("POSE:${poseRes?.poses?.size ?: 0} ${if (poseMs>=0) "${poseMs}ms" else ""}")
+            }.trim()
+            if (hud.isNotEmpty()) addTextOverlay(overlayView, hud)
+
+            if (!renderEnabled) overlayView.overlay.clear()
+        }
+    }
+
+    private fun handleServerMessage(msg: String) {
+        try {
+            val j = JSONObject(msg)
+            if (j.optString("type") == "inference") {
+                val pred = j.optString("pred", "")
+                val idx  = j.optInt("pred_idx", -1)
+                val probs = j.optJSONArray("probs")
+
+                // 取得 pred 對應的機率 → 百分比（四捨五入到整數）
+                var pct = ""
+                if (idx >= 0 && probs != null && idx < probs.length()) {
+                    val conf = probs.optDouble(idx, Double.NaN)
+                    if (!conf.isNaN()) pct = " ${"%.0f".format(conf * 100)}%"
+                }
+
+                runOnUiThread { inferenceStatus.text = "推論：$pred$pct" }
+            } else {
+                // 其他訊息型別：不顯示冗長內容
+                val brief = j.optString("message", j.optString("label", ""))
+                runOnUiThread { if (brief.isNotBlank()) inferenceStatus.text = brief }
+            }
+        } catch (_: Exception) {
+            // 非 JSON 就忽略或簡短顯示
+            runOnUiThread { /* inferenceStatus.text = "推論：" */ }
+        }
+    }
+
+    // ★ 新增：建立物件偵測 JSON（與單張輸出對齊：使用 classes 名稱）
+    private fun buildObjectJson(fid: Long, bmp: Bitmap, res: ObjectResult?): JSONObject {
+        val root = JSONObject()
+        root.put("type", "object")
+        root.put("frame_id", fid)
+        root.put("timestamp_ms", System.currentTimeMillis())
+        root.put("image_size", JSONObject().apply {
+            put("width", bmp.width); put("height", bmp.height)
+        })
+
+        val arr = JSONArray()
+        res?.outputBox?.forEach { b ->
+            val clsId = b[5].toInt()
+            val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
+            arr.put(JSONObject().apply {
+                put("cls_id", clsId)
+                put("cls_name", name)
+                put("score", b[4].toDouble())
+                put("bbox", JSONObject().apply {
+                    put("cx", b[0].toDouble()); put("cy", b[1].toDouble())
+                    put("w",  b[2].toDouble()); put("h",  b[3].toDouble())
+                })
+            })
+        }
+        root.put("detections", arr) // 即使 res==null 也會是空陣列
+        return root
+    }
+
+    // ★ 新增：建立骨架偵測 JSON
+    private fun buildPoseJson(fid: Long, bmp: Bitmap, res: PoseResult?): JSONObject {
+        val root = JSONObject()
+        root.put("type", "pose")
+        root.put("frame_id", fid)
+        root.put("timestamp_ms", System.currentTimeMillis())
+        root.put("image_size", JSONObject().apply {
+            put("width", bmp.width); put("height", bmp.height)
+        })
+
+        val persons = JSONArray()
+        res?.poses?.forEach { p ->
+            val person = JSONObject().apply {
+                put("score", p.score.toDouble())
+                put("bbox", JSONObject().apply {
+                    put("cx", p.box[0].toDouble()); put("cy", p.box[1].toDouble())
+                    put("w",  p.box[2].toDouble()); put("h",  p.box[3].toDouble())
+                })
+
+                val kps = JSONArray()
+                for (kp in p.keypoints) {
+                    kps.put(JSONObject().apply {
+                        put("x", kp[0].toDouble())
+                        put("y", kp[1].toDouble())
+                        put("confidence", kp[2].toDouble())  // ← 改這裡
+                    })
+                }
+                put("keypoints", kps)
+            }
+            persons.put(person)
+        }
+        root.put("persons", persons) // 即使 res==null 也會是空陣列
+        return root
     }
 }
