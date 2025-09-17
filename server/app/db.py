@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 load_dotenv()
 
 USE_POOL_TIMEOUT = os.getenv("USE_POOL_TIMEOUT", "false").lower() == "true"
-POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 5))  # 預設 timeout 5 秒
+POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 2))  # 預設 timeout 2 秒
 
 class Database:
     _pool = None

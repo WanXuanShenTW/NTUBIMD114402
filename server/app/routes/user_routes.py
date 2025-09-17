@@ -8,6 +8,7 @@ from ..service.user_service import (
     get_user_info,
     delete_user_account
 )
+from ..utils.response_util import make_json_response
 
 user_router = APIRouter()
 
@@ -16,6 +17,7 @@ class RegisterRequest(BaseModel):
     phone: str
     password: str
     role_id: int
+    gender: str
     line_id: Optional[str] = None
 
 class UpdateUserRequest(BaseModel):
@@ -41,12 +43,13 @@ async def register(data: RegisterRequest):
             phone=data.phone,
             password=data.password,
             role_id=data.role_id,
+            gender=data.gender,
             line_id=data.line_id
         )
-        return {"message": "註冊成功", "user_id": user_id}
+        return await make_json_response(data={"user_id": user_id}, message="註冊成功")
     except Exception as e:
-        raise HTTPException(status_code=409, detail=str(e))
-
+        return await make_json_response(code=409, message=str(e))
+    
 @user_router.patch("/user")
 async def update_user(data: UpdateUserRequest):
     if not data.phone:

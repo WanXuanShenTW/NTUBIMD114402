@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter
 from pydantic import BaseModel
 from ..service.user_service import get_user_info
+from ..utils.response_util import make_json_response
 
 auth_router = APIRouter()
 
@@ -14,17 +15,15 @@ async def login(data: LoginRequest):
     password = data.password
 
     if not phone.isdigit() or len(phone) != 10:
-        raise HTTPException(status_code=400, detail="phone 必須是10位數字")
+        return make_json_response(code=400, message="phone 必須是10位數字")
     
     try:
         user = await get_user_info(phone)
         if user is None:
-            raise HTTPException(status_code=404, detail="使用者不存在")
+            return await make_json_response(code=404, message="使用者不存在")
         if user["password"] != password:
-            raise HTTPException(status_code=401, detail="密碼錯誤")
+            return await make_json_response(code=401, message="密碼錯誤")
         
-        return {"message": "登入成功"}
-    except HTTPException:
-        raise
+        return await make_json_response(data={"user": user}, message="登入成功")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+        return await make_json_response(code=500, message=f"伺服器錯誤: {str(e)}")
