@@ -1,6 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
-from typing import List
 from ..service.emergency_contacts_service import (
     add_contact_by_phone,
     get_contact_relations,

@@ -12,6 +12,7 @@ async def add_user(
     phone: str,
     role_id: int,
     password: str,
+    gender: str,
     line_id: str = None
 ) -> int:
     """
@@ -21,12 +22,13 @@ async def add_user(
     :param phone: 電話
     :param role_id: 角色ID
     :param password: 密碼
+    :param gender: 性別 ('M' 或 'F')
     :param line_id: LINE ID（可選）
     :return: 新增的 user_id，若失敗則拋出例外
     """
     async with Database.connection() as conn:
         try:
-            user_id = await insert_user(conn, name, phone, role_id, password, line_id)
+            user_id = await insert_user(conn, name, phone, role_id, password, gender, line_id)
             if user_id is None:
                 raise DatabaseError("資料庫新增使用者失敗")
             return user_id

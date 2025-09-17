@@ -6,9 +6,9 @@ import aiomysql
 async def insert_fall_event(
     conn,
     user_id: int,
+    detected_time: datetime.datetime,
     location: str,
-    pose_before_fall: str,
-    video_filename: str
+    pose_before_fall: str
 ) -> Optional[int]:
     """
     將跌倒事件紀錄插入資料庫。
@@ -16,15 +16,14 @@ async def insert_fall_event(
     try:
         async with conn.cursor() as cursor:
             query = """
-                INSERT INTO fall_events (user_id, detected_time, location, pose_before_fall, video_filename)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO fall_events (user_id, detected_time, location, pose_before_fall)
+                VALUES (%s, %s, %s, %s)
             """
             values = (
                 user_id,
-                datetime.datetime.now(),
+                detected_time,
                 location,
-                pose_before_fall,
-                video_filename
+                pose_before_fall
             )
             await cursor.execute(query, values)
             await conn.commit()
@@ -79,24 +78,6 @@ async def select_fall_event_records_by_user_and_time_range(
         raise
     except Exception as e:
         raise DatabaseError(f"查詢跌倒事件失敗: {e}")
-
-async def select_fall_event_video_filename_by_id(conn, record_id: int) -> Optional[str]:
-    try:
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
-            query = """
-                SELECT video_filename 
-                FROM fall_events 
-                WHERE record_id = %s AND video_filename IS NOT NULL
-            """
-            await cursor.execute(query, (record_id,))
-            row = await cursor.fetchone()
-            if not row or not row["video_filename"]:
-                raise NotFoundError(f"找不到 record_id={record_id} 的影片檔名")
-            return row["video_filename"]
-    except NotFoundError:
-        raise
-    except Exception as e:
-        raise DatabaseError(f"查詢影片檔名失敗: {e}")
 
 async def select_fall_event_by_id(conn, record_id: int) -> Optional[Dict[str, Any]]:
     try:

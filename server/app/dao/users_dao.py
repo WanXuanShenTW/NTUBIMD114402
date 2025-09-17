@@ -10,6 +10,7 @@ async def insert_user(
     phone: str,
     role_id: int,
     password: str,
+    gender: str,
     line_id: Optional[str] = None
 ) -> Optional[int]:
     """
@@ -18,20 +19,22 @@ async def insert_user(
     try:
         async with conn.cursor() as cursor:
             query = """
-                INSERT INTO users (name, phone, role_id, password, created_at, line_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO users (name, phone, role_id, password, gender, created_at, line_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             values = (
                 name,
                 phone,
                 role_id,
                 password,
+                gender,
                 datetime.datetime.now(),
                 line_id
             )
             await cursor.execute(query, values)
             await conn.commit()
-            user_id = await cursor.lastrowid
+            # 修正：移除 await，直接使用 cursor.lastrowid
+            user_id = cursor.lastrowid
             print(f"[INFO] 新增使用者成功: user_id={user_id}")
             return user_id
     except IntegrityError as e:
@@ -45,9 +48,9 @@ async def insert_user(
 
 async def update_user(conn, user_id: int, **kwargs) -> bool:
     """
-    更新使用者資料。允許更新 name、phone、password、role_id、line_id。
+    更新使用者資料。允許更新 name、phone、password、role_id、gender、line_id。
     """
-    allowed = ["name", "phone", "password", "role_id", "line_id"]
+    allowed = ["name", "phone", "password", "role_id", "gender", "line_id"]
     fields = []
     values = []
 
