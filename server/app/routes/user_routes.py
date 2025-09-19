@@ -9,8 +9,9 @@ from ..service.user_service import (
     delete_user_account
 )
 from ..utils.response_util import make_json_response
+from ..exceptions import AlreadyExistsError
 
-user_router = APIRouter()
+user_router = APIRouter(tags=["使用者資料"])
 
 class RegisterRequest(BaseModel):
     name: str
@@ -37,6 +38,9 @@ class DeleteUserRequest(BaseModel):
 
 @user_router.post("/register")
 async def register(data: RegisterRequest):
+    """
+        使用者註冊
+    """
     try:
         user_id = await add_user(
             name=data.name,
@@ -47,11 +51,16 @@ async def register(data: RegisterRequest):
             line_id=data.line_id
         )
         return await make_json_response(data={"user_id": user_id}, message="註冊成功")
+    except AlreadyExistsError as ae:
+        return await make_json_response(code=409, message="此號碼已被註冊", success=False)
     except Exception as e:
-        return await make_json_response(code=409, message=str(e))
-    
+        return await make_json_response(code=409, message=str(e), success=False)
+
 @user_router.patch("/user")
 async def update_user(data: UpdateUserRequest):
+    """
+        更新使用者資料
+    """
     if not data.phone:
         raise HTTPException(status_code=400, detail="缺少 phone 參數")
 
@@ -67,6 +76,9 @@ async def update_user(data: UpdateUserRequest):
 
 @user_router.patch("/user/password")
 async def change_password(data: ChangePasswordRequest):
+    """
+        修改使用者密碼
+    """
     if data.new_password != data.confirm_password:
         raise HTTPException(status_code=400, detail="新密碼與確認密碼不一致")
 
@@ -78,6 +90,9 @@ async def change_password(data: ChangePasswordRequest):
 
 @user_router.get("/user")
 async def get_user(phone: str = Query(..., description="使用者電話")):
+    """
+        查詢使用者資料
+    """
     try:
         user = await get_user_info(phone)
         return user
@@ -88,6 +103,9 @@ async def get_user(phone: str = Query(..., description="使用者電話")):
 
 @user_router.delete("/user")
 async def delete_user(data: DeleteUserRequest):
+    """
+        刪除使用者帳號
+    """
     try:
         success = await delete_user_account(data.phone)
         if success:

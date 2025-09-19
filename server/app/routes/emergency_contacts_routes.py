@@ -2,27 +2,30 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 from ..service.emergency_contacts_service import (
     add_contact_by_phone,
-    get_contact_relations,
+    get_contacts_by_elder,
+    get_contacts_by_caregiver,
     remove_contact
 )
 
-contact_router = APIRouter()
+contact_router = APIRouter(tags=["緊急聯絡關係"])
 
 class CreateContactRequest(BaseModel):
-    user_phone: str
-    contact_phone: str
-    priority: int
+    elder_phone: str
+    caregiver_phone: str
     relationship: str
 
 class DeleteContactRequest(BaseModel):
-    user_phone: str
-    contact_phone: str
+    elder_phone: str
+    caregiver_phone: str
 
 @contact_router.post("/contact")
 async def create_contact(data: CreateContactRequest):
+    """
+        新增緊急聯絡關係
+    """
     try:
         message = await add_contact_by_phone(
-            data.user_phone, data.contact_phone, data.priority, data.relationship
+            data.elder_phone, data.caregiver_phone, data.relationship
         )
         return {"message": message}
     except ValueError as ve:
@@ -30,31 +33,45 @@ async def create_contact(data: CreateContactRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
 
-@contact_router.get("/contact")
-async def get_contacts(
-    user_phone: str = Query(..., description="使用者電話"),
-    role: int = Query(None, description="要過濾的角色ID（選填）")
+@contact_router.get("/contacts/caregiver")
+async def get_contacts_by_elder_id(
+    elder_phone: str = Query(..., description="長者電話")
 ):
+    """
+        查詢對應照護者
+    """
     try:
-        print(f"[DEBUG] 查詢 user_phone={user_phone}, role={role}")
-        contacts = await get_contact_relations(user_phone, role)
+        contacts = await get_contacts_by_elder(elder_phone)
         return contacts
     except ValueError as ve:
-        print(f"[ERROR] ValueError: {ve}")
         raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
-        import traceback
-        print(f"[EXCEPTION] 發生例外:")
-        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+
+@contact_router.get("/contacts/elder")
+async def get_contacts_by_caregiver_id(
+    caregiver_phone: str = Query(..., description="照護者電話")
+):
+    """
+        查詢對應長者
+    """
+    try:
+        contacts = await get_contacts_by_caregiver(caregiver_phone)
+        return contacts
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
 
 @contact_router.delete("/contact")
 async def delete_contact(data: DeleteContactRequest):
+    """
+        刪除緊急聯絡關係
+    """
     try:
-        message = await remove_contact(data.user_phone, data.contact_phone)
+        message = await remove_contact(data.elder_phone, data.caregiver_phone)
         return {"message": message}
     except ValueError as ve:
         raise HTTPException(status_code=404, detail=str(ve))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
-    

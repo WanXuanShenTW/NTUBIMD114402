@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from ..service.user_service import get_user_info
 from ..utils.response_util import make_json_response
 
-auth_router = APIRouter()
+auth_router = APIRouter(tags=["驗證與登入"])
 
 class LoginRequest(BaseModel):
     phone: str
@@ -11,6 +11,9 @@ class LoginRequest(BaseModel):
 
 @auth_router.post("/login")
 async def login(data: LoginRequest):
+    """
+        使用者登入
+    """
     phone = data.phone
     password = data.password
 

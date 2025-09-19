@@ -2,7 +2,7 @@ from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 from ..utils.ws_connection_manager import ws_manager
 
-ws_test_router = APIRouter()
+ws_test_router = APIRouter(tags=["WS 測試"])
 
 @ws_test_router.websocket("/ws/test")
 async def websocket_test(websocket: WebSocket):

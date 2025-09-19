@@ -24,6 +24,7 @@ except Exception:
 ABNORMAL_LABELS = {"fall"}   # 需要額外作業的類別；之後可加 "lying"、"kneel" ...
 TH_FALL = 0.60       # 跌倒分數門檻
 RECOVER_CONSEC = 2           # 連續多少個視窗才算「回復正常」
+TOTAL_FRAMES: Optional[int] = 60  # ★設定總 frame_id 數（例：1~60）。若設 None 表示關閉循環排序。
 
 # ===================== 與 loader 對齊的參數 =====================
 H, W = 64, 64
@@ -43,9 +44,9 @@ DROPOUT = 0.3                                   # 與訓練一致 :contentRefere
 ENABLE_KALMAN = True
 KALMAN_HALF_SLIDE = True
 HALF_LEN_OVERRIDE = None
-REQUIRE_FULL_FIRST = True                      # 與 loader 一致：第一幀需完整且含 bbox :contentReference[oaicite:4]{index=4}
+REQUIRE_FULL_FIRST = False                      # 與 loader 一致：第一幀需完整且含 bbox :contentReference[oaicite:4]{index=4}
 
-KP_CONF_TH = 0.0
+KP_CONF_TH = 2.0
 SIGMA_KP = 3.0
 
 COCO_EDGES = [
@@ -341,9 +342,26 @@ class FrameRecord:
     dets: List[dict] = field(default_factory=list)
 
 class UserBuffer:
-    def __init__(self):
+    def __init__(self, total_frames: Optional[int] = 60):  # ← 新增參數（預設 60，可依你實際 N 改）
         self.frames: List[FrameRecord] = []
+        self.total_frames = int(total_frames) if total_frames else None
+        self._wrap_anchor: Optional[int] = None  # ← 新增：循環排序錨點
+    
+    def _maybe_update_anchor(self, fid: int):
+        # 若尚未設定錨點，且 fid 落在「後 1/3」，就把這個 fid 設成錨點
+        if not self.total_frames or self._wrap_anchor is not None:
+            return
+        last_third_start = (2 * self.total_frames) // 3  # 例：N=60 → 40
+        if fid > last_third_start:
+            self._wrap_anchor = fid
 
+    def _order_key(self, fid: int) -> int:
+        # 有錨點時：以錨點為 0 做循環排序；否則維持原本 fid 升冪
+        if not self.total_frames or self._wrap_anchor is None:
+            return fid
+        n = self.total_frames
+        return (fid - self._wrap_anchor) % n
+    
     def upsert_pose(self, frame_id: int, ts_ms: int, img_w: float, img_h: float, persons: List[dict]):
         person = max(persons, key=lambda x: x.get("score",0.0)) if persons else None
         bbox = None; kps = None
@@ -375,6 +393,7 @@ class UserBuffer:
                bbox: Optional[Tuple[float,float,float,float]]=None,
                kps: Optional[List[dict]] = None,
                dets: Optional[List[dict]] = None):
+        self._maybe_update_anchor(frame_id)
         for fr in self.frames:
             if fr.frame_id == frame_id:
                 fr.ts_ms = max(fr.ts_ms, ts_ms)
@@ -386,10 +405,13 @@ class UserBuffer:
         else:
             self.frames.append(FrameRecord(frame_id=frame_id, ts_ms=ts_ms, img_w=img_w, img_h=img_h,
                                            kps=kps, bbox=bbox, dets=dets or []))
-            self.frames.sort(key=lambda x: x.frame_id)
+            self.frames.sort(key=lambda x: self._order_key(x.frame_id))
 
     def pop_left(self, n: int):
-        self.frames = self.frames[n:] if n>0 else self.frames
+        self.frames = self.frames[n:] if n > 0 else self.frames
+        # ★ 新增：若清空了視窗，重置循環排序錨點（下一輪再自動建立）
+        if not self.frames:
+            self._wrap_anchor = None
 
     def ready_window(self, require_full_first: bool = True) -> Optional[List[FrameRecord]]:
         if len(self.frames) < WINDOW:
@@ -476,7 +498,7 @@ class StreamInferManager:
             return _SimpleCNNLSTM(in_ch=self.in_ch, num_classes=self.num_classes)
 
     def _buf(self, user_id: str) -> UserBuffer:
-        return self._buffers.setdefault(user_id, UserBuffer())
+        return self._buffers.setdefault(user_id, UserBuffer(total_frames=60))
 
     def _lock(self, user_id: str) -> asyncio.Lock:
         if user_id not in self._locks:

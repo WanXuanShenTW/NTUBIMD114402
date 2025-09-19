@@ -7,7 +7,7 @@ from ..utils.stream_infer_manager import stream_infer_manager
 from ..utils.ws_message_dispatcher import handle_ws_text, notify_user_disconnected
 
 from ..service.fall_event_service import add_fall_event
-pose_router = APIRouter()
+pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
 
 async def on_fall_start(user_id: str, start_time: str, start_frame: int, result: dict):
     """
@@ -53,6 +53,9 @@ print("[HOOKS] registered:", list(stream_infer_manager._handlers.keys()))
 
 @pose_router.websocket("/ws/pose")
 async def ws_pose(websocket: WebSocket):
+    """
+    接收姿態資料並回傳結果
+    """
     # 1) 強制要求 user_id
     user_id = websocket.query_params.get("user_id")
     if not user_id or not user_id.strip():

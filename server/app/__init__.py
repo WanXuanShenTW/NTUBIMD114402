@@ -11,6 +11,7 @@ from .routes.reels_routes import reels_router
 from .routes.auth_routes import auth_router
 from .routes.emergency_contacts_routes import contact_router 
 from .routes.ws_test_routes import ws_test_router  # 測試用 WS
+from .routes.fall_event_routes import fall_event_router
 
 # 啟動與關閉時處理連線池
 @asynccontextmanager
@@ -30,4 +31,5 @@ def create_app():
     app.include_router(contact_router)
     app.include_router(pose_router)
     app.include_router(ws_test_router)  # 測試用 WS
+    app.include_router(fall_event_router)
     return app
