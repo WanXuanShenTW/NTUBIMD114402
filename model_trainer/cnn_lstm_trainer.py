@@ -7,7 +7,6 @@ CNN → LSTM 動作辨識訓練程式（加入卡爾曼濾波 + 骨架完整緩�
 - ✅ 對該 20 幀的 17 個關節做 2D 常速模型卡爾曼濾波（平滑 keypoints）。
 - ✅ 使用『半視窗』(window//2) 初始化卡爾曼濾波，並以線上方式每 5 幀更新。
 
-替換方式：直接以此檔案覆蓋原先的 cnn_lstm_trainer.py 後執行。
 """
 
 import os, json, glob, random
@@ -49,7 +48,7 @@ class Config:
     batch_size = 8
     lr         = 1e-3
     use_sampler = True                   # 不平衡抽樣
-    loss = "focal"                       # "focal" | "ce"
+    loss = "ce"                       # "focal" | "ce"
 
     # ====== 新增：輸入前置與過濾規則 ======
     enable_kalman = True                 # 對 keypoints 做卡爾曼平滑
@@ -80,6 +79,12 @@ _EARLY_STOP_PATIENCE = 10
 _SAVE_TOP_K = 3
 _FOCAL_GAMMA = 2.0
 
+# ====== Motion 相關 ======
+_USE_MOTION = True        # 開啟動態特徵
+_MOTION_CLIP_V = 3.0      # 速度裁剪
+_MOTION_CLIP_A = 9.0      # 加速度裁剪
+_MIN_VALID_RATIO = 0.6    # 一段視窗中至少 60% 幀有效才納入訓練（或降低權重）
+
 # ===================== Utils =====================
 def set_seed(seed=42):
     random.seed(seed)
@@ -106,13 +111,11 @@ class RelationMapConfig:
         self.include_bone_lines = bool(include_bone_lines)
         self.object_classes = [c.strip() for c in (object_classes or []) if c.strip()]
 
-
 def draw_gaussian(heatmap, x, y, sigma, mag=1.0):
     H, W = heatmap.shape
     xx, yy = np.meshgrid(np.arange(W), np.arange(H))
     g = np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2.0 * sigma ** 2)).astype(np.float32) * mag
     heatmap += g
-
 
 def _bbox_xyxy_from_any(b):
     if b is None:
@@ -128,7 +131,6 @@ def _bbox_xyxy_from_any(b):
         x1, y1, x2, y2 = map(float, b)
         return x1, y1, x2, y2
     return None
-
 
 def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
     H, W = cfg.H, cfg.W
@@ -264,7 +266,6 @@ class Kalman2D:
     def get_xy(self):
         return float(self.x[0, 0]), float(self.x[1, 0])
 
-
 def kalman_smooth_kps(window_kps, *,
                        half_slide=False,
                        half_len=10,
@@ -350,6 +351,150 @@ def kalman_smooth_kps(window_kps, *,
 
     return out
 
+# ===================== Motion 特徵（不使用 timestamp；dt=1） =====================
+import math
+
+def _safe_mean(vals):
+    vals = [v for v in vals if v is not None]
+    return sum(vals)/len(vals) if vals else None
+
+def _angle(a,b,c):
+    if (a is None) or (b is None) or (c is None): return None
+    ba = (a[0]-b[0], a[1]-b[1]); bc = (c[0]-b[0], c[1]-b[1])
+    nba = math.hypot(*ba); nbc = math.hypot(*bc)
+    if nba<1e-6 or nbc<1e-6: return None
+    cosv = (ba[0]*bc[0] + ba[1]*bc[1])/(nba*nbc)
+    cosv = max(-1.0, min(1.0, cosv))
+    return math.acos(cosv)
+
+def _kp_xy(kps, i, img_w, img_h, conf_th):
+    if i < len(kps):
+        d = kps[i]
+        conf = float(d.get("conf", d.get("confidence", 1.0)))
+        if conf >= _KP_CONF_TH and ("x" in d) and ("y" in d):
+            return (float(d["x"])/img_w, float(d["y"])/img_h)
+    return None
+
+def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=0.3):
+    """
+    parsed: list of (bbox, kps_list, detections, img_w, img_h)
+    回傳:
+      feats: (T, 9)  -> [v_y, a_y, v_h, a_h, v_A, a_A, dtrunk, dkneeL, dkneeR]
+      mask:  (T,)    -> 0/1 有效幀
+    """
+    T = len(parsed)
+    if T == 0:
+        return np.zeros((0,9), np.float32), np.zeros((0,), np.float32)
+
+    ycom, hgt, area, trunk, kneeL, kneeR = [], [], [], [], [], []
+
+    for (bbox, kps, _, img_w, img_h) in parsed:
+        # y_com（優先髖 11/12，其次肩 5/6，最後高 conf 的平均）
+        hips = [_kp_xy(kps,11,img_w,img_h,conf_th), _kp_xy(kps,12,img_w,img_h,conf_th)]
+        hs = [p for p in hips if p is not None]
+        if hs:
+            y_c = _safe_mean([p[1] for p in hs])
+        else:
+            shs = [_kp_xy(kps,5,img_w,img_h,conf_th), _kp_xy(kps,6,img_w,img_h,conf_th)]
+            ss = [p for p in shs if p is not None]
+            if ss:
+                y_c = _safe_mean([p[1] for p in ss])
+            else:
+                ys = [float(p["y"])/img_h for p in kps if float(p.get("conf", p.get("confidence",1.0)))>=conf_th and ("y" in p)]
+                y_c = _safe_mean(ys)
+        ycom.append(y_c)
+
+        # 身高 proxy 與面積（歸一化）
+        if bbox and all(k in bbox for k in ("w","h")):
+            h = float(bbox["h"])/img_h; w = float(bbox["w"])/img_w
+        else:
+            ys = [float(p["y"])/img_h for p in kps if float(p.get("conf", p.get("confidence",1.0)))>=conf_th and ("y" in p)]
+            if len(ys)>=2:
+                h = max(ys)-min(ys); w = 0.4*h
+            else:
+                h=None; w=None
+        hgt.append(h)
+        area.append((w*h) if (w is not None and h is not None) else None)
+
+        # 軀幹角 vs 垂直、膝角
+        shL=_kp_xy(kps,5,img_w,img_h,conf_th); shR=_kp_xy(kps,6,img_w,img_h,conf_th)
+        hpL=_kp_xy(kps,11,img_w,img_h,conf_th); hpR=_kp_xy(kps,12,img_w,img_h,conf_th)
+        knL=_kp_xy(kps,13,img_w,img_h,conf_th); anL=_kp_xy(kps,15,img_w,img_h,conf_th)
+        knR=_kp_xy(kps,14,img_w,img_h,conf_th); anR=_kp_xy(kps,16,img_w,img_h,conf_th)
+        if shL and shR and hpL and hpR:
+            sh=((shL[0]+shR[0])/2,(shL[1]+shR[1])/2)
+            hp=((hpL[0]+hpR[0])/2,(hpL[1]+hpR[1])/2)
+            vec=(hp[0]-sh[0], hp[1]-sh[1])
+            ang=abs(math.atan2(vec[0], vec[1]))  # 0=垂直，越大越斜
+        else:
+            ang=None
+        trunk.append(ang)
+        kneeL.append(_angle(hpL, knL, anL))
+        kneeR.append(_angle(hpR, knR, anR))
+
+    # 小洞線性補（連續缺值<=3）
+    def fill_small(arr):
+        arr=list(arr); n=len(arr); i=0
+        while i<n:
+            if arr[i] is None:
+                j=i
+                while j<n and arr[j] is None: j+=1
+                gap=j-i
+                if gap<=3 and i>0 and j<n and arr[i-1] is not None and arr[j] is not None:
+                    for k in range(gap):
+                        w=(k+1)/(gap+1); arr[i+k]=arr[i-1]*(1-w)+arr[j]*w
+                i=j
+            else:
+                i+=1
+        return [0.0 if v is None else v for v in arr]
+
+    ycom=fill_small(ycom); hgt=fill_small(hgt); area=fill_small(area)
+    trunk=fill_small(trunk); kneeL=fill_small(kneeL); kneeR=fill_small(kneeR)
+
+    ycom=np.array(ycom,np.float32); hgt=np.array(hgt,np.float32); area=np.array(area,np.float32)
+    trunk=np.array(trunk,np.float32); kneeL=np.array(kneeL,np.float32); kneeR=np.array(kneeR,np.float32)
+
+    # 差分（dt=1）
+    def diff1(x):
+        v=np.zeros_like(x)
+        v[1:]=x[1:]-x[:-1]
+        return v
+    def diff2(v):
+        a=np.zeros_like(v)
+        a[1:]=v[1:]-v[:-1]
+        return a
+
+    v_y, a_y = diff1(ycom), diff2(diff1(ycom))
+    v_h, a_h = diff1(hgt),  diff2(diff1(hgt))
+    v_A, a_A = diff1(area), diff2(diff1(area))
+    dtrunk   = diff1(trunk)
+    dkneeL   = diff1(kneeL); dkneeR = diff1(kneeR)
+
+    feats = np.stack([
+        np.clip(v_y, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        np.clip(a_y, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+        np.clip(v_h, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        np.clip(a_h, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+        np.clip(v_A, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        np.clip(a_A, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+        np.clip(dtrunk, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        np.clip(dkneeL, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        np.clip(dkneeR, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+    ], axis=1).astype(np.float32)  # (T,9)
+
+    # 有效幀 mask：關鍵點命中數>=2 或 有 bbox
+    valid=[]
+    for (bbox, kps, _, _, _) in parsed:
+        cnt=0
+        for j in (11,12,5,6,13,14):
+            if j < len(kps):
+                conf=float(kps[j].get("conf", kps[j].get("confidence",1.0)))
+                if conf>=_KP_CONF_TH: cnt+=1
+        ok=(cnt>=2) or (bbox is not None)
+        valid.append(1.0 if ok else 0.0)
+    valid=np.array(valid,np.float32)
+    return feats, valid
+
 # ===================== Dataset =====================
 
 def read_any_json(path):
@@ -393,7 +538,6 @@ def read_any_json(path):
             continue
     return recs
 
-
 def _get_frame_id(r):
     for k in ("frame_id", "frame", "fid", "index", "idx", "image_id"):
         if isinstance(r, dict) and k in r:
@@ -403,13 +547,11 @@ def _get_frame_id(r):
                 pass
     return None
 
-
 def _list_json_files(d):
     files = []
     for pat in ("*.jsonl", "*.JSONL", "*.json", "*.JSON"):
         files.extend(glob.glob(os.path.join(d, pat)))
     return sorted(files)
-
 
 def _list_json_files_recursive(root):
     files = []
@@ -418,7 +560,6 @@ def _list_json_files_recursive(root):
             if fn.lower().endswith((".jsonl", ".json")):
                 files.append(os.path.join(dirpath, fn))
     return sorted(files)
-
 
 def load_pose_sequence(pose_path):
     poses = {}
@@ -438,7 +579,6 @@ def load_pose_sequence(pose_path):
             poses[fid] = r if isinstance(r, dict) else {"raw": r}
     return poses
 
-
 def load_object_sequence(obj_path):
     objs = {}
     files = []
@@ -456,7 +596,6 @@ def load_object_sequence(obj_path):
                 fid = idx
             objs[fid] = r if isinstance(r, dict) else {"raw": r}
     return objs
-
 
 def _find_sequences_for_class(pose_cdir, obj_cdir, use_objects):
     seqs = []
@@ -478,7 +617,7 @@ def _find_sequences_for_class(pose_cdir, obj_cdir, use_objects):
             seqs.append((pf, None))
     return seqs
 
-# ============== 新增：骨架完整性檢查（每幀） ==============
+# ============== 骨架完整性檢查（每幀） ==============
 
 def _extract_pose_basic(p):
     """解析一幀 pose，回傳 (bbox, kps_list[17], img_w, img_h)；
@@ -527,7 +666,6 @@ def _extract_pose_basic(p):
         img_h = max(1.0, max(ys) if ys else 480.0)
     return bbox, kps_list, float(img_w), float(img_h)
 
-
 def _frame_has_full_skeleton(p, kp_need=17, bbox_required=True):
     bbox, kps_list, _, _ = _extract_pose_basic(p)
     if bbox_required and (bbox is None):
@@ -541,7 +679,6 @@ def _frame_has_full_skeleton(p, kp_need=17, bbox_required=True):
         except Exception:
             pass
     return ok >= kp_need
-
 
 class PoseObjectDataset(Dataset):
     def __init__(self, pose_root, obj_root=None, use_objects=True,
@@ -696,13 +833,17 @@ class PoseObjectDataset(Dataset):
             # 替換回去
             parsed = [(bbox, smoothed[i], dets, img_w, img_h) for i, (bbox, _, dets, img_w, img_h) in enumerate(parsed)]
 
+        motion_feats, valid_mask = compute_motion_feats_with_mask_from_parsed(parsed, conf_th=self.cfg.kp_conf_th)
+        
         # Rasterize → 堆疊 (T, C, H, W)
         Xs = []
         for (bbox, kps_list, detections, img_w, img_h) in parsed:
             Xs.append(rasterize_frame(bbox, kps_list, detections, img_w, img_h, self.cfg))
-        X = torch.from_numpy(np.stack(Xs)).float()
+        X = torch.from_numpy(np.stack(Xs)).float()     # (T,C,H,W)
+        M = torch.from_numpy(motion_feats).float()     # (T,9)
+        mask = torch.from_numpy(valid_mask).float()    # (T,)
         y = torch.tensor(y_idx, dtype=torch.long)
-        return X, y
+        return (X, M, mask), y
 
 # ===================== Model =====================
 class SpaceCNN(nn.Module):
@@ -720,7 +861,6 @@ class SpaceCNN(nn.Module):
     def forward(self, x):
         return self.fc(self.net(x).flatten(1))
 
-
 class TemporalHead(nn.Module):
     def __init__(self, in_dim, num_classes, mode="last", dropout=0.0):
         super().__init__()
@@ -730,34 +870,50 @@ class TemporalHead(nn.Module):
             self.attn = nn.Linear(in_dim, 1)
         self.fc = nn.Linear(in_dim, num_classes)
 
-    def forward(self, seq_feats):
-        if self.mode == "mean":
-            g = seq_feats.mean(dim=1)
-        elif self.mode == "attn":
-            a = self.attn(seq_feats).squeeze(-1)
-            w = torch.softmax(a, dim=1).unsqueeze(-1)
-            g = (seq_feats * w).sum(dim=1)
+    def forward(self, seq_feats, mask=None):
+        # seq_feats: (B,T,D), mask: (B,T) in {0,1}
+        if (mask is not None) and (self.mode in ("mean","attn")):
+            if self.mode == "mean":
+                m = mask.unsqueeze(-1)                      # (B,T,1)
+                den = m.sum(dim=1).clamp_min(1e-6)
+                g = (seq_feats * m).sum(dim=1) / den
+            else:
+                a = self.attn(seq_feats).squeeze(-1)       # (B,T)
+                a = a.masked_fill((mask<=0), float("-inf"))
+                w = torch.softmax(a, dim=1).unsqueeze(-1)  # (B,T,1)
+                g = (seq_feats * w).sum(dim=1)
         else:
-            g = seq_feats[:, -1]
+            if self.mode == "mean":
+                g = seq_feats.mean(dim=1)
+            elif self.mode == "attn":
+                a = self.attn(seq_feats).squeeze(-1)
+                w = torch.softmax(a, dim=1).unsqueeze(-1)
+                g = (seq_feats * w).sum(dim=1)
+            else:
+                g = seq_feats[:, -1]
         g = self.drop(g)
         return self.fc(g)
 
-
 class CNNLSTM(nn.Module):
     def __init__(self, in_ch, num_classes, cnn_out=256, lstm_h=256, lstm_layers=2,
-                 bidirectional=False, temporal_pool="last", dropout=0.0):
+                 bidirectional=False, temporal_pool="last", dropout=0.0, motion_dim=0):
         super().__init__()
         self.cnn = SpaceCNN(in_ch, cnn_out)
-        self.lstm = nn.LSTM(cnn_out, lstm_h, lstm_layers, batch_first=True,
+        self.motion_dim = int(motion_dim) if motion_dim else 0
+        lstm_in = cnn_out + self.motion_dim
+        self.lstm = nn.LSTM(lstm_in, lstm_h, lstm_layers, batch_first=True,
                             bidirectional=bidirectional)
         feat_dim = lstm_h * (2 if bidirectional else 1)
         self.head = TemporalHead(feat_dim, num_classes, mode=temporal_pool, dropout=dropout)
 
-    def forward(self, x):
+    def forward(self, x, motion=None, mask=None):
+        # x: (B,T,C,H,W)  motion: (B,T,D)  mask: (B,T)
         B, T, C, H, W = x.shape
-        z = self.cnn(x.view(B * T, C, H, W)).view(B, T, -1)
-        out, _ = self.lstm(z)
-        logits = self.head(out)
+        z = self.cnn(x.view(B*T, C, H, W)).view(B, T, -1)  # (B,T,cnn_out)
+        if self.motion_dim > 0 and motion is not None:
+            z = torch.cat([z, motion], dim=-1)             # (B,T,cnn_out+D)
+        out, _ = self.lstm(z)                               # (B,T,H)
+        logits = self.head(out, mask=mask)
         return logits
 
 # ===================== Loss =====================
@@ -783,10 +939,9 @@ def evaluate(model, loader, device):
     tot, corr = 0, 0
     all_y, all_p = [], []
     with torch.no_grad():
-        for X, y in loader:
-            X = X.to(device)
-            y = y.to(device)
-            out = model(X)
+        for (X, M, mask), y in loader:
+            X = X.to(device); M = M.to(device); mask = mask.to(device); y = y.to(device)
+            out = model(X, motion=(M if _USE_MOTION else None), mask=mask)
             pred = out.argmax(1)
             corr += (pred == y).sum().item()
             tot += len(y)
@@ -797,7 +952,6 @@ def evaluate(model, loader, device):
     y_pred = np.concatenate(all_p) if all_p else np.array([])
     mf1 = f1_score(y_true, y_pred, average="macro") if y_true.size else 0.0
     return acc, mf1
-
 
 # 修正後的程式碼
 
@@ -860,7 +1014,9 @@ def train(cfg: Config):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sample_x, _ = ds[0]
-    _, C, H, W = sample_x.shape
+    X0, M0, mask0 = sample_x
+    _, C, H, W = X0.shape
+    motion_dim = M0.shape[1] if _USE_MOTION else 0
 
     model = CNNLSTM(
         in_ch=C,
@@ -871,6 +1027,7 @@ def train(cfg: Config):
         bidirectional=bool(cfg.bidirectional),
         temporal_pool=cfg.temporal_pool,
         dropout=cfg.dropout,
+        motion_dim=motion_dim
     ).to(device)
 
     total = float(sum(counts))
@@ -893,14 +1050,14 @@ def train(cfg: Config):
         model.train()
         tot, corr, loss_sum = 0, 0, 0.0
         pbar = tqdm(tr_loader, desc=f"Epoch {ep}/{cfg.epochs} [train]")
-        for X, y in pbar:
-            X = X.to(device)
-            y = y.to(device)
-
-            optimizer.zero_grad(set_to_none=True)
+        for (X, M, mask), y in pbar:
+            X = X.to(device); M = M.to(device); mask = mask.to(device); y = y.to(device)
+            
+            optimizer.zero_grad(set_to_none=True) 
+            
             with torch.amp.autocast(device_type='cuda', enabled=scaler.is_enabled()):
-                out = model(X)
-                loss = criterion(out, y)
+                logits = model(X, motion=(M if _USE_MOTION else None), mask=mask)
+                loss = criterion(logits, y)
             scaler.scale(loss).backward()
             if _GRAD_CLIP and _GRAD_CLIP > 0:
                 scaler.unscale_(optimizer)
@@ -909,7 +1066,7 @@ def train(cfg: Config):
             scaler.update()
 
             loss_sum += loss.item() * len(y)
-            corr += (out.argmax(1) == y).sum().item()
+            corr += (logits.argmax(1) == y).sum().item() 
             tot += len(y)
             pbar.set_postfix({"loss": f"{loss_sum/max(1,tot):.3f}", "acc": f"{corr/max(1,tot):.3f}"})
 
@@ -964,9 +1121,9 @@ def train(cfg: Config):
         model.eval()
         all_y, all_p = [], []
         with torch.no_grad():
-            for X, y in va_loader:
-                X = X.to(device)
-                out = model(X)
+            for (X, M, mask), y in va_loader:
+                X = X.to(device); M = M.to(device); mask = mask.to(device)
+                out = model(X, motion=(M if _USE_MOTION else None), mask=mask)
                 pred = out.argmax(1).cpu().numpy()
                 all_p.append(pred)
                 all_y.append(y.numpy())
@@ -975,7 +1132,6 @@ def train(cfg: Config):
         cm = confusion_matrix(y_true, y_pred)
         print("\nConfusion Matrix:\n", cm)
         print("\nClassification Report:\n", classification_report(y_true, y_pred, target_names=ds.class_names, digits=3))
-
 
 if __name__ == "__main__":
     cfg = Config()
