@@ -43,6 +43,6 @@ async def get_fall_event_records(user_id: int, limit: int = 10):
             records = await select_fall_event_by_user_id(conn, user_id, limit)
             return records
         except NotFoundError:
-            raise
+            raise NotFoundError("查無此使用者")
         except Exception as e:
             raise DatabaseError(f"查詢跌倒事件時發生錯誤: {e}")

@@ -46,4 +46,4 @@ async def add_gait_instability(
             status_code=200
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"{str(e)}")

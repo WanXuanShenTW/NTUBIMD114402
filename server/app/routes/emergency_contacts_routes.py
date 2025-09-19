@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from ..service.emergency_contacts_service import (
     add_contact_by_phone,
@@ -6,8 +6,9 @@ from ..service.emergency_contacts_service import (
     get_contacts_by_caregiver,
     remove_contact
 )
+from ..utils.response_util import make_json_response
 
-contact_router = APIRouter(tags=["緊急聯絡關係"])
+contact_router = APIRouter(tags=["緊急聯絡人"])
 
 class CreateContactRequest(BaseModel):
     elder_phone: str
@@ -21,57 +22,57 @@ class DeleteContactRequest(BaseModel):
 @contact_router.post("/contact")
 async def create_contact(data: CreateContactRequest):
     """
-        新增緊急聯絡關係
+        新增緊急聯絡人
     """
     try:
         message = await add_contact_by_phone(
             data.elder_phone, data.caregiver_phone, data.relationship
         )
-        return {"message": message}
+        return await make_json_response(data=None, code=200, message=message)
     except ValueError as ve:
-        raise HTTPException(status_code=409, detail=str(ve))
+        return await make_json_response(data=None, code=409, message=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+        return await make_json_response(data=None, code=500, message=str(e))
 
-@contact_router.get("/contacts/caregiver")
-async def get_contacts_by_elder_id(
+@contact_router.get("/contacts/elder")
+async def get_contacts_by_elder_route(
     elder_phone: str = Query(..., description="長者電話")
 ):
     """
-        查詢對應照護者
+        根據長者電話查詢所有的照護者
     """
     try:
         contacts = await get_contacts_by_elder(elder_phone)
-        return contacts
+        return await make_json_response(data=contacts, code=200, message="查詢成功")
     except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve))
+        return await make_json_response(data=None, code=404, message=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+        return await make_json_response(data=None, code=500, message=str(e))
 
-@contact_router.get("/contacts/elder")
-async def get_contacts_by_caregiver_id(
+@contact_router.get("/contacts/caregiver")
+async def get_contacts_by_caregiver_route(
     caregiver_phone: str = Query(..., description="照護者電話")
 ):
     """
-        查詢對應長者
+        根據照護者電話查詢所有的長者
     """
     try:
         contacts = await get_contacts_by_caregiver(caregiver_phone)
-        return contacts
+        return await make_json_response(data=contacts, code=200, message="查詢成功")
     except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve))
+        return await make_json_response(data=None, code=404, message=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+        return await make_json_response(data=None, code=500, message=str(e))
 
 @contact_router.delete("/contact")
 async def delete_contact(data: DeleteContactRequest):
     """
-        刪除緊急聯絡關係
+        刪除緊急聯絡人
     """
     try:
         message = await remove_contact(data.elder_phone, data.caregiver_phone)
-        return {"message": message}
+        return await make_json_response(data=None, code=200, message=message)
     except ValueError as ve:
-        raise HTTPException(status_code=404, detail=str(ve))
+        return await make_json_response(data=None, code=404, message=str(ve))
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
+        return await make_json_response(data=None, code=500, message=str(e))

@@ -29,4 +29,4 @@ async def login(data: LoginRequest):
         
         return await make_json_response(data={"user": user}, message="登入成功")
     except Exception as e:
-        return await make_json_response(code=500, message=f"伺服器錯誤: {str(e)}")
+        return await make_json_response(code=500, message=str(e))

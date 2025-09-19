@@ -33,20 +33,35 @@ async def add_user(
                 raise DatabaseError("資料庫新增使用者失敗")
             return user_id
         except AlreadyExistsError:
-            raise
+            raise AlreadyExistsError("此電話已被註冊")
         except Exception as e:
             raise DatabaseError(f"新增使用者時發生錯誤: {e}")
 
 async def update_user_info(phone: str, **data) -> bool:
+    """
+    更新使用者資訊。
+
+    :param phone: 使用者電話
+    :param data: 要更新的資料
+    :return: 是否成功更新
+    """
     async with Database.connection() as conn:
-        user = await select_user_by_phone(conn, phone)
-        if not user:
+        try:
+            # 查詢使用者
+            user = await select_user_by_phone(conn, phone)
+            if not user:
+                raise NotFoundError("找不到該電話對應的使用者")
+        except NotFoundError:
             raise NotFoundError("找不到該電話對應的使用者")
+        except Exception as e:
+            raise DatabaseError(f"查詢使用者資料時發生錯誤: {e}")
+
         user_id = user["user_id"]
         try:
+            # 更新使用者資料
             return await update_user(conn, user_id, **data)
         except NotFoundError:
-            raise
+            raise NotFoundError("找不到該使用者")
         except Exception as e:
             raise DatabaseError(f"更新使用者資料時發生錯誤: {e}")
 
@@ -68,7 +83,7 @@ async def change_user_password(phone: str, old_password: str, new_password: str)
         try:
             return await update_user(conn, user["user_id"], password=new_password)
         except NotFoundError:
-            raise
+            raise NotFoundError("找不到該使用者")
         except Exception as e:
             raise DatabaseError(f"更改密碼時發生錯誤: {e}")
 
@@ -80,7 +95,7 @@ async def get_user_info(phone: str) -> dict:
                 raise NotFoundError("找不到該使用者")
             return user
         except NotFoundError:
-            raise
+            raise NotFoundError("找不到該使用者")
         except Exception as e:
             raise DatabaseError(f"查詢使用者資料時發生錯誤: {e}")
 
@@ -89,6 +104,6 @@ async def delete_user_account(phone: str) -> bool:
         try:
             return await delete_user(conn, phone)
         except NotFoundError:
-            raise
+            raise NotFoundError("找不到該使用者")
         except Exception as e:
             raise DatabaseError(f"刪除使用者時發生錯誤: {e}")

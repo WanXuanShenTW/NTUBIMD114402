@@ -53,7 +53,6 @@ async def add_contact_by_phone(elder_phone, caregiver_phone, relationship):
         except Exception as e:
             raise DatabaseError(f"新增照護關係時發生錯誤: {e}")
 
-
 async def get_contacts_by_elder(elder_phone: str) -> list:
     """
     根據長者電話取得其所有的照護者關係。
@@ -61,11 +60,11 @@ async def get_contacts_by_elder(elder_phone: str) -> list:
     :return: 照護者列表
     """
     async with Database.connection() as conn:
-        elder = await select_user_by_phone(conn, elder_phone)
-        if not elder:
+        caregiver = await select_user_by_phone(conn, elder_phone)
+        if not caregiver:
             raise NotFoundError(f"phone {elder_phone} 不存在")
 
-        elder_user_id = elder["user_id"]
+        elder_user_id = caregiver["user_id"]
 
         try:
             contacts = await select_contacts_by_elder_user_id(conn, elder_user_id)
@@ -98,7 +97,6 @@ async def get_contacts_by_elder(elder_phone: str) -> list:
             result.append(contact_info)
 
         return result
-
 
 async def get_contacts_by_caregiver(caregiver_phone: str) -> list:
     """
@@ -144,7 +142,6 @@ async def get_contacts_by_caregiver(caregiver_phone: str) -> list:
             result.append(contact_info)
 
         return result
-
 
 async def remove_contact(elder_phone: str, caregiver_phone: str) -> str:
     async with Database.connection() as conn:
