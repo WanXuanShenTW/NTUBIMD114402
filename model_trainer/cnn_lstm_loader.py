@@ -23,10 +23,12 @@ MODEL_PATH      = "outputs/models/test/best.pt"       # best.pt（state_dict）�
 CLASSES_PATH    = "outputs/models/test/classes.json"   # 若載入 best.pt 需提供類別清單
 
 # 測試檔（影片級 JSON，list 形式；索引=幀號）
-POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_011.json"
-OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/fall/fall_011.json"
+# POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_011.json"
+# OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/fall/fall_011.json"
 # POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/normal/normal_002.json"
 # OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/normal/normal_002.json"
+POSE_JSON       = "medias/test/normal/ps_IMG_7694.json"
+OBJECT_JSON     = None
 OUT_CSV         = None  # 例如 "preds.csv"；不要輸出就設 None
 
 # Relation Map 與物件通道（需與訓練一致）
@@ -44,11 +46,11 @@ DROPOUT                = 0.3
 
 # ===== 前置：KF 與完整性判斷（與訓練一致） =====
 ENABLE_KALMAN               = True
-KALMAN_HALF_SLIDE           = True   # 1~10 初始化；之後每 5 幀用 5~15、10~20 覆蓋尾段
-REQUIRE_FULL_FIRST_FRAME    = True   # 視窗第一幀必須完整，否則此視窗不推論
-HALF_LEN_OVERRIDE           = None   # 預設用 WINDOW//2 (=10)
-KP_CONF_TH                  = 0.4    # 與 trainer 同步
-SIGMA_KP                    = 3.0
+KALMAN_HALF_SLIDE           = False    # 1~10 初始化；之後每 5 幀用 5~15、10~20 覆蓋尾段
+REQUIRE_FULL_FIRST_FRAME    = False   # 視窗第一幀必須完整，否則此視窗不推論
+HALF_LEN_OVERRIDE           = None    # 預設用 WINDOW//2 (=10)
+KP_CONF_TH                  = 0.6    # 與 trainer 同步
+SIGMA_KP                    = 2.0
 
 # Motion & 掩碼
 _USE_MOTION                 = True   # 與 trainer 一致；motion 維度固定 9
@@ -398,7 +400,7 @@ def _kp_xy(kps, i, img_w, img_h, conf_th):
         d = kps[i]
         conf = float(d.get("conf", d.get("confidence", 1.0)))
         if conf >= KP_CONF_TH and ("x" in d) and ("y" in d):
-            return (float(d["x"])/img_w, float(d["y"])/img_h)
+            return (float(d["x"]) / img_w, float(d["y"]) / img_h)
     return None
 
 def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=0.3):
@@ -426,17 +428,17 @@ def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=0.3):
             if ss:
                 y_c = _safe_mean([p[1] for p in ss])
             else:
-                ys = [float(p["y"])/img_h for p in kps if float(p.get("conf", p.get("confidence",1.0)))>=conf_th and ("y" in p)]
+                ys = [float(p["y"]) / img_h for p in kps if float(p.get("conf", p.get("confidence",1.0))) >= conf_th and ("y" in p)]
                 y_c = _safe_mean(ys)
         ycom.append(y_c)
 
         # 身高 proxy 與面積（歸一化）
         if bbox and all(k in bbox for k in ("w","h")):
-            h = float(bbox["h"])/img_h; w = float(bbox["w"])/img_w
+            h = float(bbox["h"]) / img_h; w = float(bbox["w"]) / img_w
         else:
-            ys = [float(p["y"])/img_h for p in kps if float(p.get("conf", p.get("confidence",1.0)))>=conf_th and ("y" in p)]
-            if len(ys)>=2:
-                h = max(ys)-min(ys); w = 0.4*h
+            ys = [float(p["y"]) / img_h for p in kps if float(p.get("conf", p.get("confidence",1.0))) >= conf_th and ("y" in p)]
+            if len(ys) >= 2:
+                h = max(ys) - min(ys); w = 0.4 * h
             else:
                 h=None; w=None
         hgt.append(h)
