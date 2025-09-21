@@ -1,13 +1,18 @@
-from flask import Blueprint, request, jsonify
+import os
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 from datetime import datetime
-from ..db import get_connection
-import requests
+from ..db import Database
+import httpx
 
-notify_line_bp = Blueprint('notify_line_bp', __name__)
+notify_line_router = APIRouter()
 
-LINE_CHANNEL_ACCESS_TOKEN = "JXA4r5Tp2n7UF7mRcP2qWY1PzXM4f7FvCPYbTwaoKQoz2hU6916oxiADO8oMUDJBrHmGjL5WRCK8KR1+GAxtA+7Hr7uGLpFd1HuLVWRvo3CvBLlm7iNQqY2vJpRX8F9dgBaVrtn0JGW0KxzVrwa1iQdB04t89/1O/w1cDnyilFU="
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 
-def push_line_message(user_id, message):
+async def push_line_message(user_id: str, message: str) -> int:
+    """
+    傳送 LINE 訊息給指定的使用者。
+    """
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
         "Content-Type": "application/json",
@@ -23,46 +28,41 @@ def push_line_message(user_id, message):
         ]
     }
 
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"傳送給 {user_id}，狀態碼：{response.status_code}")
-    if response.status_code != 200:
-        print(f"回應內容：{response.text}")
-    return response.status_code
+    async with httpx.AsyncClient() as client:
+        response = await client.post(url, headers=headers, json=payload)
+        print(f"傳送給 {user_id}，狀態碼：{response.status_code}")
+        if response.status_code != 200:
+            print(f"回應內容：{response.text}")
+        return response.status_code
 
-@notify_line_bp.route('/notify_line', methods=['POST'])
-def notify_line():
+@notify_line_router.post("/notify_line")
+async def notify_line():
+    """
+    發送跌倒事件通知給 LINE 使用者。
+    """
     try:
-        data = request.get_json()
-        user_ids = data.get('user_id', [])
-        if not isinstance(user_ids, list):
-            user_ids = [user_ids]
-
         detected_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         message = f"""⚠️ 注意！偵測到跌倒事件 ⚠️
-                    時間：{detected_time}
-                    請立即檢查爺爺奶奶的狀況，確保他們安全無恙。"""
-        
-        conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT line_id FROM users WHERE role_id = 2") 
-        user_ids = [row[0] for row in cursor.fetchall()]
-        cursor.close()
-        conn.close()
+時間：{detected_time}
+請立即檢查爺爺奶奶的狀況，確保他們安全無恙。"""
+
+        async with Database.connection() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT line_id FROM users WHERE role_id = 2")
+                user_ids = [row["line_id"] for row in await cursor.fetchall()]
 
         success_list, fail_list = [], []
         for uid in user_ids:
-            status = push_line_message(uid, message)
+            status = await push_line_message(uid, message)
             (success_list if status == 200 else fail_list).append(uid)
-            
 
-        return jsonify({
+        return JSONResponse(content={
             "status": "ok",
             "sent": success_list,
             "failed": fail_list,
             "message": message
-        }), 200
+        }, status_code=200)
 
     except Exception as e:
         print(f"[錯誤] 發送失敗：{str(e)}")
-        return jsonify({"status": "error", "error": str(e)}), 400
+        raise HTTPException(status_code=500, detail=f"伺服器錯誤: {str(e)}")
