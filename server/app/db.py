@@ -1,20 +1,27 @@
+# app/db.py
 import os
 import asyncio
 from dotenv import load_dotenv
 from aiomysql import create_pool, OperationalError
 from contextlib import asynccontextmanager
+from aiomysql.cursors import DictCursor  # ✅ for dictionary-style rows
 
 load_dotenv()
 
+# ---- 可調參數（支援 .env）----
 USE_POOL_TIMEOUT = os.getenv("USE_POOL_TIMEOUT", "false").lower() == "true"
-POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 2))  # acquire 逾時（秒）
-
-# 連線最長存活（秒）：應小於 MySQL wait_timeout；避免 NAT/防火牆閒置回收
-POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", 1800))
-
-# 借出時 pre-ping，避免用到壞連線
-PRE_PING = os.getenv("DB_PRE_PING", "true").lower() == "true"
-PING_TIMEOUT = float(os.getenv("DB_PING_TIMEOUT", 1.0))
+POOL_TIMEOUT     = int(os.getenv("POOL_TIMEOUT", 15))          # 取得連線逾時（秒）← 放大預設
+POOL_RECYCLE     = int(os.getenv("DB_POOL_RECYCLE", 1800))     # 連線最長存活（秒）
+PRE_PING         = os.getenv("DB_PRE_PING", "true").lower() == "true"
+PING_TIMEOUT     = float(os.getenv("DB_PING_TIMEOUT", 1.0))
+DB_HOST          = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT          = int(os.getenv("DB_PORT", 3306))             # ✅ 支援自訂 port
+DB_USER          = os.getenv("DB_USER")
+DB_PASSWORD      = os.getenv("DB_PASSWORD")
+DB_NAME          = os.getenv("DB_NAME")
+DB_MINSIZE       = int(os.getenv("DB_POOL_MINSIZE", 1))
+DB_MAXSIZE       = int(os.getenv("DB_POOL_MAXSIZE", 10))
+CONNECT_TIMEOUT  = int(os.getenv("DB_CONNECT_TIMEOUT", 10))
 
 # 會自動重試的 MySQL 錯誤碼
 _RETRY_ERRCODES = {2006, 2013}  # MySQL server has gone away / Lost connection during query
@@ -24,7 +31,7 @@ class _RetryingCursor:
     """
     透明重試的 Cursor 包裝器：
     - 支援 async context manager
-    - 在 execute / executemany 碰到 2006/2013 會自動重建連線並重試一次
+    - execute / executemany 碰到 2006/2013 會自動重建連線並重試一次
     """
     def __init__(self, rconn, raw_cursor_factory_args, raw_cursor_factory_kwargs):
         self._rconn = rconn
@@ -119,11 +126,22 @@ class _RetryingConnection:
                     self._raw = await self._db._acquire_from_pool()
 
     async def _new_raw_cursor(self, *args, **kwargs):
+        # 相容寫法：cursor(dictionary=True) / cursorclass=... / cursor=...
+        if kwargs.pop("dictionary", False):
+            args = (DictCursor,) + args
+        if "cursorclass" in kwargs:
+            cls = kwargs.pop("cursorclass")
+            args = (cls,) + args
+        if "cursor" in kwargs:
+            cls = kwargs.pop("cursor")
+            args = (cls,) + args
+
         if PRE_PING:
             try:
                 await asyncio.wait_for(self._raw.ping(), timeout=PING_TIMEOUT)
             except Exception:
                 await self._reacquire_new()
+
         return await self._raw.cursor(*args, **kwargs)
 
     def cursor(self, *args, **kwargs):
@@ -154,17 +172,23 @@ class Database:
         if cls._pool is not None:
             return
         cls._pool = await create_pool(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            db=os.getenv("DB_NAME"),
-            minsize=1,
-            maxsize=10,
+            host=DB_HOST,
+            port=DB_PORT,                   # ✅ 傳入 port
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db=DB_NAME,
+            minsize=DB_MINSIZE,
+            maxsize=DB_MAXSIZE,
             autocommit=True,
-            pool_recycle=POOL_RECYCLE,   # ✅ 定期回收舊連線
-            # connect_timeout=5,
+            pool_recycle=POOL_RECYCLE,
+            connect_timeout=CONNECT_TIMEOUT,  # ✅ 握手逾時
         )
-        print(f"[✅] Connection pool initialized (recycle={POOL_RECYCLE}s, pre_ping={PRE_PING})")
+        # ✅ 預熱一條連線（避免第一次握手拖到 webhook）
+        async with cls.connection():
+            pass
+        print(f"[✅] Connection pool initialized "
+              f"(host={DB_HOST}:{DB_PORT}, size={DB_MINSIZE}-{DB_MAXSIZE}, "
+              f"recycle={POOL_RECYCLE}s, pre_ping={PRE_PING}, acquire_timeout={POOL_TIMEOUT if USE_POOL_TIMEOUT else 'off'})")
 
     @classmethod
     async def close_pool(cls):
@@ -228,8 +252,8 @@ class Database:
     def debug_status(cls):
         """列出目前 pool 狀態（僅供除錯用）"""
         if cls._pool:
-            print(f"[🌀] Pool size      : {cls._pool.size}")
-            print(f"[🔒] Used          : {cls._pool._used}")
-            print(f"[🆓] Free          : {cls._pool.freesize}")
+            print(f"[🌀] Pool size : {cls._pool.size}")
+            print(f"[🔒] Used     : {cls._pool._used}")
+            print(f"[🆓] Free     : {cls._pool.freesize}")
         else:
             print("❌ Pool not initialized.")

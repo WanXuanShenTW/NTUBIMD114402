@@ -5,7 +5,7 @@ from datetime import datetime
 from ..db import Database
 import httpx
 
-notify_line_router = APIRouter()
+notify_line_router = APIRouter(tags=["LINE Bot"])
 
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 

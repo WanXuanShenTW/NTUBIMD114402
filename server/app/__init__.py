@@ -12,11 +12,13 @@ from .routes.auth_routes import auth_router
 from .routes.emergency_contacts_routes import contact_router 
 from .routes.ws_test_routes import ws_test_router  # 測試用 WS
 from .routes.fall_event_routes import fall_event_router
+from .routes.line_routes import router as line_router
 
 # 啟動與關閉時處理連線池
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await Database.init_pool()
+    print("[DB] pool inited")
     yield
     await Database.close_pool()
 
@@ -32,4 +34,5 @@ def create_app():
     app.include_router(pose_router)
     app.include_router(ws_test_router)  # 測試用 WS
     app.include_router(fall_event_router)
+    app.include_router(line_router)
     return app

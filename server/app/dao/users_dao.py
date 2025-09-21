@@ -130,3 +130,35 @@ async def delete_user(conn, phone: str) -> bool:
     except Exception as e:
         print(f"[ERROR] 刪除使用者失敗: {e}")
         raise DatabaseError(f"刪除使用者失敗: {e}")
+    
+# app/dao/users_dao.py
+from typing import Optional, Dict, Any
+from app.db import Database
+
+async def get_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
+    """
+    由電話找 user；需有欄位 users.phone
+    回傳：{user_id, name, role_id}
+    """
+    async with Database.connection() as conn:
+        async with conn.cursor(dictionary=True) as cur:
+            await cur.execute(
+                "SELECT user_id, name, role_id FROM users WHERE phone=%s LIMIT 1",
+                (phone,)
+            )
+            return await cur.fetchone()
+
+async def get_user_auth_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    取使用者的密碼（雜湊）。請依你的實際欄位調整：
+      - 這裡預設欄位名為 `password`（varchar）
+      - 若你使用其他欄位（例如 password_hash / hashed_password），請同步修改 SQL
+    """
+    async with Database.connection() as conn:
+        async with conn.cursor(dictionary=True) as cur:
+            await cur.execute(
+                "SELECT password FROM users WHERE user_id=%s LIMIT 1",
+                (user_id,)
+            )
+            row = await cur.fetchone()
+            return row if row else None
