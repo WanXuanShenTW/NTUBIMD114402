@@ -14,7 +14,6 @@ async def get_elder_by_caregiver_user_id(caregiver_user_id: int) -> Optional[Dic
         FROM emergency_contacts ec
         JOIN users e ON e.user_id = ec.elder_user_id
         WHERE ec.caregiver_user_id = %s
-          AND e.role_id = 2                 -- 僅長者
         ORDER BY e.user_id ASC
         LIMIT 1
     """
@@ -25,21 +24,16 @@ async def get_elder_by_caregiver_user_id(caregiver_user_id: int) -> Optional[Dic
 
 async def get_elder_by_reversed_mapping(user_id: int) -> Optional[Dict[str, Any]]:
     """
-    反向關係（欄位填反）：
+    反向容錯（表裡不小心把欄位放反）：
       emergency_contacts.caregiver_user_id = 長者
       emergency_contacts.elder_user_id     = 照護者
-    對於傳入的「照護者 user_id」，去找 ec.elder_user_id = 該照護者，
-    並且 ec.caregiver_user_id 指向的 user 必須是 role_id = 2（長者）。
-    回傳：{ elder_id, elder_name }
+    由『照護者 user_id』往回找長者。
     """
     sql = """
         SELECT e.user_id AS elder_id, e.name AS elder_name
         FROM emergency_contacts ec
         JOIN users e ON e.user_id = ec.caregiver_user_id   -- 這欄其實放了長者
-        JOIN users c ON c.user_id = ec.elder_user_id       -- 這欄其實放了照護者
         WHERE ec.elder_user_id = %s
-          AND e.role_id = 2                                -- 長者
-          AND c.role_id IN (1, 3, 4, 5)                    -- 照護者/其他非長者角色
         ORDER BY e.user_id ASC
         LIMIT 1
     """
