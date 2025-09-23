@@ -8,9 +8,8 @@ from ..utils.ws_message_dispatcher import handle_ws_text, notify_user_disconnect
 from ..service.fall_event_service import add_fall_event
 pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
 
-# ★ 與新版 manager 對齊：on_fall_start 多一個 start_frame 參數
-async def on_fall_start(user_id: str, start_time: str, start_frame: int, result: dict):
-    print("[FALL_START]", user_id, start_time, start_frame, result["probs"][result["pred_idx"]])
+async def on_fall_start(user_id: str, start_time: str, result: dict, clip20: dict):
+    print("[FALL_START]", user_id, start_time, result["probs"][result["pred_idx"]])
     # 若你希望一開始就入庫，保留原本功能：
     await add_fall_event(
         user_id=user_id,
@@ -19,10 +18,8 @@ async def on_fall_start(user_id: str, start_time: str, start_frame: int, result:
         pose_before_fall="正常行走"
     )
 
-async def on_fall_recover(user_id: str, start_time: str, end_time: str,
-                          start_frame: int, end_frame: int, peak_score: float, result: dict):
+async def on_fall_recover(user_id: str, start_time: str, end_time: str, peak_score: float, result: dict):
     print("[FALL_RECOVER]", user_id, start_time, end_time, peak_score)
-    # TODO: 這裡保留你原版本的處理方式（若原本有寫 DB，就照舊呼叫）
     return
 
 stream_infer_manager.set_handlers(

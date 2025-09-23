@@ -596,6 +596,27 @@ class StreamInferManager:
         return self._locks[user_id]
 
     def set_handlers(self, **handlers):
+        """
+        註冊事件 hook（皆為 async function）：
+        - on_fall_start(user_id, start_time, result, clip20)
+            clip20 結構：
+            {
+            "window": {"start_frame": int, "end_frame": int},
+            "kp_indices": [int, ...],     # 這次推論實際用到的關節索引（若無特別設定，等於全部）
+            "frames": [
+                {
+                "frame_id": int,
+                "timestamp_ms": int,
+                "image_size": {"width": float, "height": float},
+                "bbox_xyxy": [x1,y1,x2,y2] 或 None,
+                "keypoints_used": [{ "x": float, "y": float, "conf": float }, ...],  # 只輸出判斷用到的點
+                "objects": [{"cls_name": str, "score": float, "bbox": {"cx":..., "cy":..., "w":..., "h":...}}, ...]
+                },  # * 20 幀
+            ]
+            }
+
+        - on_fall_recover(user_id, start_time, end_time, peak_score, result)
+        """
         self._handlers.update({k: v for k, v in handlers.items() if v})
 
     def _emit(self, name: str, *args, **kwargs):
@@ -627,7 +648,7 @@ class StreamInferManager:
         result_stub = {"forced_reason": reason, "pred": "fall"}
         if self._handlers.get("on_fall_recover"):
             await self._handlers["on_fall_recover"](
-                user_id, start_time, end_time, start_frame, end_frame, peak_score, result_stub
+                user_id, start_time, end_time, float(peak_score), result_stub
             )
         st.update({"active": False, "start_time": None, "start_frame": None, "peak_score": 0.0, "normal_streak": 0, "last_end_frame": None})
 
@@ -687,6 +708,21 @@ class StreamInferManager:
                 # 更新使用序列（定稿優先）
                 kps_seq = [ (user_cache[fr.frame_id] if fr.frame_id in finalized else fr.kps) for fr in window ]
 
+            # ===== 只保留「本次推論實際用到的點」：若 cfg 有 kp_indices 就取子集；否則等於全部 =====
+            if hasattr(self.cfg, "kp_indices") and self.cfg.kp_indices:
+                used_idxs = list(self.cfg.kp_indices)
+                kps_used = []
+                for kp in kps_seq:
+                    if not kp:
+                        kps_used.append([])
+                    else:
+                        kps_used.append([kp[j] for j in used_idxs if j < len(kp)])
+            else:
+                used_count = len(kps_seq[0] or [])
+                used_idxs = list(range(used_count))
+                kps_used = kps_seq
+            # ======================================================================
+            
             # 4) relation map + motion + mask
             clips = []
             for i, fr in enumerate(window):
@@ -741,13 +777,14 @@ class StreamInferManager:
                     vals = get_last_vals(TRIGGER_CONSEC)
                     if len(vals) == TRIGGER_CONSEC and all(v >= 0.80 for v in vals):
                         st.update({"active": True, "start_time": now_str(), "start_frame": recent_centers[-TRIGGER_CONSEC], "peak_score": max(vals)})
-                        self._emit("on_fall_start", user_id, st["start_time"], st["start_frame"], result)
+                        clip20 = self._build_clip20(window, kps_used, used_idxs)
+                        self._emit("on_fall_start", user_id, st["start_time"], result, clip20)
                 else:
                     vals = get_last_vals(RECOVER_CONSEC_)
                     if len(vals) == RECOVER_CONSEC_ and all(v <= 0.60 for v in vals):
-                        end_time = now_str(); end_frame = center_fid
-                        self._emit("on_fall_recover", user_id, st["start_time"], end_time, st["start_frame"], end_frame, float(st["peak_score"]), result)
-                        st.update({"active": False, "start_time": None, "start_frame": None, "peak_score": 0.0, "normal_streak": 0, "last_end_frame": end_frame})
+                        end_time = now_str()
+                        self._emit("on_fall_recover", user_id, st["start_time"], end_time, float(st["peak_score"]), result)
+                        st.update({"active": False, "start_time": None, "peak_score": 0.0, "normal_streak": 0})
 
             # 7) 彈出 STRIDE 並清理對應的快取
             to_pop_ids = [fr.frame_id for fr in window[:STRIDE]]
@@ -758,6 +795,30 @@ class StreamInferManager:
                 user_cache.pop(fid_rm, None)
                 finalized.discard(fid_rm)
 
+    def _build_clip20(self, window, kps_used, kp_indices):
+        """
+        將當下 20 幀視窗打包成 clip20（只含「判斷用到的點」）。
+        - window: List[FrameRecord]
+        - kps_used: List[List[dict]]  # 已卡爾曼、且只保留本次推論實際用到的關節點
+        - kp_indices: List[int]       # 本次推論使用到的關節索引集合（若未指定，等於全部）
+        """
+        frames = []
+        for i, fr in enumerate(window):
+            frames.append({
+                "frame_id": fr.frame_id,
+                "timestamp_ms": fr.ts_ms,
+                "image_size": {"width": fr.img_w, "height": fr.img_h},
+                "bbox_xyxy": fr.bbox,
+                "keypoints_used": kps_used[i] or [],
+                "objects": fr.dets or []
+            })
+        return {
+            "window": {"start_frame": window[0].frame_id, "end_frame": window[-1].frame_id},
+            "kp_indices": list(kp_indices or []),
+            "frames": frames
+        }
+
+    
     def drop_user(self, user_id: str):
         self._buffers.pop(user_id, None)
         self._locks.pop(user_id, None)
