@@ -19,7 +19,7 @@ class RegisterRequest(BaseModel):
     password: str
     role_id: int
     gender: str
-    line_id: Optional[str] = None
+    address: Optional[str] = None
 
 class UpdateUserRequest(BaseModel):
     phone: str
@@ -48,7 +48,7 @@ async def register(data: RegisterRequest):
             password=data.password,
             role_id=data.role_id,
             gender=data.gender,
-            line_id=data.line_id
+            address=data.address,
         )
         return await make_json_response(data={"user_id": user_id}, message="註冊成功")
     except AlreadyExistsError as ae:

@@ -1,4 +1,3 @@
-# app/dao/caregiver_elder_dao.py
 from typing import Optional, Dict, Any
 from app.db import Database
 

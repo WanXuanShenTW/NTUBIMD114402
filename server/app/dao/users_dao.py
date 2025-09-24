@@ -11,7 +11,7 @@ async def insert_user(
     role_id: int,
     password: str,
     gender: str,
-    line_id: Optional[str] = None
+    address: str
 ) -> Optional[int]:
     """
     新增一筆使用者資料到資料庫。
@@ -19,7 +19,7 @@ async def insert_user(
     try:
         async with conn.cursor() as cursor:
             query = """
-                INSERT INTO users (name, phone, role_id, password, gender, created_at, line_id)
+                INSERT INTO users (name, phone, role_id, password, gender, created_at, address)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             values = (
@@ -29,7 +29,7 @@ async def insert_user(
                 password,
                 gender,
                 datetime.datetime.now(),
-                line_id
+                address
             )
             await cursor.execute(query, values)
             await conn.commit()
@@ -48,9 +48,9 @@ async def insert_user(
 
 async def update_user(conn, user_id: int, **kwargs) -> bool:
     """
-    更新使用者資料。允許更新 name、phone、password、role_id、gender、line_id。
+    更新使用者資料。允許更新 name、phone、password、role_id、gender、address。
     """
-    allowed = ["name", "phone", "password", "role_id", "gender", "line_id"]
+    allowed = ["name", "phone", "password", "role_id", "gender", "address"]
     fields = []
     values = []
 
@@ -150,9 +150,7 @@ async def get_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
 
 async def get_user_auth_by_id(user_id: int) -> Optional[Dict[str, Any]]:
     """
-    取使用者的密碼（雜湊）。請依你的實際欄位調整：
-      - 這裡預設欄位名為 `password`（varchar）
-      - 若你使用其他欄位（例如 password_hash / hashed_password），請同步修改 SQL
+    取使用者的密碼： user_id, password
     """
     async with Database.connection() as conn:
         async with conn.cursor(dictionary=True) as cur:

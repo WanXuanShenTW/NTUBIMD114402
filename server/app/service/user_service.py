@@ -13,7 +13,7 @@ async def add_user(
     role_id: int,
     password: str,
     gender: str,
-    line_id: str = None
+    address: str = None,
 ) -> int:
     """
     新增一筆使用者資料到資料庫。
@@ -23,7 +23,7 @@ async def add_user(
     :param role_id: 角色ID
     :param password: 密碼
     :param gender: 性別 ('M' 或 'F')
-    :param line_id: LINE ID（可選）
+    :param address: 地址 (可選)
     :return: 新增的 user_id，若失敗則拋出例外
     """
     async with Database.connection() as conn:
