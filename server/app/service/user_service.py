@@ -28,7 +28,7 @@ async def add_user(
     """
     async with Database.connection() as conn:
         try:
-            user_id = await insert_user(conn, name, phone, role_id, password, gender, line_id)
+            user_id = await insert_user(conn, name, phone, role_id, password, gender, address)
             if user_id is None:
                 raise DatabaseError("資料庫新增使用者失敗")
             return user_id

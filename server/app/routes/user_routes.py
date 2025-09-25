@@ -25,7 +25,7 @@ class UpdateUserRequest(BaseModel):
     phone: str
     name: Optional[str] = None
     role_id: Optional[int] = None
-    line_id: Optional[str] = None
+    address: Optional[str] = None
 
 class ChangePasswordRequest(BaseModel):
     phone: str
