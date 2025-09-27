@@ -1,232 +1,175 @@
 package com.example.myapplication
 
-import android.app.DatePickerDialog
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.graphics.Rect
+import android.content.IntentFilter
 import android.os.Bundle
-import android.util.Log
-import android.view.MotionEvent
 import android.view.View
-import android.view.inputmethod.InputMethodManager
-import android.widget.*
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.ProgressBar
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.example.myapplication.adapter.VideoEventAdapter
-import com.example.myapplication.model.FavoriteRequest
-import com.example.myapplication.model.VideoEvent
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+import com.example.myapplication.adapter.FallRecordAdapter
+import com.example.myapplication.model.FallRecord
 import com.example.myapplication.network.RetrofitClient
-import retrofit2.Call
-import retrofit2.Callback
-import retrofit2.Response
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
 import java.util.*
 
 class VideoListActivity : AppCompatActivity() {
 
-    private lateinit var recyclerView: RecyclerView
-    private lateinit var adapter: VideoEventAdapter
-    private lateinit var editStartDate: EditText
-    private lateinit var editEndDate: EditText
-    private lateinit var btnSearch: Button
-    private lateinit var loadingProgress: ProgressBar
-    private var isFavoriteActionRunning = false
-    private var isDataLoaded = false
+    private lateinit var swipe: SwipeRefreshLayout
+    private lateinit var recycler: RecyclerView
+    private lateinit var progress: ProgressBar
+    private lateinit var emptyState: View
+    private lateinit var empty: TextView
+    private lateinit var btnRetry: Button
+    private val adapter by lazy { FallRecordAdapter(::onItemClick) }
 
-    private val apiService = RetrofitClient.apiService
-    private var caregiverId: Int = -1
-    private var elderId: String? = null  // 改為 String
+    // 切換被照護者 → 自動刷新
+    private val elderChangedReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            loadData()
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_video_list)
 
-        recyclerView = findViewById(R.id.recyclerView)
-        editStartDate = findViewById(R.id.editStartDate)
-        editEndDate = findViewById(R.id.editEndDate)
-        btnSearch = findViewById(R.id.btnSearch)
-        loadingProgress = findViewById(R.id.loadingProgress)
+        swipe = findViewById(R.id.swipe)
+        recycler = findViewById(R.id.recyclerView)
+        progress = findViewById(R.id.progressBar)
+        emptyState = findViewById(R.id.emptyState)
+        empty = findViewById(R.id.emptyView)
+        btnRetry = findViewById(R.id.btnRetry)
 
         findViewById<LinearLayout>(R.id.btnBackToMain).setOnClickListener { finish() }
 
-        val sharedPref = getSharedPreferences("smartcare_pref", Context.MODE_PRIVATE)
-        caregiverId = sharedPref.getInt("user_id", -1)
-        elderId = sharedPref.getString("elder_id", null)
+        recycler.layoutManager = LinearLayoutManager(this)
+        recycler.adapter = adapter
 
-        if (elderId.isNullOrEmpty()) {
-            Toast.makeText(this, "請先選擇被照護者", Toast.LENGTH_LONG).show()
-            finish()
+        swipe.setOnRefreshListener { loadData(isRefresh = true) }
+        btnRetry.setOnClickListener { loadData() }
+
+        loadData()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter(AppKeys.ACTION_ELDER_CHANGED)
+        ContextCompat.registerReceiver(
+            this,
+            elderChangedReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    override fun onStop() {
+        try { unregisterReceiver(elderChangedReceiver) } catch (_: Exception) {}
+        super.onStop()
+    }
+
+    private fun loadData(isRefresh: Boolean = false) {
+        val sp = getSharedPreferences(AppKeys.SP, Context.MODE_PRIVATE)
+        val elderId = sp.getInt(AppKeys.ELDER_ID, -1)
+        if (elderId <= 0) {
+            showEmpty("尚未選擇被照護者")
             return
         }
 
-        adapter = VideoEventAdapter(
-            mutableListOf(),
-            onItemClick = { event ->
-                val videoUrl = "${ApiConfig.BASE_URL}fall_video_file?record_id=${event.record_id}"
-                val intent = Intent(this, VideoPlayerActivity::class.java).apply {
-                    putExtra("record_id", event.record_id)
-                    putExtra("video_url", videoUrl)
-                }
-                startActivity(intent)
-            },
-            onFavoriteClick = { event, _, done ->
-                if (!isDataLoaded) {
-                    Toast.makeText(this, "資料尚未載入完成", Toast.LENGTH_SHORT).show()
-                    return@VideoEventAdapter
-                }
-                if (isFavoriteActionRunning) {
-                    Toast.makeText(this, "正在處理收藏中，請稍後", Toast.LENGTH_SHORT).show()
-                    return@VideoEventAdapter
-                }
+        if (!isRefresh) {
+            progress.visibility = View.VISIBLE
+            recycler.visibility = View.GONE
+            emptyState.visibility = View.GONE
+        }
 
-                isFavoriteActionRunning = true
+        lifecycleScope.launch {
+            try {
+                val resp = withContext(Dispatchers.IO) {
+                    RetrofitClient.apiService.getFallEventRecords(elderId)
+                }
+                swipe.isRefreshing = false
 
-                if (event.isFavorite) {
-                    removeFromFavorite(event) { success ->
-                        if (success) {
-                            event.isFavorite = false
-                            adapter.updateFavoriteByRecordId(event.record_id, event.isFavorite)
-                        } else {
-                            Toast.makeText(this, "取消收藏失敗", Toast.LENGTH_SHORT).show()
-                        }
-                        isFavoriteActionRunning = false
-                        done()
-                    }
+                val records = resp.data?.records ?: emptyList()
+                if (resp.success && records.isNotEmpty()) {
+                    // 排序（新→舊）
+                    val sorted = records.sortedByDescending { parseEpoch(it.detected_time) }
+
+                    fun normalizeTime(s: String) = s.replace('T', ' ').removeSuffix("Z")
+                    val normalized = sorted.map { it.copy(detected_time = normalizeTime(it.detected_time)) }
+
+                    progress.visibility = View.GONE
+                    emptyState.visibility = View.GONE
+                    recycler.visibility = View.VISIBLE
+                    adapter.submitList(normalized)
                 } else {
-                    addToFavorite(event) { success ->
-                        if (success) {
-                            event.isFavorite = true
-                            adapter.updateFavoriteByRecordId(event.record_id, event.isFavorite)
-                        } else {
-                            Toast.makeText(this, "加入收藏失敗", Toast.LENGTH_SHORT).show()
-                        }
-                        isFavoriteActionRunning = false
-                        done()
-                    }
+                    showEmpty("這位被照護者目前沒有跌倒事件")
                 }
-            }
-        )
-        recyclerView.layoutManager = LinearLayoutManager(this)
-        recyclerView.adapter = adapter
-
-        val today = Calendar.getInstance()
-        editEndDate.setText(String.format("%04d-%02d-%02d",
-            today.get(Calendar.YEAR), today.get(Calendar.MONTH) + 1, today.get(Calendar.DAY_OF_MONTH)))
-
-        fun showDatePicker(onDateSelected: (String) -> Unit) {
-            val calendar = Calendar.getInstance()
-            DatePickerDialog(this,
-                { _, year, month, day ->
-                    val dateStr = String.format("%04d-%02d-%02d", year, month + 1, day)
-                    onDateSelected(dateStr)
-                },
-                calendar.get(Calendar.YEAR),
-                calendar.get(Calendar.MONTH),
-                calendar.get(Calendar.DAY_OF_MONTH)
-            ).show()
-        }
-
-        editStartDate.setOnClickListener { showDatePicker { editStartDate.setText(it) } }
-        editEndDate.setOnClickListener { showDatePicker { editEndDate.setText(it) } }
-
-        btnSearch.setOnClickListener { queryVideoList() }
-    }
-
-    private fun queryVideoList() {
-        val startDate = editStartDate.text.toString()
-        val endDate = editEndDate.text.toString()
-
-        if (startDate.isBlank() || endDate.isBlank()) {
-            Toast.makeText(this, "請選擇開始與結束日期", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        isDataLoaded = false
-        loadingProgress.visibility = View.VISIBLE
-        recyclerView.visibility = View.GONE
-
-        apiService.getFallVideos(caregiverId, elderId!!, startDate, endDate, limit = 5)
-            .enqueue(object : Callback<List<VideoEvent>> {
-                override fun onResponse(call: Call<List<VideoEvent>>, response: Response<List<VideoEvent>>) {
-                    if (response.isSuccessful && response.body() != null) {
-                        val events = response.body()!!.map {
-                            it.copy(
-                                isFavorite = it.in_watchlist,
-                                video_type = it.video_type ?: "fall"
-                            )
-                        }.toMutableList()
-                        adapter.updateData(events)
-                        isDataLoaded = true
-                    } else {
-                        Toast.makeText(this@VideoListActivity, "查詢失敗：${response.code()}", Toast.LENGTH_SHORT).show()
-                    }
-                    loadingProgress.visibility = View.GONE
-                    recyclerView.visibility = View.VISIBLE
-                }
-                override fun onFailure(call: Call<List<VideoEvent>>, t: Throwable) {
-                    Toast.makeText(this@VideoListActivity, "連線錯誤：${t.message}", Toast.LENGTH_SHORT).show()
-                    loadingProgress.visibility = View.GONE
-                    recyclerView.visibility = View.VISIBLE
-                }
-            })
-    }
-
-    private fun addToFavorite(event: VideoEvent, onFinish: (Boolean) -> Unit) {
-        val data = FavoriteRequest(
-            user_id = caregiverId,
-            record_id = event.record_id,
-            video_type = event.video_type ?: "fall"
-        )
-
-        Log.d("FavoriteDebug", "發送 JSON = user_id=${data.user_id}, record_id=${data.record_id}, video_type=${data.video_type}")
-
-        apiService.addFavorite(data).enqueue(object : Callback<Map<String, String>> {
-            override fun onResponse(call: Call<Map<String, String>>, response: Response<Map<String, String>>) {
-                Log.d("FavoriteDebug", "addFavorite HTTP=${response.code()} body=${response.body()} err=${response.errorBody()?.string()}")
-                onFinish(response.isSuccessful)
-            }
-            override fun onFailure(call: Call<Map<String, String>>, t: Throwable) {
-                Log.e("FavoriteDebug", "加入收藏錯誤：${t.message}")
-                onFinish(false)
-            }
-        })
-    }
-
-    private fun removeFromFavorite(event: VideoEvent, onFinish: (Boolean) -> Unit) {
-        val data = FavoriteRequest(
-            user_id = caregiverId,
-            record_id = event.record_id,
-            video_type = event.video_type ?: "fall"
-        )
-        apiService.removeFavorite(data).enqueue(object : Callback<Map<String, String>> {
-            override fun onResponse(call: Call<Map<String, String>>, response: Response<Map<String, String>>) {
-                Log.d("FavoriteDebug", "removeFavorite HTTP=${response.code()} body=${response.body()} err=${response.errorBody()?.string()}")
-                onFinish(response.isSuccessful)
-            }
-            override fun onFailure(call: Call<Map<String, String>>, t: Throwable) {
-                Log.e("FavoriteDebug", "取消收藏錯誤：${t.message}")
-                onFinish(false)
-            }
-        })
-    }
-
-    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.action == MotionEvent.ACTION_DOWN) {
-            val v = currentFocus
-            if (v is EditText) {
-                val outRect = Rect()
-                v.getGlobalVisibleRect(outRect)
-                if (!outRect.contains(ev.rawX.toInt(), ev.rawY.toInt())) {
-                    v.clearFocus()
-                    hideKeyboard(v)
-                }
+            } catch (_: Exception) {
+                swipe.isRefreshing = false
+                showEmpty("連線失敗，請重試")
             }
         }
-        return super.dispatchTouchEvent(ev)
     }
 
-    private fun hideKeyboard(view: View) {
-        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-        imm.hideSoftInputFromWindow(view.windowToken, 0)
+    private fun showEmpty(msg: String) {
+        recycler.visibility = View.GONE
+        progress.visibility = View.GONE
+        emptyState.visibility = View.VISIBLE
+        empty.text = msg
+    }
+
+    private fun onItemClick(item: FallRecord) {
+        // 顯示簡單詳情（無影片）
+        val detail = """
+            時間：${formatTime(item.detected_time)}
+            地點：${item.location ?: "未知"}
+            跌倒前：${item.pose_before_fall ?: "—"}
+        """.trimIndent()
+        androidXAlert(detail)
+    }
+
+    // ---- 時間處理 ----
+    private fun parseEpoch(raw: String): Long {
+        for (p in listOf(
+            "yyyy-MM-dd HH:mm:ss",
+            "yyyy-MM-dd'T'HH:mm:ss",
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+        )) {
+            try {
+                val sdf = SimpleDateFormat(p, Locale.getDefault())
+                // 如果你的後端用本地時間，就用預設時區；若是 UTC，把下一行改成 UTC
+                // sdf.timeZone = TimeZone.getTimeZone("UTC")
+                return sdf.parse(raw)?.time ?: Long.MIN_VALUE
+            } catch (_: Exception) {}
+        }
+        return Long.MIN_VALUE
+    }
+
+    private fun formatTime(raw: String): String {
+        val epoch = parseEpoch(raw)
+        if (epoch == Long.MIN_VALUE) return raw
+        val out = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
+        return out.format(Date(epoch))
+    }
+
+    // 簡單的 appcompat 對話框
+    private fun androidXAlert(message: String) {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("事件詳情")
+            .setMessage(message)
+            .setPositiveButton("關閉", null)
+            .show()
     }
 }
