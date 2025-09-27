@@ -7,11 +7,14 @@ import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.util.UnstableApi
 import com.example.myapplication.model.LoginRequest
-import com.example.myapplication.model.LoginResponse
+import com.example.myapplication.model.LoginResponse // = User 物件
+import com.example.myapplication.model.LoginApiResponse // 新增的包裝回傳
 import com.example.myapplication.network.RetrofitClient
 import retrofit2.Call
 import retrofit2.Callback
 import retrofit2.Response
+import androidx.core.widget.addTextChangedListener
+
 
 @UnstableApi
 class LoginActivity : AppCompatActivity() {
@@ -33,6 +36,13 @@ class LoginActivity : AppCompatActivity() {
         phoneError = findViewById(R.id.phoneError)
         passwordError = findViewById(R.id.passwordError)
 
+        passwordInput.addTextChangedListener {
+            clearError(passwordInput, passwordError)
+        }
+        phoneInput.addTextChangedListener {
+            clearError(phoneInput, phoneError)
+        }
+
         forgotPasswordButton = findViewById(R.id.forgotPasswordButton)
         registerButton = findViewById(R.id.registerButton)
         loginButton = findViewById(R.id.loginButton)
@@ -46,7 +56,7 @@ class LoginActivity : AppCompatActivity() {
         }
 
         loginButton.setOnClickListener {
-            val phone = phoneInput.text.toString()
+            val phone = phoneInput.text.toString().trim()
             val password = passwordInput.text.toString()
 
             clearError(phoneInput, phoneError)
@@ -62,43 +72,73 @@ class LoginActivity : AppCompatActivity() {
                 hasError = true
             }
 
-            if (password.isEmpty()) {
-                setError(passwordInput, passwordError, "請輸入密碼")
+            if (password.isBlank()) {
+                showPasswordError("請輸入密碼")
                 hasError = true
-            } else if (!password.matches(Regex("^(?=.*[a-z])(?=.*[A-Z]).{8,}$"))) {
-                setError(passwordInput, passwordError, "密碼需至少8碼，且包含大小寫字母")
+            } else if (!isValidPassword(password)) {
+                showPasswordError("密碼格式不符（至少8碼，含大小寫）")
                 hasError = true
             }
 
             if (hasError) return@setOnClickListener
 
-            val loginRequest = LoginRequest(phone, password)
-            RetrofitClient.apiService.getUser(phone)
-                .enqueue(object : Callback<LoginResponse> {
-                    override fun onResponse(call: Call<LoginResponse>, r: Response<LoginResponse>) {
-                        if (!r.isSuccessful) {
-                            Toast.makeText(this@LoginActivity, "登入成功，但讀取使用者失敗：${r.code()}", Toast.LENGTH_SHORT).show()
+            val req = LoginRequest(phone, password)
+
+            RetrofitClient.apiService.loginUser(req)
+                .enqueue(object : Callback<LoginApiResponse> {
+                    override fun onResponse(
+                        call: Call<LoginApiResponse>,
+                        response: Response<LoginApiResponse>
+                    ) {
+                        // ① HTTP 層錯誤：解析 errorBody 的訊息
+                        if (!response.isSuccessful) {
+                            val code = response.code()
+                            val msg = parseErrorMessage(response)  // 會抓 JSON 的 message/detail 或原始字串
+
+                            when {
+                                // 401 常用於密碼錯；有些後端也會回 400
+                                code == 401 || msg.contains("密碼", ignoreCase = true) -> {
+                                    showPasswordError("密碼錯誤")
+                                }
+                                // 404 常見「使用者不存在」；也可能回 400 搭配訊息
+                                code == 404 || msg.contains("不存在", ignoreCase = true) || msg.contains("使用者", ignoreCase = true) || msg.contains("電話", ignoreCase = true) -> {
+                                    showPhoneError("電話號碼不存在")
+                                }
+                                else -> {
+                                    Toast.makeText(this@LoginActivity, if (msg.isNotBlank()) msg else "登入失敗（HTTP $code）", Toast.LENGTH_SHORT).show()
+                                }
+                            }
                             return
                         }
 
-                        // 先把 body 拿出來；為空就結束（之後 u 一定是非空）
-                        val u = r.body() ?: run {
-                            Toast.makeText(this@LoginActivity, "登入成功，但回應為空", Toast.LENGTH_SHORT).show()
+                        // ② 成功的 HTTP，但 success=false（你的新 API 格式）
+                        val body = response.body()
+                        if (body == null) {
+                            Toast.makeText(this@LoginActivity, "登入失敗：伺服器回應為空", Toast.LENGTH_SHORT).show()
+                            return
+                        }
+                        if (!body.success) {
+                            val msg = body.message
+                            when {
+                                msg.contains("密碼", ignoreCase = true) -> showPasswordError("密碼錯誤")
+                                msg.contains("不存在", ignoreCase = true) || msg.contains("使用者", ignoreCase = true) || msg.contains("電話", ignoreCase = true) -> showPhoneError("電話號碼不存在")
+                                else -> Toast.makeText(this@LoginActivity, if (msg.isNotBlank()) msg else "登入失敗", Toast.LENGTH_SHORT).show()
+                            }
                             return
                         }
 
-                        val uid = u.userId ?: -1
-                        if (uid <= 0) {
-                            Toast.makeText(this@LoginActivity, "登入成功，但查無有效 user_id", Toast.LENGTH_SHORT).show()
+                        // ③ 成功：照你原本的邏輯
+                        val u: LoginResponse? = body.data?.user
+                        if (u?.userId == null || u.userId <= 0) {
+                            Toast.makeText(this@LoginActivity, "登入成功但缺少使用者資料", Toast.LENGTH_SHORT).show()
                             return
                         }
 
                         with(getSharedPreferences("smartcare_pref", MODE_PRIVATE).edit()) {
-                            putInt("user_id", uid)
+                            putInt("user_id", u.userId)
                             putInt("role_id", u.roleId ?: -1)
                             putString("name", u.name ?: "")
-                            putString("phone", u.phone ?: phone)   // 以回應為主，沒有就用輸入的 phone
-                            putString("line_id", u.lineId)
+                            putString("phone", u.phone ?: (phoneInput.text?.toString() ?: ""))
                             apply()
                         }
 
@@ -107,11 +147,24 @@ class LoginActivity : AppCompatActivity() {
                         finish()
                     }
 
-                    override fun onFailure(call: Call<LoginResponse>, t: Throwable) {
-                        Toast.makeText(this@LoginActivity, "登入成功，但讀取使用者失敗：${t.message}", Toast.LENGTH_SHORT).show()
+                    override fun onFailure(call: Call<LoginApiResponse>, t: Throwable) {
+                        Toast.makeText(
+                            this@LoginActivity,
+                            "登入失敗：${t.message ?: "連線錯誤"}",
+                            Toast.LENGTH_SHORT
+                        ).show()
                     }
                 })
         }
+    }
+
+    // —— 驗證/錯誤顯示工具 —— //
+
+    private fun isValidPassword(p: String): Boolean {
+        // 至少 8 碼、同時含大小寫（可含數字/符號）
+        val hasUpper = p.any { it.isUpperCase() }
+        val hasLower = p.any { it.isLowerCase() }
+        return p.length >= 8 && hasUpper && hasLower
     }
 
     private fun setError(editText: EditText, errorText: TextView, message: String) {
@@ -123,5 +176,36 @@ class LoginActivity : AppCompatActivity() {
     private fun clearError(editText: EditText, errorText: TextView) {
         editText.setBackgroundResource(R.drawable.edittext_background)
         errorText.visibility = View.GONE
+    }
+
+    private fun showPasswordError(msg: String = "密碼錯誤") {
+        setError(passwordInput, passwordError, msg)
+    }
+
+    private fun showPhoneError(msg: String = "電話號碼不存在") {
+        setError(phoneInput, phoneError, msg)
+    }
+
+    private fun parseErrorMessage(response: Response<*>): String {
+        return try {
+            val raw = response.errorBody()?.string()?.trim().orEmpty()
+            if (raw.isBlank()) return ""
+            try {
+                val obj = org.json.JSONObject(raw)
+                when {
+                    obj.has("message") -> obj.optString("message")
+                    obj.has("detail") -> {
+                        val detail = obj.get("detail")
+                        if (detail is String) detail
+                        else detail.toString()
+                    }
+                    else -> raw
+                }
+            } catch (_: Exception) {
+                raw // 不是 JSON 就原樣回傳
+            }
+        } catch (_: Exception) {
+            ""
+        }
     }
 }
