@@ -136,7 +136,6 @@ async def get_contacts_by_caregiver(caregiver_phone: str) -> list:
                 "phone": elder.get("phone"),
                 "role_id": elder.get("role_id"),
                 "role_name": role_name,
-                "line_id": elder.get("line_id"),
                 "relationship": contact["relationship"]
             }
             result.append(contact_info)

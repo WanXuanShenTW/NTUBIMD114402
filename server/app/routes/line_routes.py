@@ -134,7 +134,6 @@ async def webhook(request: Request):
         if isinstance(event, FollowEvent):
             uid = event.source.user_id
             try:
-                # 確保 Rich Menu 存在 & 連上使用者
                 await ensure_default_richmenu(line_api)
                 await ensure_user_linked_richmenu(line_api, uid)
 
@@ -169,8 +168,12 @@ async def webhook(request: Request):
                 )
             continue
 
-        # 2) 取消好友（可忽略）
+        # 2) 取消好友(避免殭屍帳號)
         if isinstance(event, UnfollowEvent):
+            try:
+                await unbind_line_user(event.source.user_id)
+            except Exception as e:
+                print(f"[unfollow] unbind error: {e}")
             continue
 
         # 3) 訊息事件
