@@ -1,8 +1,12 @@
 import datetime
-import aiomysql
 from typing import Any, Dict, Optional
-from mysql.connector import IntegrityError
+
+import aiomysql
+from aiomysql.cursors import DictCursor
+from pymysql.err import IntegrityError
+
 from ..exceptions import DatabaseError, NotFoundError, AlreadyExistsError
+
 
 async def insert_user(
     conn,
@@ -15,6 +19,7 @@ async def insert_user(
 ) -> Optional[int]:
     """
     新增一筆使用者資料到資料庫。
+    回傳新 user_id
     """
     try:
         async with conn.cursor() as cursor:
@@ -23,41 +28,32 @@ async def insert_user(
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
             """
             values = (
-                name,
-                phone,
-                role_id,
-                password,
-                gender,
+                name, phone, role_id, password, gender,
                 datetime.datetime.now(),
                 address
             )
             await cursor.execute(query, values)
             await conn.commit()
-            # 修正：移除 await，直接使用 cursor.lastrowid
-            user_id = cursor.lastrowid
-            print(f"[INFO] 新增使用者成功: user_id={user_id}")
-            return user_id
+            return cursor.lastrowid
     except IntegrityError as e:
+        # Duplicate phone（唯一鍵衝突）
         if "Duplicate entry" in str(e) and "phone" in str(e):
-            print(f"[ERROR] 帳號已被註冊: {phone}")
             raise AlreadyExistsError("帳號已被註冊")
         raise DatabaseError(f"資料庫完整性錯誤: {e}")
     except Exception as e:
-        print(f"[ERROR] 新增使用者失敗: {e}")
         raise DatabaseError(f"新增使用者失敗: {e}")
+
 
 async def update_user(conn, user_id: int, **kwargs) -> bool:
     """
     更新使用者資料。允許更新 name、phone、password、role_id、gender、address。
     """
-    allowed = ["name", "phone", "password", "role_id", "gender", "address"]
-    fields = []
-    values = []
-
-    for k in allowed:
-        if k in kwargs:
+    allowed = {"name", "phone", "password", "role_id", "gender", "address"}
+    fields, values = [], []
+    for k, v in kwargs.items():
+        if k in allowed:
             fields.append(f"{k} = %s")
-            values.append(kwargs[k])
+            values.append(v)
     if not fields:
         return False
 
@@ -74,53 +70,50 @@ async def update_user(conn, user_id: int, **kwargs) -> bool:
     except NotFoundError:
         raise
     except Exception as e:
-        print(f"[ERROR] 更新使用者失敗: {e}")
         raise DatabaseError(f"更新使用者失敗: {e}")
+
 
 async def select_user_by_phone(conn, phone: str) -> Dict[str, Any]:
     """
-    根據 phone 查詢使用者資料。
+    依 phone 查詢使用者資料（全部欄位）
     """
     try:
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
-            query = "SELECT * FROM users WHERE phone = %s"
-            await cursor.execute(query, (phone,))
-            result = await cursor.fetchone()
-            if not result:
+        async with conn.cursor(DictCursor) as cursor:
+            await cursor.execute("SELECT * FROM users WHERE phone = %s", (phone,))
+            row = await cursor.fetchone()
+            if not row:
                 raise NotFoundError(f"找不到 phone={phone} 的使用者")
-            return result
+            return row
     except NotFoundError:
         raise
     except Exception as e:
-        print(f"[ERROR] 查詢使用者資料失敗: {e}")
         raise DatabaseError(f"查詢使用者資料失敗: {e}")
-    
+
+
 async def select_user_by_id(conn, user_id: int) -> Dict[str, Any]:
     """
-    根據 user_id 查詢使用者資料。
+    依 user_id 查詢使用者資料（全部欄位）
     """
     try:
-        async with conn.cursor(aiomysql.DictCursor) as cursor:
-            query = "SELECT * FROM users WHERE user_id = %s"
-            await cursor.execute(query, (user_id,))
-            result = await cursor.fetchone()
-            if not result:
+        async with conn.cursor(DictCursor) as cursor:
+            await cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
+            row = await cursor.fetchone()
+            if not row:
                 raise NotFoundError(f"找不到 user_id={user_id} 的使用者")
-            return result
+            return row
     except NotFoundError:
         raise
     except Exception as e:
-        print(f"[ERROR] 查詢使用者資料失敗: {e}")
         raise DatabaseError(f"查詢使用者資料失敗: {e}")
+
 
 async def delete_user(conn, phone: str) -> bool:
     """
-    根據 phone 刪除使用者帳號。
+    依 phone 刪除使用者
     """
     try:
         async with conn.cursor() as cursor:
-            query = "DELETE FROM users WHERE phone = %s"
-            await cursor.execute(query, (phone,))
+            await cursor.execute("DELETE FROM users WHERE phone = %s", (phone,))
             await conn.commit()
             if cursor.rowcount == 0:
                 raise NotFoundError(f"找不到 phone={phone} 的使用者可刪除")
@@ -128,35 +121,28 @@ async def delete_user(conn, phone: str) -> bool:
     except NotFoundError:
         raise
     except Exception as e:
-        print(f"[ERROR] 刪除使用者失敗: {e}")
         raise DatabaseError(f"刪除使用者失敗: {e}")
-    
-# app/dao/users_dao.py
-from typing import Optional, Dict, Any
-from app.db import Database
 
-async def get_user_by_phone(phone: str) -> Optional[Dict[str, Any]]:
-    """
-    由電話找 user；需有欄位 users.phone
-    回傳：{user_id, name, role_id}
-    """
-    async with Database.connection() as conn:
-        async with conn.cursor(dictionary=True) as cur:
-            await cur.execute(
-                "SELECT user_id, name, role_id FROM users WHERE phone=%s LIMIT 1",
-                (phone,)
-            )
-            return await cur.fetchone()
 
-async def get_user_auth_by_id(user_id: int) -> Optional[Dict[str, Any]]:
+async def get_user_by_phone(conn, phone: str) -> Optional[Dict[str, Any]]:
     """
-    取使用者的密碼： user_id, password
+    由電話找 user；回傳：{user_id, name, role_id}
     """
-    async with Database.connection() as conn:
-        async with conn.cursor(dictionary=True) as cur:
-            await cur.execute(
-                "SELECT password FROM users WHERE user_id=%s LIMIT 1",
-                (user_id,)
-            )
-            row = await cur.fetchone()
-            return row if row else None
+    async with conn.cursor(DictCursor) as cursor:  
+        await cursor.execute(
+            "SELECT user_id, name, role_id FROM users WHERE phone=%s LIMIT 1",
+            (phone,)
+        )
+        return await cursor.fetchone()  
+
+
+async def get_user_auth_by_id(conn, user_id: int) -> Optional[Dict[str, Any]]:
+    """
+    取使用者的密碼：{password}
+    """
+    async with conn.cursor(DictCursor) as cursor:
+        await cursor.execute(
+            "SELECT password FROM users WHERE user_id=%s LIMIT 1",
+            (user_id,)
+        )
+        return await cursor.fetchone() 

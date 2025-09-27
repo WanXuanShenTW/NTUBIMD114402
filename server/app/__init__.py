@@ -14,13 +14,24 @@ from .routes.fall_event_routes import fall_event_router
 from .routes.line_routes import router as line_router
 
 
-# 啟動與關閉時處理連線池
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await Database.init_pool()
-    print("[DB] pool inited")
+    # 啟動時初始化
+    try:
+        await Database.init_pool()
+        print("[✅] Database pool initialized successfully")
+    except Exception as e:
+        print(f"[❌] Failed to initialize database pool: {e}")
+        raise
+    
     yield
-    await Database.close_pool()
+    
+    # 關閉時清理
+    try:
+        await Database.close_pool()
+        print("[✅] Database pool closed successfully")  
+    except Exception as e:
+        print(f"[⚠️] Error closing database pool: {e}")
 
 def create_app():
     app = FastAPI(lifespan=lifespan)
@@ -31,7 +42,7 @@ def create_app():
     app.include_router(auth_router)
     app.include_router(contact_router)
     app.include_router(pose_router)
-    app.include_router(ws_test_router)  # 測試用 WS
+    app.include_router(ws_test_router) 
     app.include_router(fall_event_router)
     app.include_router(line_router)
     return app
