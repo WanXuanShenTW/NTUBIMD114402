@@ -47,7 +47,7 @@ import android.view.Gravity
 import androidx.core.view.updateLayoutParams
 import android.widget.FrameLayout
 import kotlin.math.roundToInt
-
+import android.content.IntentFilter
 
 
 class MainActivity : AppCompatActivity() {
@@ -77,12 +77,21 @@ class MainActivity : AppCompatActivity() {
         private const val CAMERA_PERMISSION_CODE = 1001
         private val REQUIRED_PERMISSIONS = arrayOf(android.Manifest.permission.CAMERA)
         private const val TAG = "CameraDetect"
+        private const val TAG_STT_FINAL = "STT_FINAL"
+        private const val TAG_AI_REPLY = "AI_REPLY"
 
         const val ACTION_STT_UPDATE = "com.example.myapplication.ACTION_STT_UPDATE"
         const val EXTRA_STT_TEXT = "EXTRA_STT_TEXT"
         const val EXTRA_STT_IS_PARTIAL = "EXTRA_STT_IS_PARTIAL"
 
         const val MIC_PERMISSION_CODE = 2002
+
+        const val ACTION_AI_REPLY = "com.example.myapplication.ACTION_AI_REPLY"
+        const val ACTION_USER_UTTER = "com.example.myapplication.ACTION_USER_UTTER"
+        const val EXTRA_AI_TEXT = "EXTRA_AI_TEXT"
+        const val EXTRA_AI_AUDIO_URL = "EXTRA_AI_AUDIO_URL"
+        const val EXTRA_SESSION_ID = "EXTRA_SESSION_ID"
+        const val EXTRA_ELDER_ID = "EXTRA_ELDER_ID"
     }
 
     // --- ONNX 相關 ---
@@ -95,7 +104,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ws: WsManager
     private var frameId: Long = 0
     // 把你的 WS 位址換成實際值（支援 ws:// 或 wss://）
-    private val WS_URL = "wss://518b99a27170.ngrok-free.app/ws/pose?user_id=3"
+    private val WS_URL = "wss://95a66165dfe2.ngrok-free.app/ws/pose?user_id=3"
 
     private lateinit var switchSendWs: SwitchCompat
     @Volatile private var sendWsEnabled = false
@@ -154,6 +163,9 @@ class MainActivity : AppCompatActivity() {
     private val unlockStreakNeed = 2
     private val minElderFramesToUnlock = 6
     private val emitHoldMs = 3000L
+    @Volatile var aiSpeaking = false
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var aiReceiverRegistered = false
 
     private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     private var playbackFocusRequest: android.media.AudioFocusRequest? = null
@@ -222,6 +234,7 @@ class MainActivity : AppCompatActivity() {
 
         // 權限：麥克風（單獨處理）
         if (hasAudioPermission()) {
+            initStt()
             startSttIfPermitted()
         } else {
             ActivityCompat.requestPermissions(
@@ -262,6 +275,9 @@ class MainActivity : AppCompatActivity() {
         btnStartInfer.setOnClickListener {
             allowProcess = true
             lastProcessTimeMs = 0L
+            if (!sendWsEnabled) {
+                switchSendWs.isChecked = true   // 會觸發你現有的 connect() 流程
+            }
             Toast.makeText(this, "開始以 $targetFps fps 擷取幀", Toast.LENGTH_SHORT).show()
         }
         btnStopInfer.setOnClickListener {
@@ -284,6 +300,18 @@ class MainActivity : AppCompatActivity() {
                 ws.close()
             }
         }
+    }
+
+    fun onAiSpeakingStart() {
+        aiSpeaking = true
+        try { stt?.stopListening() } catch (_: Exception) {}
+        isSttRunning = false
+    }
+
+    fun onAiSpeakingDone() {
+        aiSpeaking = false
+        // 延遲一點點，避免剛結束還有尾音被收進來
+        uiHandler.postDelayed({ startSttIfPermitted() }, 600)
     }
 
     // ===== 權限 =====
@@ -423,22 +451,32 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ===== 檔案與廣播 =====
-    private fun transcriptFile(): File =
-        File(getExternalFilesDir(null) ?: filesDir, "stt_transcript.jsonl")
+    private fun transcriptFile(): File {
+        val sp = getSharedPreferences("app", Context.MODE_PRIVATE)
+        val elderId = sp.getInt("elder_id", -1)
+        val fname = if (elderId > 0) {
+            "stt_transcript_elder${elderId}.jsonl"
+        } else {
+            "stt_transcript.jsonl"
+        }
+        return File(getExternalFilesDir(null) ?: filesDir, fname)
+    }
 
+    // MainActivity.kt
     private fun appendTranscript(text: String, type: String = "final") {
-        if (text.isBlank()) return
-        val obj = org.json.JSONObject().apply {
+        if (text.isBlank() && type != "ai") return
+
+        val obj = JSONObject().apply {
             put("ts", System.currentTimeMillis())
             put("text", text)
-            put("type", type)  // "final" 或 "partial"
+            put("type", type)
         }
         val f = transcriptFile()
-        Log.d("STT", "appendTranscript -> ${f.absolutePath}  type=$type  text=$text")
-        FileOutputStream(f, /* append = */ true).bufferedWriter(Charsets.UTF_8).use {
+        FileOutputStream(f, true).bufferedWriter(Charsets.UTF_8).use {
             it.appendLine(obj.toString())
         }
     }
+
 
     private fun broadcastStt(text: String, partial: Boolean) {
         if (text.isBlank()) return
@@ -486,6 +524,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
             }
@@ -528,7 +567,7 @@ class MainActivity : AppCompatActivity() {
                 touchLastElder()
 
                 if (sttTriggeredByMonitor) {
-                    val deadline = sttGateDeadline.takeIf { it > 0 } ?: (System.currentTimeMillis() + 2800L)
+                    val deadline = sttGateDeadline.takeIf { it > 0 } ?: (System.currentTimeMillis() + 5000L)
                     sttHandler.post(object : Runnable {
                         override fun run() {
                             if (!sttLoopEnabled) return
@@ -575,14 +614,11 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onPartialResults(partialResults: Bundle?) {
+                if (aiSpeaking || pausedByPlayback) return
+
                 sttLastEventTs = System.currentTimeMillis()
-
-                val text = partialResults
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                    .orEmpty()
+                val text = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
                 if (text.isBlank()) return
-
                 sttLastPartial = text
 
                 val now = System.currentTimeMillis()
@@ -595,26 +631,36 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onResults(results: Bundle?) {
+                if (aiSpeaking || pausedByPlayback) return
+
+                // ✅ 門沒開就不處理結果、也不送到 N8n
+                if (!sttEmitAllowed) return
+
                 sttLastEventTs = System.currentTimeMillis()
-
-                val text = results
-                    ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                    .orEmpty()
-
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull().orEmpty()
                 if (text.isNotBlank()) {
                     sttLastPartial = ""
                     broadcastStt(text, false)
                     appendTranscript(text, "final")
-                    N8nSender.sendElderVoice(this@MainActivity, text)
+                    val sessionId = SessionId.next(this@MainActivity)
+                    val elderId = getSharedPreferences("app", Context.MODE_PRIVATE).getInt("elder_id", 1)
+
+                    Log.i(TAG_STT_FINAL, "sid=$sessionId elder=$elderId text=$text")
+
+                    val userMsg = Intent(ACTION_USER_UTTER).apply {
+                        setPackage(packageName)
+                        putExtra(EXTRA_ELDER_ID, elderId)
+                        putExtra(EXTRA_SESSION_ID, sessionId)
+                        putExtra(EXTRA_AI_TEXT, text)
+                    }
+                    sendBroadcast(userMsg)
+
+                    N8nSender.sendElderVoiceAndSpeak(this@MainActivity, text, sessionId)
                 }
 
                 isSttRunning = false
-                if (sttTriggeredByMonitor && sttOneShot) {
-                    stopSttLoop()
-                } else if (sttLoopEnabled) {
-                    sttHandler.postDelayed({ startSttOnce() }, 250)
-                }
+                if (sttTriggeredByMonitor && sttOneShot) stopSttLoop()
+                else if (sttLoopEnabled) sttHandler.postDelayed({ startSttOnce() }, 250)
             }
 
             override fun onError(error: Int) {
@@ -679,6 +725,58 @@ class MainActivity : AppCompatActivity() {
         })
     }
 
+    fun showAiAnswer(text: String) {
+        runOnUiThread { statusText.text = "AI：$text" }
+    }
+
+    private var ttsPlayer: MediaPlayer? = null
+
+    fun playTtsFromUrl(url: String, answerText: String) {
+        runOnUiThread {
+            try {
+                // 播放前先停掉舊的
+                ttsPlayer?.release()
+                ttsPlayer = null
+
+                onAiSpeakingStart()
+                pauseVoiceStuffForPlayback() // 停掉 STT / 背景監聽，避免搶麥
+
+                val player = MediaPlayer().apply {
+                    setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    setDataSource(url)
+                    setOnPreparedListener { start() }
+                    setOnCompletionListener {
+                        resumeVoiceStuffAfterPlayback()
+                        onAiSpeakingDone()
+                        release()
+                        ttsPlayer = null
+                    }
+                    setOnErrorListener { _, what, extra ->
+                        Log.e("TTS", "播放錯誤: $what/$extra")
+                        resumeVoiceStuffAfterPlayback()
+                        onAiSpeakingDone()
+                        release()
+                        ttsPlayer = null
+                        true
+                    }
+                    prepareAsync()
+                }
+                ttsPlayer = player
+
+            } catch (e: Exception) {
+                Log.e("TTS", "播放失敗: ${e.message}", e)
+                resumeVoiceStuffAfterPlayback()
+                onAiSpeakingDone()
+            }
+        }
+    }
+
+
     private fun sttErrorName(code: Int) = when (code) {
         1 -> "NETWORK_TIMEOUT"
         2 -> "NETWORK"
@@ -690,6 +788,37 @@ class MainActivity : AppCompatActivity() {
         8 -> "RECOGNIZER_BUSY"
         9 -> "INSUFFICIENT_PERMISSIONS"
         else -> "UNKNOWN($code)"
+    }
+
+    private val aiReplyReceiver = object : android.content.BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_AI_REPLY) return
+
+            val text = intent.getStringExtra(EXTRA_AI_TEXT).orEmpty()
+            val audioUrl = intent.getStringExtra(EXTRA_AI_AUDIO_URL)
+
+            appendTranscript(text, "ai")
+
+            if (text.isNotBlank()) {
+                appendTranscript(text, "ai")
+            }
+
+            if (!audioUrl.isNullOrBlank()) {
+                playTtsFromUrl(audioUrl, text)
+            } else {
+                showAiAnswer(text)
+                uiHandler.postDelayed({ startSttIfPermitted() }, 200)
+            }
+
+            Log.i(TAG_AI_REPLY, "text='${text.take(100)}' audioUrl=${audioUrl ?: "<none>"}")
+
+            if (!audioUrl.isNullOrBlank()) {
+                playTtsFromUrl(audioUrl, text)
+            } else {
+                showAiAnswer(text)
+                uiHandler.postDelayed({ startSttIfPermitted() }, 200)
+            }
+        }
     }
 
     private fun safeResetStt(delay: Long) {
@@ -714,13 +843,11 @@ class MainActivity : AppCompatActivity() {
     private fun startSttLoop() {
         if (sttLoopEnabled) return
         sttLoopEnabled = true
-        showMicListeningIcon()
-
-        sttEmitAllowed = true
+        sttLastPartial = ""
+        sttEmitAllowed = true       // ← 迴圈啟動時就開門（一般情境要能出字）
         sttGateDeadline = 0L
         sttTriggeredByMonitor = false
         sttOneShot = false
-        sttLastPartial = ""
 
         stopBackgroundVoiceMonitor()
         if (stt == null) initStt()
@@ -734,7 +861,7 @@ class MainActivity : AppCompatActivity() {
     private fun startSttIfPermitted() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED) {
-            startSttLoop()
+            startSttLoop()              // ← 直接開 STT 迴圈
             showMicListeningIcon()
         } else {
             updateStatus("等待麥克風授權…")
@@ -862,16 +989,16 @@ class MainActivity : AppCompatActivity() {
         monitorShouldRun = true
         monitorThread = thread(start = true, isDaemon = true) {
             val sampleRate = 16000
-            val frameMs = 160L
+            val frameMs = 120L
             val silenceNeedFrames = 3
             val hangoverFrames = 2
             val nonElderEndFrames = 8
-            val silentDbThreshold = -42f
+            val silentDbThreshold = -48f
             val maxSegFrames = 120
-            val preFrames = 15                 // ≈2.4s pre-roll
-            val startStreakNeed = 1            // 開段門檻
-            val unlockStreakNeed = 2           // 解鎖需連續長輩幀數
-            val minElderFramesToUnlock = 4     // 解鎖需累積長輩幀數（≈640ms）
+            val preFrames = 10
+            val startStreakNeed = 1
+            val unlockStreakNeed = 2
+            val minElderFramesToUnlock = 4
 
             var silentFrames = 0
             var nonElderFrames = 0
@@ -990,11 +1117,11 @@ class MainActivity : AppCompatActivity() {
                             if (!sttEmitAllowed &&
                                 elderStreak >= unlockStreakNeed &&
                                 elderFramesInSeg >= minElderFramesToUnlock &&
-                                !isDevicePlaying()
+                                !aiSpeaking
                             ) {
                                 val justUnlocked = !sttEmitAllowed
                                 sttEmitAllowed = true
-                                Log.d("VoiceMonitor", "🔓 解鎖輸出（elderStreak=$elderStreak, elderFramesInSeg=$elderFramesInSeg）")
+                                Log.d("VoiceMonitor", "解鎖輸出（elderStreak=$elderStreak, elderFramesInSeg=$elderFramesInSeg）")
 
                                 if (justUnlocked && sttLastPartial.isNotBlank()) {
                                     broadcastStt(sttLastPartial, true)
@@ -1005,7 +1132,7 @@ class MainActivity : AppCompatActivity() {
                                     sttRequested = true
                                     runOnUiThread {
                                         stopBackgroundVoiceMonitor()
-                                        sttHandler.postDelayed({ startSttFromMonitor() }, 150)
+                                        sttHandler.postDelayed({ startSttFromMonitor() }, 40)
                                     }
                                 }
                             } else if (!sttEmitAllowed &&
@@ -1030,7 +1157,7 @@ class MainActivity : AppCompatActivity() {
                             // 連續非長輩幀達門檻 → 關閘避免外部語音接手
                             if (sttEmitAllowed && nonElderFrames >= 4) {
                                 sttEmitAllowed = false
-                                Log.d("VoiceMonitor", "🔒 關閉輸出（nonElderFrames=$nonElderFrames）")
+                                Log.d("VoiceMonitor", "關閉輸出（nonElderFrames=$nonElderFrames）")
                             }
                         }
                     }
@@ -1753,7 +1880,10 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        // 恢復註冊狀態（會自動決定是否開背景監聽）
         setRegisteredUI(hasRegisteredElder())
+
+        // 有麥克風權限，且目前沒在跑 → 啟動 STT
         if (hasAudioPermission() && !sttLoopEnabled && !isSttRunning) {
             startSttIfPermitted()
         }
@@ -1761,12 +1891,16 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        // === 語音 ===
+        // === 暫停語音相關 ===
         sttEmitAllowed = false
         sttGateDeadline = 0L
-        try { stt?.stopListening() } catch (_: Exception) {}
-        try { stt?.cancel() } catch (_: Exception) {}
+
+        // 停止 STT
+        runCatching { stt?.stopListening() }
+        runCatching { stt?.cancel() }
         if (sttLoopEnabled) stopSttLoop()
+
+        // 停止背景監聽
         stopBackgroundVoiceMonitor()
     }
 
@@ -1905,16 +2039,35 @@ class MainActivity : AppCompatActivity() {
     }
     override fun onStart() {
         super.onStart()
+        // 先連 WS（你原本的邏輯）
         if (sendWsEnabled) {
             ws.connect(
                 onState = { ok, err -> if (!ok) Log.w(TAG, "WS connect failed: $err") },
                 onMessage = { msg -> handleServerMessage(msg) }
             )
         }
+
+        if (!aiReceiverRegistered) {
+            val filter = IntentFilter(ACTION_AI_REPLY)
+            ContextCompat.registerReceiver(
+                /* context = */ this,
+                /* receiver = */ aiReplyReceiver,
+                /* filter = */ filter,
+                /* flags = */ ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            aiReceiverRegistered = true
+        }
     }
+
     override fun onStop() {
         super.onStop()
+        // 先關 WS（你原本的邏輯）
         ws.close()
+
+        if (aiReceiverRegistered) {
+            try { unregisterReceiver(aiReplyReceiver) } catch (_: Exception) {}
+            aiReceiverRegistered = false
+        }
     }
 
     private fun safeRotation(): Int {
