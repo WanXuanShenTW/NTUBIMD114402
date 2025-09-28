@@ -81,7 +81,8 @@ class _RetryingConnection:
         self._db = db
         self._raw = None
         self._closed = False
-
+        self._released = False
+        
     async def _acquire_initial(self):
         self._raw = await self._db._acquire_from_pool()
         if PRE_PING:
@@ -131,16 +132,22 @@ class _RetryingConnection:
         return _RetryingCursor(self, args, kwargs)
 
     async def ensure_closed(self):
-        if self._raw:
+        if self._raw and not self._closed:
             try:
                 await self._raw.ensure_closed()
-            except Exception:
-                pass
+                self._closed = True
+                print(f"[✅] Connection properly closed")
+            except Exception as e:
+                print(f"[⚠️] Error closing connection: {e}")
 
     def close(self):
         if self._raw and not self._closed:
-            self._raw.close()
-            self._closed = True
+            try:
+                self._raw.close()
+                self._closed = True
+                print(f"[✅] Connection closed")
+            except Exception as e:
+                print(f"[⚠️] Error in close(): {e}")
 
     def __getattr__(self, name):
         return getattr(self._raw, name)
@@ -225,13 +232,32 @@ class Database:
 
     @classmethod
     async def release_connection(cls, conn):
-        """釋放連線回連線池"""
-        if cls._pool and conn:
+        """修正版釋放連線 - 確保連線被正確釋放"""
+        if not cls._pool or not conn:
+            return
+            
+        try:
+            # 確保關閉連線相關資源
+            if hasattr(conn, '_raw') and conn._raw:
+                raw_conn = conn._raw
+                # 重要：將原始連線還給池子
+                cls._pool.release(raw_conn)
+                print(f"[✅] Connection released to pool")
+            elif hasattr(conn, 'close'):
+                # 直接是原始連線的情況
+                cls._pool.release(conn)
+                print(f"[✅] Raw connection released to pool")
+                
+        except Exception as e:
+            print(f"[⚠️] Error releasing connection: {e}")
+            # 如果釋放失敗，強制關閉連線
             try:
-                raw = getattr(conn, "_raw", None) or conn
-                cls._pool.release(raw)   # 交還給 pool，由 pool 管生命周期
-            except Exception as e:
-                print(f"[⚠️] Error releasing connection: {e}")
+                if hasattr(conn, '_raw') and conn._raw:
+                    conn._raw.close()
+                elif hasattr(conn, 'close'):
+                    conn.close()
+            except:
+                pass
 
     @classmethod
     @asynccontextmanager

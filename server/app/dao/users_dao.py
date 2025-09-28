@@ -1,12 +1,8 @@
 import datetime
 from typing import Any, Dict, Optional
-
-import aiomysql
 from aiomysql.cursors import DictCursor
 from pymysql.err import IntegrityError
-
 from ..exceptions import DatabaseError, NotFoundError, AlreadyExistsError
-
 
 async def insert_user(
     conn,
@@ -17,10 +13,7 @@ async def insert_user(
     gender: str,
     address: str
 ) -> Optional[int]:
-    """
-    新增一筆使用者資料到資料庫。
-    回傳新 user_id
-    """
+    """新增一筆使用者資料到資料庫"""
     try:
         async with conn.cursor() as cursor:
             query = """
@@ -33,21 +26,16 @@ async def insert_user(
                 address
             )
             await cursor.execute(query, values)
-            await conn.commit()
             return cursor.lastrowid
     except IntegrityError as e:
-        # Duplicate phone（唯一鍵衝突）
         if "Duplicate entry" in str(e) and "phone" in str(e):
             raise AlreadyExistsError("帳號已被註冊")
         raise DatabaseError(f"資料庫完整性錯誤: {e}")
     except Exception as e:
         raise DatabaseError(f"新增使用者失敗: {e}")
 
-
 async def update_user(conn, user_id: int, **kwargs) -> bool:
-    """
-    更新使用者資料。允許更新 name、phone、password、role_id、gender、address。
-    """
+    """更新使用者資料"""
     allowed = {"name", "phone", "password", "role_id", "gender", "address"}
     fields, values = [], []
     for k, v in kwargs.items():
@@ -63,7 +51,6 @@ async def update_user(conn, user_id: int, **kwargs) -> bool:
     try:
         async with conn.cursor() as cursor:
             await cursor.execute(query, tuple(values))
-            await conn.commit()
             if cursor.rowcount == 0:
                 raise NotFoundError(f"找不到 user_id={user_id} 的使用者可更新")
             return True
@@ -72,11 +59,8 @@ async def update_user(conn, user_id: int, **kwargs) -> bool:
     except Exception as e:
         raise DatabaseError(f"更新使用者失敗: {e}")
 
-
 async def select_user_by_phone(conn, phone: str) -> Dict[str, Any]:
-    """
-    依 phone 查詢使用者資料（全部欄位）
-    """
+    """依 phone 查詢使用者資料"""
     try:
         async with conn.cursor(DictCursor) as cursor:
             await cursor.execute("SELECT * FROM users WHERE phone = %s", (phone,))
@@ -89,11 +73,8 @@ async def select_user_by_phone(conn, phone: str) -> Dict[str, Any]:
     except Exception as e:
         raise DatabaseError(f"查詢使用者資料失敗: {e}")
 
-
 async def select_user_by_id(conn, user_id: int) -> Dict[str, Any]:
-    """
-    依 user_id 查詢使用者資料（全部欄位）
-    """
+    """依 user_id 查詢使用者資料"""
     try:
         async with conn.cursor(DictCursor) as cursor:
             await cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
@@ -106,15 +87,11 @@ async def select_user_by_id(conn, user_id: int) -> Dict[str, Any]:
     except Exception as e:
         raise DatabaseError(f"查詢使用者資料失敗: {e}")
 
-
 async def delete_user(conn, phone: str) -> bool:
-    """
-    依 phone 刪除使用者
-    """
+    """依 phone 刪除使用者"""
     try:
         async with conn.cursor() as cursor:
             await cursor.execute("DELETE FROM users WHERE phone = %s", (phone,))
-            await conn.commit()
             if cursor.rowcount == 0:
                 raise NotFoundError(f"找不到 phone={phone} 的使用者可刪除")
             return True
@@ -123,26 +100,20 @@ async def delete_user(conn, phone: str) -> bool:
     except Exception as e:
         raise DatabaseError(f"刪除使用者失敗: {e}")
 
-
 async def get_user_by_phone(conn, phone: str) -> Optional[Dict[str, Any]]:
-    """
-    由電話找 user；回傳：{user_id, name, role_id}
-    """
+    """由電話找 user"""
     async with conn.cursor(DictCursor) as cursor:  
         await cursor.execute(
             "SELECT user_id, name, role_id FROM users WHERE phone=%s LIMIT 1",
             (phone,)
         )
-        return await cursor.fetchone()  
-
+        return await cursor.fetchone()
 
 async def get_user_auth_by_id(conn, user_id: int) -> Optional[Dict[str, Any]]:
-    """
-    取使用者的密碼：{password}
-    """
+    """取使用者的密碼"""
     async with conn.cursor(DictCursor) as cursor:
         await cursor.execute(
             "SELECT password FROM users WHERE user_id=%s LIMIT 1",
             (user_id,)
         )
-        return await cursor.fetchone() 
+        return await cursor.fetchone()
