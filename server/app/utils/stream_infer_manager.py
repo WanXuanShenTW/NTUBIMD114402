@@ -1,3 +1,4 @@
+import os
 import asyncio
 import json
 from dataclasses import dataclass, field
@@ -37,8 +38,8 @@ DROPOUT = 0.3
 ENABLE_KALMAN = True
 KALMAN_HALF_SLIDE = True
 HALF_LEN_OVERRIDE = None
-REQUIRE_FULL_FIRST = True         # ← 開啟第一幀完整檢查（bbox+17kp）
-KP_CONF_TH = 0.4                  # ← 與 trainer 對齊（原本 2.0 太高）
+REQUIRE_FULL_FIRST = False         # ← 開啟第一幀完整檢查（bbox+17kp）
+KP_CONF_TH = 0.2                  # ← 與 trainer 對齊（原本 2.0 太高）
 SIGMA_KP = 3.0
 
 COCO_EDGES = [
@@ -47,8 +48,23 @@ COCO_EDGES = [
 ]
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL_PATH = f"{SC_MODELS}/best.pt"
-CLASSES_PATH = f"{SC_MODELS}/classes.json"
+
+# === 二階段推論設定（可用環境變數覆蓋） ===
+USE_TWO_STAGE = True  # 關掉就回到舊單模型流程
+
+# Binary（跌倒/非跌倒）
+BINARY_MODEL_PATH   = os.getenv("SC_BINARY_MODEL_PATH", f"{SC_MODELS}/binary/best.pt")
+BINARY_CLASSES_PATH = os.getenv("SC_BINARY_CLASSES_PATH", f"{SC_MODELS}/binary/classes.json")
+BINARY_POS_NAME     = os.getenv("SC_BINARY_POS_NAME", "fall")
+BINARY_THR          = float(os.getenv("SC_BINARY_THR", "0.50"))  # binary 判定 fall 的 gate
+
+# Multi（多類別動作）
+MULTI_MODEL_PATH    = os.getenv("SC_MULTI_MODEL_PATH",  f"{SC_MODELS}/multi/best.pt")
+MULTI_CLASSES_PATH  = os.getenv("SC_MULTI_CLASSES_PATH",f"{SC_MODELS}/multi/classes.json")
+
+# （保留舊版單模型相容設定）
+MODEL_PATH   = os.getenv("SC_MODEL_PATH",   f"{SC_MODELS}/best.pt")
+CLASSES_PATH = os.getenv("SC_CLASSES_PATH", f"{SC_MODELS}/classes.json")
 
 # ===== Relation Map & 工具 =====
 class RelationMapConfig:
@@ -492,14 +508,42 @@ class StreamInferManager:
     def __init__(self):
         coord = 2 if COORDCONV_2 else 0
         self.in_ch = 2 + 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + (len(OBJECT_CLASSES) if OBJECT_CLASSES else 0) + coord
+        
+        # 讀取二階段 classes（失敗就給預設）
+        self.class_names_bin   = ["non-fall", "fall"]
+        self.class_names_multi = ["class_0", "class_1"]
         try:
-            with open(CLASSES_PATH, "r", encoding="utf-8") as f:
-                self.class_names = json.load(f)
+            with open(BINARY_CLASSES_PATH, "r", encoding="utf-8") as f:
+                self.class_names_bin = json.load(f)
         except Exception:
-            self.class_names = ["class_0", "class_1"]
-        self.num_classes = len(self.class_names)
-        self.model = self._load_model()
-        self.model.eval().to(DEVICE)
+            pass
+        try:
+            with open(MULTI_CLASSES_PATH, "r", encoding="utf-8") as f:
+                self.class_names_multi = json.load(f)
+        except Exception:
+            pass
+
+        if USE_TWO_STAGE:
+            # 兩個模型
+            self.model_bin   = self._build_model(num_classes=len(self.class_names_bin))
+            self.model_multi = self._build_model(num_classes=len(self.class_names_multi))
+            try:
+                self._load_weights(self.model_bin,   BINARY_MODEL_PATH)
+                self._load_weights(self.model_multi, MULTI_MODEL_PATH)
+                print(f"[InferManager] Two-stage loaded. bin={len(self.class_names_bin)} classes, multi={len(self.class_names_multi)} classes")
+            except Exception as e:
+                print(f"[InferManager] WARN two-stage load failed: {e}")
+            self.model_bin.eval().to(DEVICE)
+            self.model_multi.eval().to(DEVICE)
+        else:
+            # 舊版單模型相容流程
+            try:
+                with open(CLASSES_PATH, "r", encoding="utf-8") as f:
+                    self.class_names_multi = json.load(f)
+            except Exception:
+                self.class_names_multi = ["class_0", "class_1"]
+            self.model_multi = self._load_model()  # 沿用你原本的 _load_model
+            self.model_multi.eval().to(DEVICE)
         self.cfg = RelationMapConfig(H=H, W=W, sigma_kp=SIGMA_KP, kp_conf_th=KP_CONF_TH,
                                      include_bone_lines=INCLUDE_BONE_LINES, object_classes=OBJECT_CLASSES)
         # user 狀態
@@ -596,33 +640,58 @@ class StreamInferManager:
         return self._locks[user_id]
 
     def set_handlers(self, **handlers):
-        """
-        註冊事件 hook（皆為 async function）：
-        - on_fall_start(user_id, start_time, result, clip20)
-            clip20 結構：
-            {
-            "window": {"start_frame": int, "end_frame": int},
-            "kp_indices": [int, ...],     # 這次推論實際用到的關節索引（若無特別設定，等於全部）
-            "frames": [
-                {
-                "frame_id": int,
-                "timestamp_ms": int,
-                "image_size": {"width": float, "height": float},
-                "bbox_xyxy": [x1,y1,x2,y2] 或 None,
-                "keypoints_used": [{ "x": float, "y": float, "conf": float }, ...],  # 只輸出判斷用到的點
-                "objects": [{"cls_name": str, "score": float, "bbox": {"cx":..., "cy":..., "w":..., "h":...}}, ...]
-                },  # * 20 幀
-            ]
-            }
-
-        - on_fall_recover(user_id, start_time, end_time, peak_score, result)
-        """
         self._handlers.update({k: v for k, v in handlers.items() if v})
 
     def _emit(self, name: str, *args, **kwargs):
         h = self._handlers.get(name)
         if h:
             asyncio.create_task(h(*args, **kwargs))
+
+    def _build_model(self, num_classes: int) -> nn.Module:
+        if CNNLSTM is not None:
+            m = CNNLSTM(
+                in_ch=self.in_ch,
+                num_classes=num_classes,
+                cnn_out=256,
+                lstm_h=LSTM_HIDDEN,
+                lstm_layers=2,
+                bidirectional=BIDIRECTIONAL,
+                temporal_pool=TEMPORAL_POOL,
+                dropout=DROPOUT,
+                motion_dim=9,
+            )
+        else:
+            class _LiteCNNLSTM(nn.Module):
+                def __init__(self, in_ch, num_classes):
+                    super().__init__()
+                    self.c1 = nn.Sequential(
+                        nn.Conv2d(in_ch,64,3,padding=1), nn.ReLU(),
+                        nn.Conv2d(64,64,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                        nn.Conv2d(64,128,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
+                        nn.Conv2d(128,256,3,padding=1), nn.ReLU(),
+                        nn.AdaptiveAvgPool2d(1)
+                    )
+                    self.p = nn.Linear(256,256)
+                    self.lstm = nn.LSTM(256, LSTM_HIDDEN, num_layers=2, batch_first=True, bidirectional=BIDIRECTIONAL)
+                    feat = LSTM_HIDDEN * (2 if BIDIRECTIONAL else 1)
+                    self.fc = nn.Linear(feat, num_classes)
+                def forward(self, x):
+                    B,T,C,H,W = x.shape
+                    z = self.p(self.c1(x.view(B*T,C,H,W)).flatten(1)).view(B,T,-1)
+                    z,_ = self.lstm(z)
+                    return self.fc(z[:,-1])
+            m = _LiteCNNLSTM(self.in_ch, num_classes)
+        return m
+
+    def _load_weights(self, model: nn.Module, weight_path: str):
+        state = torch.load(weight_path, map_location=DEVICE)
+        if isinstance(state, dict) and "state_dict" in state:
+            model.load_state_dict(state["state_dict"], strict=False)
+        elif isinstance(state, dict):
+            model.load_state_dict(state, strict=False)
+        else:
+            # 直接是 model 物件的情況很少見，略過
+            pass
 
     # ---- 事件決策（只看中心幀） ----
     @staticmethod
@@ -648,7 +717,7 @@ class StreamInferManager:
         result_stub = {"forced_reason": reason, "pred": "fall"}
         if self._handlers.get("on_fall_recover"):
             await self._handlers["on_fall_recover"](
-                user_id, start_time, end_time, float(peak_score), result_stub
+                user_id, start_time, end_time, start_frame, end_frame, peak_score, result_stub
             )
         st.update({"active": False, "start_time": None, "start_frame": None, "peak_score": 0.0, "normal_streak": 0, "last_end_frame": None})
 
@@ -708,21 +777,6 @@ class StreamInferManager:
                 # 更新使用序列（定稿優先）
                 kps_seq = [ (user_cache[fr.frame_id] if fr.frame_id in finalized else fr.kps) for fr in window ]
 
-            # ===== 只保留「本次推論實際用到的點」：若 cfg 有 kp_indices 就取子集；否則等於全部 =====
-            if hasattr(self.cfg, "kp_indices") and self.cfg.kp_indices:
-                used_idxs = list(self.cfg.kp_indices)
-                kps_used = []
-                for kp in kps_seq:
-                    if not kp:
-                        kps_used.append([])
-                    else:
-                        kps_used.append([kp[j] for j in used_idxs if j < len(kp)])
-            else:
-                used_count = len(kps_seq[0] or [])
-                used_idxs = list(range(used_count))
-                kps_used = kps_seq
-            # ======================================================================
-            
             # 4) relation map + motion + mask
             clips = []
             for i, fr in enumerate(window):
@@ -733,26 +787,104 @@ class StreamInferManager:
             M = torch.from_numpy(motion_feats).unsqueeze(0).float().to(DEVICE)
             mask = torch.from_numpy(valid_mask).unsqueeze(0).float().to(DEVICE)
 
-            # 5) 模型推論（仍保留 per-window 結果給前端）
+            # 5) 二階段模型推論
             with torch.no_grad():
-                try:
-                    logits = self.model(x, motion=M, mask=mask)
-                except TypeError:
-                    logits = self.model(x)
-                if isinstance(logits, (list, tuple)):
-                    logits = logits[0]
-                if logits.ndim > 2:
-                    logits = logits.view(1, -1)
-                prob = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
-            pred_idx = int(prob.argmax())
-            result = {
-                "type": "inference",
-                "window": {"start_frame": window[0].frame_id, "end_frame": window[-1].frame_id},
-                "pred_idx": pred_idx,
-                "pred": self.class_names[pred_idx] if 0 <= pred_idx < len(self.class_names) else f"class_{pred_idx}",
-                "probs": [float(p) for p in prob.tolist()]
-            }
-            await ws_manager.send_json(result, user_id)
+                if USE_TWO_STAGE and getattr(self, "model_bin", None) is not None:
+                    # --- (1) 先 binary ---
+                    try:
+                        logits_bin = self.model_bin(x, motion=M, mask=mask)
+                    except TypeError:
+                        logits_bin = self.model_bin(x)
+                    if isinstance(logits_bin, (list, tuple)):
+                        logits_bin = logits_bin[0]
+                    if logits_bin.ndim > 2:
+                        logits_bin = logits_bin.view(1, -1)
+                    prob_bin = torch.softmax(logits_bin, dim=1).detach().cpu().numpy()[0].tolist()
+                    try:
+                        bin_fall_idx = self.class_names_bin.index(BINARY_POS_NAME)
+                    except ValueError:
+                        bin_fall_idx = min(1, len(self.class_names_bin)-1)  # 安全 fallback
+                    p_fall = float(prob_bin[bin_fall_idx])
+                    is_fall = (p_fall >= BINARY_THR)
+
+                    multi_block = None
+                    if (not is_fall) and getattr(self, "model_multi", None) is not None:
+                        # --- (2) non-fall 才跑 multi ---
+                        try:
+                            logits_multi = self.model_multi(x, motion=M, mask=mask)
+                        except TypeError:
+                            logits_multi = self.model_multi(x)
+                        if isinstance(logits_multi, (list, tuple)):
+                            logits_multi = logits_multi[0]
+                        if logits_multi.ndim > 2:
+                            logits_multi = logits_multi.view(1, -1)
+                        prob_multi = torch.softmax(logits_multi, dim=1).detach().cpu().numpy()[0].tolist()
+                        pred_multi = int(np.argmax(prob_multi))
+                        multi_block = {
+                            "pred_idx": pred_multi,
+                            "pred": self.class_names_multi[pred_multi] if 0 <= pred_multi < len(self.class_names_multi) else f"class_{pred_multi}",
+                            "probs": [float(p) for p in prob_multi],
+                        }
+
+                    if is_fall:
+                        final_pred = BINARY_POS_NAME
+                        final_idx  = bin_fall_idx
+                        final_probs = prob_bin     # 傳回的是 binary 的 2 維
+                        stage = "binary"
+                    else:
+                        final_pred = multi_block["pred"]
+                        final_idx  = multi_block["pred_idx"]
+                        final_probs = multi_block["probs"]
+                        stage = "multi"
+
+                    result = {
+                        "type": "inference",
+                        "window": {"start_frame": window[0].frame_id, "end_frame": window[-1].frame_id},
+                        # 舊欄位（相容前端）：以最終結果為準
+                        "pred_idx": final_idx,
+                        "pred": final_pred,
+                        "probs": final_probs,
+                        # 新增說明：二階段細節
+                        "stage": stage,
+                        "binary": {
+                            "class_names": self.class_names_bin,
+                            "pred_idx": bin_fall_idx if is_fall else int(np.argmax(prob_bin)),
+                            "pred": BINARY_POS_NAME if is_fall else self.class_names_bin[int(np.argmax(prob_bin))],
+                            "probs": [float(p) for p in prob_bin],
+                            "thr": BINARY_THR,
+                        },
+                        "multi": (multi_block if multi_block is not None else None)
+                    }
+                    await ws_manager.send_json(result, user_id)
+
+                else:
+                    # 單模型 fallback（沿用你原來的邏輯）
+                    try:
+                        logits = self.model_multi(x, motion=M, mask=mask)
+                    except TypeError:
+                        logits = self.model_multi(x)
+                    if isinstance(logits, (list, tuple)):
+                        logits = logits[0]
+                    if logits.ndim > 2:
+                        logits = logits.view(1, -1)
+                    prob = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+                    pred_idx = int(np.argmax(prob))
+                    result = {
+                        "type": "inference",
+                        "window": {"start_frame": window[0].frame_id, "end_frame": window[-1].frame_id},
+                        "pred_idx": pred_idx,
+                        "pred": self.class_names_multi[pred_idx] if 0 <= pred_idx < len(self.class_names_multi) else f"class_{pred_idx}",
+                        "probs": [float(p) for p in prob],
+                        "stage": "single",
+                    }
+                    await ws_manager.send_json(result, user_id)
+
+                    # 給事件判斷用的 p_fall（單模型時若有 'fall' 類就拿那一維，否則拿最大機率）
+                    try:
+                        p_fall_idx = self.class_names_multi.index("fall")
+                        p_fall = float(prob[p_fall_idx])
+                    except ValueError:
+                        p_fall = float(np.max(prob))
 
             # 6) 中心幀決策：只有當『中心幀已定稿』才寫入 centerline，避免滑窗延長
             center_fid = window[0].frame_id + WINDOW // 2
@@ -763,8 +895,9 @@ class StreamInferManager:
             })
             if commit_center:
                 line = self._centerline.setdefault(user_id, {})
-                p_fall_idx = 0 if ("fall" in self.class_names and self.class_names.index("fall") == 0) else pred_idx
-                p_fall = float(prob[p_fall_idx])
+                # 已在上面的推論區塊算出 p_fall（binary 的 fall 機率）
+                # 這裡直接用 p_fall，不再從 multi 的 prob 推估
+                # （注意：若走單模型 fallback，p_fall 已在上面單模型分支給好）
                 line[center_fid] = p_fall
                 # 事件判定（僅看最近幾個中心點）
                 # 觸發：>=0.80 連續 2 個中心幀；恢復：<=0.60 連續 2 個中心幀
@@ -777,14 +910,13 @@ class StreamInferManager:
                     vals = get_last_vals(TRIGGER_CONSEC)
                     if len(vals) == TRIGGER_CONSEC and all(v >= 0.80 for v in vals):
                         st.update({"active": True, "start_time": now_str(), "start_frame": recent_centers[-TRIGGER_CONSEC], "peak_score": max(vals)})
-                        clip20 = self._build_clip20(window, kps_used, used_idxs)
-                        self._emit("on_fall_start", user_id, st["start_time"], result, clip20)
+                        self._emit("on_fall_start", user_id, st["start_time"], st["start_frame"], result)
                 else:
                     vals = get_last_vals(RECOVER_CONSEC_)
                     if len(vals) == RECOVER_CONSEC_ and all(v <= 0.60 for v in vals):
-                        end_time = now_str()
-                        self._emit("on_fall_recover", user_id, st["start_time"], end_time, float(st["peak_score"]), result)
-                        st.update({"active": False, "start_time": None, "peak_score": 0.0, "normal_streak": 0})
+                        end_time = now_str(); end_frame = center_fid
+                        self._emit("on_fall_recover", user_id, st["start_time"], end_time, st["start_frame"], end_frame, float(st["peak_score"]), result)
+                        st.update({"active": False, "start_time": None, "start_frame": None, "peak_score": 0.0, "normal_streak": 0, "last_end_frame": end_frame})
 
             # 7) 彈出 STRIDE 並清理對應的快取
             to_pop_ids = [fr.frame_id for fr in window[:STRIDE]]
@@ -795,30 +927,6 @@ class StreamInferManager:
                 user_cache.pop(fid_rm, None)
                 finalized.discard(fid_rm)
 
-    def _build_clip20(self, window, kps_used, kp_indices):
-        """
-        將當下 20 幀視窗打包成 clip20（只含「判斷用到的點」）。
-        - window: List[FrameRecord]
-        - kps_used: List[List[dict]]  # 已卡爾曼、且只保留本次推論實際用到的關節點
-        - kp_indices: List[int]       # 本次推論使用到的關節索引集合（若未指定，等於全部）
-        """
-        frames = []
-        for i, fr in enumerate(window):
-            frames.append({
-                "frame_id": fr.frame_id,
-                "timestamp_ms": fr.ts_ms,
-                "image_size": {"width": fr.img_w, "height": fr.img_h},
-                "bbox_xyxy": fr.bbox,
-                "keypoints_used": kps_used[i] or [],
-                "objects": fr.dets or []
-            })
-        return {
-            "window": {"start_frame": window[0].frame_id, "end_frame": window[-1].frame_id},
-            "kp_indices": list(kp_indices or []),
-            "frames": frames
-        }
-
-    
     def drop_user(self, user_id: str):
         self._buffers.pop(user_id, None)
         self._locks.pop(user_id, None)
