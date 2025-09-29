@@ -1,6 +1,5 @@
-import os
+import os, json
 import asyncio
-import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -49,6 +48,10 @@ COCO_EDGES = [
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# === 目標 FPS 補幀設定 ===
+TARGET_FPS = float(os.getenv("SC_TARGET_FPS", "0"))  # 0 = 不補幀
+UPSAMPLE_MAX_MULT = int(os.getenv("SC_UPSAMPLE_MAX_MULT", "4"))
+
 # === 二階段推論設定（可用環境變數覆蓋） ===
 USE_TWO_STAGE = True  # 關掉就回到舊單模型流程
 
@@ -62,9 +65,36 @@ BINARY_THR          = float(os.getenv("SC_BINARY_THR", "0.50"))  # binary 判定
 MULTI_MODEL_PATH    = os.getenv("SC_MULTI_MODEL_PATH",  f"{SC_MODELS}/multi/best.pt")
 MULTI_CLASSES_PATH  = os.getenv("SC_MULTI_CLASSES_PATH",f"{SC_MODELS}/multi/classes.json")
 
-# （保留舊版單模型相容設定）
+# 舊單模型相容
 MODEL_PATH   = os.getenv("SC_MODEL_PATH",   f"{SC_MODELS}/best.pt")
 CLASSES_PATH = os.getenv("SC_CLASSES_PATH", f"{SC_MODELS}/classes.json")
+
+# === 跌倒事件門檻 ===
+FALL_TRIGGER_THR = float(os.getenv("SC_FALL_TRIGGER_THR", "0.60"))
+FALL_RECOVER_THR = float(os.getenv("SC_FALL_RECOVER_THR", "0.40"))
+TRIGGER_CONSEC   = int(os.getenv("SC_FALL_TRIGGER_CONSEC", "2"))
+RECOVER_CONSEC   = int(os.getenv("SC_FALL_RECOVER_CONSEC", "2"))
+
+# === 坐/躺事件規則（內嵌預設；可用 SC_ACTION_EVENTS_JSON 整包覆蓋） ===
+ACTION_EVENTS_DEFAULT = {
+    "sit": {
+        "pos_labels":     ["lie","locomotion"],
+        "recover_labels": ["lie","locomotion"],
+        "trigger_thr":    float(os.getenv("SC_SIT_TRIGGER_THR", "0.60")),
+        "recover_thr":    float(os.getenv("SC_SIT_RECOVER_THR", "0.40")),
+        "trigger_consec": int(os.getenv("SC_SIT_TRIGGER_CONSEC", "2")),
+        "recover_consec": int(os.getenv("SC_SIT_RECOVER_CONSEC", "2"))
+    },
+    "lie": {
+        "pos_labels":     ["sit", "locomotion"],
+        "recover_labels": ["sit", "locomotion"],
+        "trigger_thr":    float(os.getenv("SC_LIE_TRIGGER_THR", "0.60")),
+        "recover_thr":    float(os.getenv("SC_LIE_RECOVER_THR", "0.40")),
+        "trigger_consec": int(os.getenv("SC_LIE_TRIGGER_CONSEC", "2")),
+        "recover_consec": int(os.getenv("SC_LIE_RECOVER_CONSEC", "2"))
+    }
+}
+ACTION_EVENTS = ACTION_EVENTS_DEFAULT
 
 # ===== Relation Map & 工具 =====
 class RelationMapConfig:
@@ -288,6 +318,183 @@ def kalman_smooth_kps(window_kps, *, half_slide=True, half_len=10, require_full_
                 out[i] = fb[i]
     return out
 
+def _estimate_fps(ts_list_ms: List[int]) -> float:
+    """用相鄰 timestamp 中位數估計輸入 FPS（較抗噪）"""
+    if not ts_list_ms or len(ts_list_ms) < 2:
+        return 0.0
+    dts = [max(1.0, float(ts_list_ms[i] - ts_list_ms[i-1])) for i in range(1, len(ts_list_ms))]
+    dts.sort()
+    med = dts[len(dts)//2]
+    return 1000.0 / med if med > 0 else 0.0
+
+def _normalize_in_fps(fps: float) -> float:
+    """你指定的規則：4.x fps 一律視為 5 fps"""
+    if 4.0 <= fps < 5.0:
+        return 5.0
+    return fps
+
+def _interp_val(a: Optional[float], b: Optional[float], w: float) -> Optional[float]:
+    if a is None and b is None: return None
+    if a is None: return b
+    if b is None: return a
+    return a*(1.0-w) + b*w
+
+def _interp_kp(kpa: dict, kpb: dict, w: float) -> dict:
+    ax = kpa.get('x'); ay = kpa.get('y'); ac = float(kpa.get('conf', kpa.get('confidence', 1.0)))
+    bx = kpb.get('x'); by = kpb.get('y'); bc = float(kpb.get('conf', kpb.get('confidence', 1.0)))
+    x = _interp_val(ax, bx, w); y = _interp_val(ay, by, w)
+    c = ac*(1.0-w) + bc*w
+    out = {}
+    if x is not None: out['x'] = float(x)
+    if y is not None: out['y'] = float(y)
+    out['conf'] = float(c)
+    return out
+
+def _interp_bbox_xyxy(bba: Optional[Tuple[float,float,float,float]],
+                      bbb: Optional[Tuple[float,float,float,float]],
+                      w: float) -> Optional[Tuple[float,float,float,float]]:
+    """FrameRecord.bbox 是 xyxy tuple，線性插值後回傳 xyxy"""
+    if not bba and not bbb:
+        return None
+    if not bba: return bbb
+    if not bbb: return bba
+    x1a,y1a,x2a,y2a = bba
+    x1b,y1b,x2b,y2b = bbb
+    return (
+        _interp_val(x1a, x1b, w),
+        _interp_val(y1a, y1b, w),
+        _interp_val(x2a, x2b, w),
+        _interp_val(y2a, y2b, w),
+    )
+
+def _densify_sequences(kps_seq: List[List[dict]],
+                       bbox_seq: List[Optional[Tuple[float,float,float,float]]],
+                       dets_seq: List[List[dict]],
+                       mult: int):
+    """
+    針對相鄰幀做等距插值，mult=1 表示不變；mult=2 表示每對幀中插 1 幀，以此類推
+    dets 使用左值持有（物件可慢到）
+    回傳：kps_dense, bbox_dense, dets_dense
+    """
+    if mult <= 1 or len(kps_seq) <= 1:
+        return kps_seq, bbox_seq, dets_seq
+
+    J = max(len(kps_seq[0]) if kps_seq and kps_seq[0] else 17, 17)
+    kd, bd, dd = [], [], []
+    N = len(kps_seq)
+    for i in range(N-1):
+        A_kps, B_kps = kps_seq[i] or [], kps_seq[i+1] or []
+        A_bbox, B_bbox = bbox_seq[i], bbox_seq[i+1]
+        A_dets = dets_seq[i] if dets_seq[i] is not None else []
+        kd.append(A_kps)
+        bd.append(A_bbox)
+        dd.append(A_dets)
+        # 插入中間幀
+        for k in range(1, mult):
+            w = k / float(mult)  # 0<w<1
+            inter_kps = []
+            for j in range(J):
+                a = A_kps[j] if j < len(A_kps) else {}
+                b = B_kps[j] if j < len(B_kps) else {}
+                inter_kps.append(_interp_kp(a, b, w))
+            kd.append(inter_kps)
+            bd.append(_interp_bbox_xyxy(A_bbox, B_bbox, w))
+            dd.append(A_dets)  # dets：零階保持
+
+    # 末幀
+    kd.append(kps_seq[-1] or [])
+    bd.append(bbox_seq[-1])
+    dd.append(dets_seq[-1] if dets_seq[-1] is not None else [])
+    return kd, bd, dd
+
+def _virtual_window_from(bbox_seq: List[Optional[Tuple[float,float,float,float]]],
+                         dets_seq: List[List[dict]],
+                         template_fr: 'FrameRecord') -> List['FrameRecord']:
+    """產生與 bbox_seq 同長度的虛擬 window（img_w/img_h/bbox/dets 來自參數；frame_id/ts 用樣板）"""
+    vwin = []
+    for i in range(len(bbox_seq)):
+        vwin.append(FrameRecord(
+            frame_id=template_fr.frame_id,
+            ts_ms=template_fr.ts_ms,
+            img_w=template_fr.img_w,
+            img_h=template_fr.img_h,
+            kps=None,
+            bbox=bbox_seq[i],
+            dets=dets_seq[i] or []
+        ))
+    return vwin
+
+def _resample_sequences_to_fps(window, use_kps, use_bbox, use_dets, target_fps):
+    """
+    以「時間軸重採樣」的方式，回傳剛好 WINDOW 長度、等間距(=1000/target_fps ms)的序列。
+    - keypoints / bbox：線性插值
+    - dets：左值保持（較慢沒關係）
+    - 虛擬 window：只帶 img_w/img_h/bbox/dets 給後續 motion/mask / rasterize 使用
+    """
+    if not window or len(window) < 2:
+        # 樣本太少，直接回傳原序列
+        return use_kps, use_bbox, use_dets, window
+
+    # 目標時間格點：以最後一幀時間為對齊點
+    dt = 1000.0 / float(target_fps)
+    t_end = float(window[-1].ts_ms)
+    t_grid = [t_end - dt * (WINDOW - 1 - i) for i in range(WINDOW)]  # 長度=WINDOW
+
+    # 原時間序列
+    ts = [float(fr.ts_ms) for fr in window]
+    n = len(ts)
+
+    res_kps, res_bbox, res_dets = [], [], []
+
+    j = 0  # 游標（單調前進）
+    for t in t_grid:
+        # 往前找到 ts[j] <= t <= ts[j+1]
+        while j + 1 < n and ts[j + 1] < t:
+            j += 1
+
+        if t <= ts[0]:
+            # 落在最前，直接取第 0 幀
+            kps_a, bbox_a, dets_a = use_kps[0], use_bbox[0], (use_dets[0] or [])
+            res_kps.append(kps_a)
+            res_bbox.append(bbox_a)
+            res_dets.append(dets_a)
+            continue
+
+        if t >= ts[-1]:
+            # 落在最後，直接取最後一幀
+            kps_b, bbox_b, dets_b = use_kps[-1], use_bbox[-1], (use_dets[-1] or [])
+            res_kps.append(kps_b)
+            res_bbox.append(bbox_b)
+            res_dets.append(dets_b)
+            continue
+
+        # 正常情況：介於 j 與 j+1 之間
+        t0, t1 = ts[j], ts[j + 1]
+        # 保險起見
+        if t1 <= t0:
+            w = 0.0
+        else:
+            w = (t - t0) / (t1 - t0)
+
+        # keypoints 插值
+        J = max(len(use_kps[j]) if use_kps[j] else 17, 17)
+        inter_kps = []
+        for idx in range(J):
+            a = use_kps[j][idx] if idx < len(use_kps[j]) else {}
+            b = use_kps[j + 1][idx] if idx < len(use_kps[j + 1]) else {}
+            inter_kps.append(_interp_kp(a, b, w))
+        res_kps.append(inter_kps)
+
+        # bbox 插值（xyxy）
+        res_bbox.append(_interp_bbox_xyxy(use_bbox[j], use_bbox[j + 1], w))
+
+        # dets：採左值保持
+        res_dets.append(use_dets[j] or [])
+
+    # 產生對齊長度的虛擬 window（img_w/img_h/bbox/dets）
+    vwin = _virtual_window_from(res_bbox, res_dets, template_fr=window[-1])
+    return res_kps, res_bbox, res_dets, vwin
+
 # ===== Motion + Mask =====
 import math
 
@@ -509,7 +716,7 @@ class StreamInferManager:
         coord = 2 if COORDCONV_2 else 0
         self.in_ch = 2 + 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + (len(OBJECT_CLASSES) if OBJECT_CLASSES else 0) + coord
         
-        # 讀取二階段 classes（失敗就給預設）
+        # 讀 classes
         self.class_names_bin   = ["non-fall", "fall"]
         self.class_names_multi = ["class_0", "class_1"]
         try:
@@ -523,27 +730,35 @@ class StreamInferManager:
         except Exception:
             pass
 
+        # （保留你原本 self.in_ch 的計算）
+
         if USE_TWO_STAGE:
-            # 兩個模型
             self.model_bin   = self._build_model(num_classes=len(self.class_names_bin))
             self.model_multi = self._build_model(num_classes=len(self.class_names_multi))
             try:
                 self._load_weights(self.model_bin,   BINARY_MODEL_PATH)
                 self._load_weights(self.model_multi, MULTI_MODEL_PATH)
-                print(f"[InferManager] Two-stage loaded. bin={len(self.class_names_bin)} classes, multi={len(self.class_names_multi)} classes")
+                print(f"[InferManager] Two-stage loaded. bin={len(self.class_names_bin)}, multi={len(self.class_names_multi)}")
             except Exception as e:
                 print(f"[InferManager] WARN two-stage load failed: {e}")
             self.model_bin.eval().to(DEVICE)
             self.model_multi.eval().to(DEVICE)
         else:
-            # 舊版單模型相容流程
             try:
                 with open(CLASSES_PATH, "r", encoding="utf-8") as f:
                     self.class_names_multi = json.load(f)
             except Exception:
                 self.class_names_multi = ["class_0", "class_1"]
-            self.model_multi = self._load_model()  # 沿用你原本的 _load_model
+
+            self.num_classes = len(self.class_names_multi)  
+
+            self.model_multi = self._load_model()
             self.model_multi.eval().to(DEVICE)
+
+        # 多事件（坐/躺）狀態表 + 依 multi 類別編譯事件規則
+        self._multi_event_state = {}  # { user_id: { event_name: {...} } }
+        self._event_defs = self._compile_action_events(ACTION_EVENTS, self.class_names_multi)
+        self._last_action_name: Dict[str, Optional[str]] = {}  # {user_id: 上一次 multi 的動作名稱}
         self.cfg = RelationMapConfig(H=H, W=W, sigma_kp=SIGMA_KP, kp_conf_th=KP_CONF_TH,
                                      include_bone_lines=INCLUDE_BONE_LINES, object_classes=OBJECT_CLASSES)
         # user 狀態
@@ -689,9 +904,70 @@ class StreamInferManager:
             model.load_state_dict(state["state_dict"], strict=False)
         elif isinstance(state, dict):
             model.load_state_dict(state, strict=False)
-        else:
-            # 直接是 model 物件的情況很少見，略過
-            pass
+
+    def _compile_action_events(self, cfg: dict, class_names: list):
+        name_to_idx = {n: i for i, n in enumerate(class_names)}
+        event_defs = {}
+        for ev, econf in cfg.items():
+            pos_idx = [name_to_idx[x] for x in econf.get("pos_labels", []) if x in name_to_idx]
+            rec_idx = [name_to_idx[x] for x in econf.get("recover_labels", []) if x in name_to_idx]
+            event_defs[ev] = {
+                "pos_idx": pos_idx,
+                "rec_idx": rec_idx,
+                "trigger_thr":    float(econf.get("trigger_thr", 0.80)),
+                "recover_thr":    float(econf.get("recover_thr", 0.60)),
+                "trigger_consec": int(econf.get("trigger_consec", 2)),
+                "recover_consec": int(econf.get("recover_consec", 2)),
+            }
+            if not pos_idx:
+                print(f"[InferManager] WARN: event '{ev}' has no valid pos_labels.")
+            if not rec_idx:
+                print(f"[InferManager] WARN: event '{ev}' has no valid recover_labels.")
+        return event_defs
+
+    @staticmethod
+    def _group_prob(indices: list, probs: list) -> float:
+        if not indices or not probs: return 0.0
+        return float(max((probs[i] for i in indices if 0 <= i < len(probs)), default=0.0))
+
+    def _update_multi_events(self, user_id: str, center_fid: int, probs: list, result_payload: dict,
+                         prev_action_name: Optional[str] = None, curr_action_name: Optional[str] = None):
+        user_map = self._multi_event_state.setdefault(user_id, {})
+        now = now_str()
+
+        for ev_name, evdef in self._event_defs.items():
+            st = user_map.setdefault(ev_name, {
+                "active": False, "start_time": None, "start_frame": None,
+                "peak_score": 0.0, "pos_streak": 0, "rec_streak": 0
+            })
+            pos_p = self._group_prob(evdef["pos_idx"], probs)
+            rec_p = self._group_prob(evdef["rec_idx"], probs)
+
+            if not st["active"]:
+                if pos_p >= evdef["trigger_thr"]:
+                    st["pos_streak"] += 1
+                    st["peak_score"] = max(st["peak_score"], pos_p)
+                else:
+                    st["pos_streak"] = 0
+                    st["rec_streak"] = 0
+                if st["pos_streak"] >= evdef["trigger_consec"]:
+                    st.update({"active": True, "start_time": now, "start_frame": center_fid})
+                    self._emit("on_state_event_start",
+                            user_id, ev_name, st["start_time"], float(st["peak_score"]),
+                            prev_action_name, curr_action_name, result_payload)
+            else:
+                if rec_p >= evdef["recover_thr"]:
+                    st["rec_streak"] += 1
+                else:
+                    st["rec_streak"] = 0
+                if st["rec_streak"] >= evdef["recover_consec"]:
+                    end_time = now; end_frame = center_fid; peak = float(st["peak_score"])
+                    self._emit("on_state_event_recover",
+                            user_id, ev_name, st["start_time"], end_time, peak,
+                            prev_action_name, curr_action_name, result_payload)
+                    st.update({"active": False, "start_time": None, "start_frame": None,
+                            "peak_score": 0.0, "pos_streak": 0, "rec_streak": 0})
+
 
     # ---- 事件決策（只看中心幀） ----
     @staticmethod
@@ -731,17 +1007,26 @@ class StreamInferManager:
 
     async def ingest(self, user_id: str, msg: dict):
         async with self._lock(user_id):
-            t = (msg.get("type") or "").lower()
+            t = (msg.get("type") or "frame").lower()  # 預設當 frame（容錯）
             fid = int(msg.get("frame_id", -1))
             ts = int(msg.get("timestamp_ms", 0))
             img_w = float(((msg.get("image_size") or {}).get("width") or 640))
             img_h = float(((msg.get("image_size") or {}).get("height") or 480))
             buf = self._buf(user_id)
 
-            if t == "pose":
-                buf.upsert_pose(fid, ts, img_w, img_h, msg.get("persons") or [])
-            elif t == "object":
-                buf.upsert_objects(fid, ts, img_w, img_h, msg.get("detections") or [])
+            # 新鍵名優先（pose / detect），保留舊鍵名相容（persons / detections）
+            pose   = msg.get("pose")    or msg.get("persons")
+            detect = msg.get("detect")  or msg.get("detections")
+
+            # 合併包：同一訊息可能帶 pose 與/或 detect（detect 可省略）
+            if t == "frame" or (t not in ("pose","object","detect") and (pose is not None or detect is not None)):
+                if pose   is not None: buf.upsert_pose(fid, ts, img_w, img_h, pose)
+                if detect is not None: buf.upsert_objects(fid, ts, img_w, img_h, detect)
+            # 分開包仍相容
+            elif t == "pose":
+                buf.upsert_pose(fid, ts, img_w, img_h, pose or [])
+            elif t in ("object", "detect"):
+                buf.upsert_objects(fid, ts, img_w, img_h, detect or [])
             else:
                 return
 
@@ -777,13 +1062,43 @@ class StreamInferManager:
                 # 更新使用序列（定稿優先）
                 kps_seq = [ (user_cache[fr.frame_id] if fr.frame_id in finalized else fr.kps) for fr in window ]
 
-            # 4) relation map + motion + mask
+            # === (新) 依目標 FPS 做上采樣（只用 pose；dets 用左值持有） ===
+            use_kps  = kps_seq
+            use_bbox = [fr.bbox for fr in window]   # fr.bbox 是 xyxy tuple
+            use_dets = [fr.dets for fr in window]
+            win_for_feats = window                  # 給 motion/mask 用的對齊 window
+
+            if TARGET_FPS > 0:
+                in_fps = _estimate_fps([fr.ts_ms for fr in window])
+                in_fps = _normalize_in_fps(in_fps)
+
+                # 只在「目標 fps 明顯高於輸入 fps」時才重採樣，避免沒必要的運算
+                if in_fps > 0 and TARGET_FPS > in_fps * 1.02:
+                    # 安全門：若倍率太大可視需要限制，但時間軸重採樣不會增加序列長度，通常不必限制
+                    # ratio = TARGET_FPS / in_fps
+                    # if ratio > UPSAMPLE_MAX_MULT + 1e-6:  # 真的要限制可放開
+                    #     target = in_fps * UPSAMPLE_MAX_MULT
+                    # else:
+                    #     target = TARGET_FPS
+                    target = TARGET_FPS
+
+                    use_kps, use_bbox, use_dets, win_for_feats = _resample_sequences_to_fps(
+                        window, use_kps, use_bbox, use_dets, target
+                    )
+
+
+            # 4) relation map + motion + mask（改用補幀後的序列）
             clips = []
-            for i, fr in enumerate(window):
-                canvas = rasterize_frame(fr.bbox, kps_seq[i], fr.dets, fr.img_w, fr.img_h, self.cfg)
+            for i in range(len(use_kps)):
+                fr_like = win_for_feats[i]
+                canvas = rasterize_frame(use_bbox[i], use_kps[i], use_dets[i],
+                                        fr_like.img_w, fr_like.img_h, self.cfg)
                 clips.append(canvas)
+
             x = torch.from_numpy(np.stack(clips)).unsqueeze(0).float().to(DEVICE)
-            motion_feats, valid_mask = compute_motion_feats_with_mask_from_window(window, kps_seq, conf_th=KP_CONF_TH)
+            motion_feats, valid_mask = compute_motion_feats_with_mask_from_window(
+                win_for_feats, use_kps, conf_th=KP_CONF_TH
+            )
             M = torch.from_numpy(motion_feats).unsqueeze(0).float().to(DEVICE)
             mask = torch.from_numpy(valid_mask).unsqueeze(0).float().to(DEVICE)
 
@@ -890,8 +1205,11 @@ class StreamInferManager:
             center_fid = window[0].frame_id + WINDOW // 2
             commit_center = (center_fid in finalized)
             st = self._fall_state.setdefault(user_id, {
-                "active": False, "start_time": None, "start_frame": None, "peak_score": 0.0,
-                "normal_streak": 0, "started": False, "last_end_frame": None
+                "active": False,
+                "start_time": None,
+                "peak_score": 0.0,
+                "normal_streak": 0,
+                "started": False
             })
             if commit_center:
                 line = self._centerline.setdefault(user_id, {})
@@ -900,23 +1218,64 @@ class StreamInferManager:
                 # （注意：若走單模型 fallback，p_fall 已在上面單模型分支給好）
                 line[center_fid] = p_fall
                 # 事件判定（僅看最近幾個中心點）
-                # 觸發：>=0.80 連續 2 個中心幀；恢復：<=0.60 連續 2 個中心幀
                 recent_centers = sorted([k for k in line.keys() if k <= center_fid])
                 def get_last_vals(n):
                     return [line[f] for f in recent_centers[-n:]] if n>0 else []
-                TRIGGER_CONSEC = 2
-                RECOVER_CONSEC_ = RECOVER_CONSEC
-                if not st["active"]:
+
+                if (not st["active"]):
+                    # 先判斷「跌倒觸發」：連續 TRIGGER_CONSEC 個中心幀 ≥ FALL_TRIGGER_THR
                     vals = get_last_vals(TRIGGER_CONSEC)
-                    if len(vals) == TRIGGER_CONSEC and all(v >= 0.80 for v in vals):
-                        st.update({"active": True, "start_time": now_str(), "start_frame": recent_centers[-TRIGGER_CONSEC], "peak_score": max(vals)})
-                        self._emit("on_fall_start", user_id, st["start_time"], st["start_frame"], result)
+                    if len(vals) == TRIGGER_CONSEC and all(v >= FALL_TRIGGER_THR for v in vals):
+                        st.update({
+                            "active": True,
+                            "start_time": now_str(),
+                            "start_frame": recent_centers[-TRIGGER_CONSEC],
+                            "peak_score": max(vals)
+                        })
+
+                        # 準備 clip20（當前視窗的 20 幀原始資料）
+                        clip20 = {
+                            "frames": [
+                                {
+                                    "frame_id": fr.frame_id,
+                                    "ts_ms": fr.ts_ms,
+                                    "img_w": fr.img_w, "img_h": fr.img_h,
+                                    "bbox": fr.bbox,
+                                    "kps": fr.kps,
+                                    "dets": fr.dets,
+                                } for fr in window
+                            ]
+                        }
+
+                        # 送出跌倒觸發（帶 clip20）
+                        self._emit("on_fall_start", user_id, st["start_time"], result, clip20)
+
+                    else:
+                        # 沒觸發跌倒 → 才進行 multi 的坐/躺事件偵測（保留你原本這段）
+                        multi_info = None
+                        if isinstance(result, dict) and result.get("stage") == "multi":
+                            multi_info = result.get("multi") or {
+                                "pred_idx": result.get("pred_idx"),
+                                "pred": result.get("pred"),
+                                "probs": result.get("probs"),
+                            }
+                        if multi_info and multi_info.get("probs"):
+                            prev_action = self._last_action_name.get(user_id)  # 可能為 None
+                            curr_action = multi_info.get("pred")
+                            self._update_multi_events(
+                                user_id, center_fid, multi_info["probs"], result,
+                                prev_action_name=prev_action, curr_action_name=curr_action
+                            )
+                            # 更新「上一個動作」
+                            if isinstance(curr_action, str) and curr_action:
+                                self._last_action_name[user_id] = curr_action
                 else:
-                    vals = get_last_vals(RECOVER_CONSEC_)
-                    if len(vals) == RECOVER_CONSEC_ and all(v <= 0.60 for v in vals):
+                    vals = get_last_vals(RECOVER_CONSEC)
+                    if len(vals) == RECOVER_CONSEC and all(v <= FALL_RECOVER_THR for v in vals):
                         end_time = now_str(); end_frame = center_fid
-                        self._emit("on_fall_recover", user_id, st["start_time"], end_time, st["start_frame"], end_frame, float(st["peak_score"]), result)
-                        st.update({"active": False, "start_time": None, "start_frame": None, "peak_score": 0.0, "normal_streak": 0, "last_end_frame": end_frame})
+                        self._emit("on_fall_recover", user_id, st["start_time"], end_time, float(st["peak_score"]), result)
+                        st.update({"active": False, "start_time": None, "start_frame": None,
+                                "peak_score": 0.0, "normal_streak": 0, "last_end_frame": end_frame})
 
             # 7) 彈出 STRIDE 並清理對應的快取
             to_pop_ids = [fr.frame_id for fr in window[:STRIDE]]
@@ -928,11 +1287,13 @@ class StreamInferManager:
                 finalized.discard(fid_rm)
 
     def drop_user(self, user_id: str):
+        print(f"[InferManager] Drop user '{user_id}' and clear all related data.")
         self._buffers.pop(user_id, None)
         self._locks.pop(user_id, None)
         self._fall_state.pop(user_id, None)
         self._centerline.pop(user_id, None)
         self._smooth_cache.pop(user_id, None)
         self._smooth_finalized.pop(user_id, None)
+        self._last_action_name.pop(user_id, None)
 
 stream_infer_manager = StreamInferManager()
