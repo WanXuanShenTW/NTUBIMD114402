@@ -293,3 +293,5 @@ class Database:
                 print("🚨 WARNING: Connection pool is exhausted!")
         else:
             print("❌ Pool not initialized.")
+            
+    

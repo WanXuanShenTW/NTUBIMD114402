@@ -5,16 +5,16 @@ async def upsert_binding(conn, user_id: int, line_user_id: str) -> None:
     """
     一對一綁定（不改 schema）：
     先刪掉同 user_id 或同 line_user_id 的舊紀錄 → 再插入新紀錄
-    使用表：system_push_notification_account_binding
+    使用表：linebot_notification_binding
     """
     async with conn.cursor() as cur:
         await cur.execute(
-            "DELETE FROM system_push_notification_account_binding "
+            "DELETE FROM linebot_notification_binding "
             "WHERE user_id=%s OR line_user_id=%s",
             (user_id, line_user_id)
         )
         await cur.execute(
-            "INSERT INTO system_push_notification_account_binding "
+            "INSERT INTO linebot_notification_binding "
             "(user_id, line_user_id, last_bind_time) "
             "VALUES (%s, %s, NOW())",
             (user_id, line_user_id)
@@ -30,7 +30,7 @@ async def get_user_by_line_user_id(conn, line_user_id: str) -> Optional[Dict[str
         await cur.execute("""
             SELECT u.user_id, u.name, u.role_id, u.phone
             FROM users u
-            JOIN system_push_notification_account_binding b
+            JOIN linebot_notification_binding b
               ON b.user_id = u.user_id
             WHERE b.line_user_id = %s
             ORDER BY b.last_bind_time DESC
@@ -45,7 +45,7 @@ async def get_line_user_id_by_user(conn, user_id: int) -> Optional[str]:
     async with conn.cursor() as cur:
         await cur.execute("""
             SELECT line_user_id
-            FROM system_push_notification_account_binding
+            FROM linebot_notification_binding
             WHERE user_id=%s
             ORDER BY last_bind_time DESC
             LIMIT 1
@@ -56,7 +56,7 @@ async def get_line_user_id_by_user(conn, user_id: int) -> Optional[str]:
 async def unbind_by_line_user_id(conn, line_user_id: str) -> int:
     async with conn.cursor() as cur:
         await cur.execute(
-            "DELETE FROM system_push_notification_account_binding WHERE line_user_id=%s",
+            "DELETE FROM linebot_notification_binding WHERE line_user_id=%s",
             (line_user_id,)
         )
         affected = cur.rowcount

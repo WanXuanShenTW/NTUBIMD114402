@@ -3,7 +3,7 @@ import asyncio
 from typing import Iterable, Dict, List, Tuple, Optional
 import httpx
 from datetime import datetime
-
+from app.db import Database
 from app.dao.notify_line_dao import (
     list_caregiver_line_uids_by_elder,
     list_line_uids_by_role,
@@ -63,14 +63,15 @@ async def notify_from_payload(
     """
     msg = build_message(status=status, message=message, detected_at=detected_at)
 
-    if elder_id is not None:
-        uids, source = await list_caregiver_line_uids_by_elder(elder_id)
-    else:
-        uids = await list_line_uids_by_role(2)
-        source = "role_broadcast"
+    async with Database.connection() as conn:
+        if elder_id is not None:
+            uids, source = await list_caregiver_line_uids_by_elder(conn, elder_id)
+        else:
+            uids = await list_line_uids_by_role(conn, 2)
+            source = "role_broadcast"
 
-    if not uids:
-        return {"status": "ok", "message": msg, "source": source, "sent": [], "failed": [], "note": "無收件者"}
+        if not uids:
+            return {"status": "ok", "message": msg, "source": source, "sent": [], "failed": [], "note": "無收件者"}
 
-    result = await push_text_bulk(uids, msg)
-    return {"status": "ok", "message": msg, "source": source, **result}
+        result = await push_text_bulk(uids, msg)
+        return {"status": "ok", "message": msg, "source": source, **result}

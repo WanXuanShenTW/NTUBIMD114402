@@ -211,11 +211,46 @@ async def webhook(request: Request):
             # 3-3) 已綁定 → 僅接受白名單指令
             if text in ALLOWED_CMDS:
                 if text == "個人資訊":
-                    # 這裡先示範固定內容，你可以改成查 DB 回傳實際資料
-                    await line_api.reply_message(ReplyMessageRequest(
-                        reply_token=event.reply_token,
-                        messages=[TextMessage(text="長者 1 的個人資訊（示範）")]
-                    ))
+                    try:
+                        # 獲取當前照護的長者資訊
+                        elder_info = await resolve_current_elder(uid)
+                        if elder_info:
+                            # 格式化個人資訊
+                            name = elder_info.get("elder_name", "未提供")
+                            phone = elder_info.get("elder_phone", "未提供") 
+                            gender = elder_info.get("elder_gender", "未提供")
+                            address = elder_info.get("elder_address", "未提供")
+                            
+                            # 格式化性別顯示
+                            if gender in ['M', 'male', '男']:
+                                gender_display = '男'
+                            elif gender in ['F', 'female', '女']:
+                                gender_display = '女'
+                            else:
+                                gender_display = gender if gender else "未提供"
+                            
+                            # 格式化輸出文字
+                            formatted_info = f"""{name}的個人資訊：
+姓名：{name}
+電話：{phone}
+性別：{gender_display}
+住址：{address}"""
+                            
+                            await line_api.reply_message(ReplyMessageRequest(
+                                reply_token=event.reply_token,
+                                messages=[TextMessage(text=formatted_info)]
+                            ))
+                        else:
+                            await line_api.reply_message(ReplyMessageRequest(
+                                reply_token=event.reply_token,
+                                messages=[TextMessage(text="❌ 目前沒有照護的長者資訊，請確認是否已正確綁定帳號")]
+                            ))
+                    except Exception as e:
+                        print(f"查詢個人資訊時發生錯誤: {e}")
+                        await line_api.reply_message(ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[TextMessage(text="❌ 查詢個人資訊時發生錯誤，請稍後再試或聯繫系統管理員")]
+                        ))
                     continue
 
                 if text == "我的長者":
