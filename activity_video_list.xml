@@ -52,6 +52,27 @@
         android:textColor="#333333"
         android:gravity="center_horizontal" />
 
+    <!-- 狀態類別選單 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingStart="20dp"
+        android:paddingEnd="20dp"
+        android:layout_marginTop="10dp"
+        android:layout_marginBottom="6dp"
+        android:gravity="center_vertical">
+
+        <Spinner
+            android:id="@+id/spinnerCategory"
+            android:layout_width="match_parent"
+            android:layout_height="44dp"
+            android:background="@drawable/bg_spinner_ripple"
+            android:spinnerMode="dropdown"
+            android:paddingStart="12dp"
+            android:paddingEnd="12dp"/>
+    </LinearLayout>
+
     <!-- 內容區（列表/空狀態/載入中） -->
     <FrameLayout
         android:layout_width="match_parent"
@@ -70,8 +91,8 @@
                 android:layout_height="match_parent"
                 android:paddingStart="20dp"
                 android:paddingEnd="20dp"
-                android:paddingTop="8dp"
-                android:paddingBottom="8dp"
+                android:paddingTop="2dp"
+                android:paddingBottom="2dp"
                 android:clipToPadding="false"/>
         </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
 
@@ -82,7 +103,7 @@
             android:layout_height="48dp"
             android:layout_gravity="center"/>
 
-        <!-- 空畫面 / 錯誤畫面 -->
+        <!-- 空畫面 / 錯誤畫面（已移除重新整理按鈕） -->
         <LinearLayout
             android:id="@+id/emptyState"
             android:layout_width="match_parent"
@@ -96,18 +117,9 @@
                 android:id="@+id/emptyView"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="目前沒有跌倒事件"
+                android:text="請先選擇類別"
                 android:textSize="16sp"
                 android:textColor="#666666"/>
-
-            <Button
-                android:id="@+id/btnRetry"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="重新整理"
-                android:layout_marginTop="12dp"
-                android:textColor="@android:color/white"
-                android:backgroundTint="#4F4F4F"/>
         </LinearLayout>
     </FrameLayout>
 </LinearLayout>
