@@ -53,27 +53,44 @@ class VideoListActivity : AppCompatActivity() {
 
         spinnerCategory = findViewById(R.id.spinnerCategory)
 
-        // 第 0 項是提示（灰色、不可選）
-        val categories = listOf("選擇類別", "跌倒列表", "互動報告")
+        // 顯示文字
+        val categories = listOf("— 選擇類別", "跌倒列表", "互動報告")
+// 對應圖示（第 0 項不顯示）
+        val icons = listOf(0, R.drawable.ic_fall_24, R.drawable.ic_report_24)
 
         val spinAdapter = object : ArrayAdapter<String>(
-            this, R.layout.item_spinner_text, categories
+            this, R.layout.item_spinner_icon, categories
         ) {
-            override fun isEnabled(position: Int): Boolean = position != 0
-            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val v = super.getDropDownView(position, convertView, parent) as TextView
-                v.setTextColor(if (position == 0) 0xFF9E9E9E.toInt() else 0xFF333333.toInt())
-                return v
+            override fun isEnabled(position: Int) = position != 0
+
+            private fun colorFor(position: Int) =
+                if (position == 0) 0xFF9E9E9E.toInt() else 0xFF333333.toInt()
+
+            private fun bind(tv: TextView, position: Int) {
+                tv.setTextColor(colorFor(position))
+                val iconRes = icons.getOrNull(position) ?: 0
+                val icon = if (position == 0 || iconRes == 0) null
+                else ContextCompat.getDrawable(context, iconRes)
+                tv.setCompoundDrawablesRelativeWithIntrinsicBounds(icon, null, null, null)
             }
+
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val v = super.getView(position, convertView, parent) as TextView
-                v.setTextColor(if (position == 0) 0xFF9E9E9E.toInt() else 0xFF333333.toInt())
-                return v
+                val tv = super.getView(position, convertView, parent) as TextView
+                bind(tv, position)
+                return tv
             }
-        }.also { it.setDropDownViewResource(R.layout.item_spinner_text) }
+
+            override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val tv = super.getDropDownView(position, convertView, parent) as TextView
+                bind(tv, position)
+                return tv
+            }
+        }.also {
+            it.setDropDownViewResource(R.layout.item_spinner_icon)
+        }
 
         spinnerCategory.adapter = spinAdapter
-        spinnerCategory.setSelection(0, false) // 停在「選擇類別」，不觸發 onItemSelected
+        spinnerCategory.setSelection(0, false)
 
         spinnerCategory.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
