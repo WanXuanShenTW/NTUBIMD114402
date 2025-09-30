@@ -5,13 +5,14 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Bundle
-import android.text.method.ScrollingMovementMethod
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
@@ -20,19 +21,28 @@ import java.util.Locale
 
 class VoiceResultActivity : AppCompatActivity() {
 
-    private lateinit var tvLog: TextView
+    // === 新增：聊天資料與 UI ===
+    private lateinit var rvChat: RecyclerView
+    private lateinit var tvTyping: TextView
+    private val items = mutableListOf<ChatMessage>()
+    private lateinit var chatAdapter: ChatAdapter
+
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
 
-    // 只顯示 partial，final 交給 ACTION_USER_UTTER（避免重複）
+    // 只顯示 partial 在 tvTyping，final 交給 ACTION_USER_UTTER
     private val sttReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action != MainActivity.ACTION_STT_UPDATE) return
             val text = intent.getStringExtra(MainActivity.EXTRA_STT_TEXT).orEmpty()
             val isPartial = intent.getBooleanExtra(MainActivity.EXTRA_STT_IS_PARTIAL, false)
-            if (text.isBlank() || !isPartial) return
-
-            val ts = timeFmt.format(Date())
-            appendLine("[$ts] [長輩·聽寫中] $text…")
+            if (text.isBlank() || !isPartial) {
+                // 若空白或不是 partial，就隱藏「聽寫中」
+                tvTyping.text = ""
+                tvTyping.visibility = TextView.GONE
+                return
+            }
+            tvTyping.text = "［長輩·聽寫中］$text…"
+            tvTyping.visibility = TextView.VISIBLE
         }
     }
 
@@ -55,11 +65,11 @@ class VoiceResultActivity : AppCompatActivity() {
             val elderIdFromIntent = intent.getIntExtra(MainActivity.EXTRA_ELDER_ID, -1)
             val currentElderId = getSharedPreferences("app", Context.MODE_PRIVATE)
                 .getInt("elder_id", 1)
-
             if (elderIdFromIntent > 0 && elderIdFromIntent != currentElderId) {
                 return
             }
-            val ts = timeFmt.format(Date())
+
+            val ts = System.currentTimeMillis()
             val sessionId = run {
                 val sidInt = intent.getIntExtra(MainActivity.EXTRA_SESSION_ID, Int.MIN_VALUE)
                 if (sidInt != Int.MIN_VALUE) sidInt.toString()
@@ -70,41 +80,43 @@ class VoiceResultActivity : AppCompatActivity() {
                 // ✅ 長輩 final：讀 STT 用的 key，不要再用 EXTRA_AI_TEXT
                 MainActivity.ACTION_USER_UTTER -> {
                     val text =
-                        intent.getStringExtra(MainActivity.EXTRA_STT_TEXT) // STT final 用的 key
-                            ?: intent.getStringExtra(MainActivity.EXTRA_AI_TEXT) // 最後容錯
+                        intent.getStringExtra(MainActivity.EXTRA_STT_TEXT)
+                            ?: intent.getStringExtra(MainActivity.EXTRA_AI_TEXT)
                             ?: ""
 
+                    // 收到 final 時，隱藏「聽寫中」
+                    tvTyping.text = ""
+                    tvTyping.visibility = TextView.GONE
+
                     if (text.isNotBlank()) {
-                        appendLine("[$ts] [長輩] $text" + sessionSuffix(sessionId))
+                        addMessage(ChatMessage(ts, Sender.ELDER, text, sessionId))
                         writeTranscript("final", text)
                     }
                 }
 
                 MainActivity.ACTION_AI_REPLY -> {
                     val text = intent.getStringExtra(MainActivity.EXTRA_AI_TEXT).orEmpty()
-                    val audioUrl = intent.getStringExtra(MainActivity.EXTRA_AI_AUDIO_URL).orEmpty()
-                    val show = when {
-                        text.isNotBlank() && audioUrl.isNotBlank() -> "$text"
-                        text.isNotBlank() -> text
-                        audioUrl.isNotBlank() -> "（AI 已回覆並播放語音）"
-                        else -> "（AI 回覆為空）"
-                    }
-                    appendLine("[$ts] [AI] $show" + sessionSuffix(sessionId))
-                    // 即使只播了語音也記錄下來，方便之後回看
+                    // 即使只有播語音也記一條（文字空就顯示「（AI 曾播放語音回覆）」）
+                    val displayText = text.ifBlank { "（AI 曾播放語音回覆）" }
+                    addMessage(ChatMessage(ts, Sender.AI, displayText, sessionId))
                     writeTranscript("ai", text.ifBlank { "" })
                 }
             }
         }
     }
-    private fun sessionSuffix(sessionId: String): String =
-        if (sessionId.isNotBlank()) "  (sess:$sessionId)" else ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_voice_result)
 
-        tvLog = findViewById(R.id.tvLog)
-        tvLog.movementMethod = ScrollingMovementMethod()
+        rvChat = findViewById(R.id.rvChat)
+        tvTyping = findViewById(R.id.tvTyping)
+
+        rvChat.layoutManager = LinearLayoutManager(this).apply {
+            stackFromEnd = true
+        }
+        chatAdapter = ChatAdapter(items, timeFmt)
+        rvChat.adapter = chatAdapter
 
         loadTranscript() // 載入歷史 final/ai 記錄
 
@@ -128,16 +140,20 @@ class VoiceResultActivity : AppCompatActivity() {
             f.parentFile?.mkdirs()
             f.appendText(obj.toString() + "\n", Charsets.UTF_8)
         } catch (_: Exception) {
-            // 可視需要加上 Log.e
+            // 可以視需要 Log.e
         }
     }
 
     private fun clearTranscript() {
-        tvLog.text = ""
+        // 清空畫面資料
+        items.clear()
+        chatAdapter.notifyDataSetChanged()
+        // 清空檔案
         val f = getTranscriptFile()
-        if (f.exists()) {
-            f.delete()
-        }
+        if (f.exists()) f.delete()
+        // 也把「聽寫中」收起來
+        tvTyping.text = ""
+        tvTyping.visibility = TextView.GONE
     }
 
     override fun onResume() {
@@ -150,7 +166,6 @@ class VoiceResultActivity : AppCompatActivity() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
-        // 長輩與 AI 的對話廣播
         val chatFilter = IntentFilter().apply {
             addAction(MainActivity.ACTION_USER_UTTER)
             addAction(MainActivity.ACTION_AI_REPLY)
@@ -170,45 +185,110 @@ class VoiceResultActivity : AppCompatActivity() {
         runCatching { unregisterReceiver(chatReceiver) }
     }
 
-    // 載入歷史：同時讀「final」(長輩) 與「ai」(AI)
+    // 載入歷史：把 "final"=長輩、"ai"=AI 轉成泡泡列表
     private fun loadTranscript() {
         val f = getTranscriptFile()
         if (!f.exists()) {
-            tvLog.text = ""
+            items.clear()
+            chatAdapter.notifyDataSetChanged()
             return
         }
 
-        val sb = StringBuilder()
+        val list = mutableListOf<ChatMessage>()
         f.bufferedReader(Charsets.UTF_8).useLines { lines ->
             lines.forEach { ln ->
                 val obj = runCatching { JSONObject(ln) }.getOrNull() ?: return@forEach
                 val t    = obj.optLong("ts", 0L)
                 val text = obj.optString("text", "")
-                val type = obj.optString("type", "final") // "final"=長輩, "ai"=AI
-                val tsStr = if (t > 0) timeFmt.format(Date(t)) else "--:--:--"
-
-                when (type) {
-                    "final" -> if (text.isNotBlank())
-                        sb.append("[$tsStr] [長輩] ").append(text).append('\n')
-                    "ai"    -> sb.append("[$tsStr] [AI] ")
-                        .append(text.ifBlank { "（AI 曾播放語音回覆）🔊" })
-                        .append('\n')
-                    else    -> { /* 其他類型略過 */ }
+                val type = obj.optString("type", "final")
+                val sender = if (type == "ai") Sender.AI else Sender.ELDER
+                // 空字串的 AI 代表當時只有播語音，仍顯示一則提示
+                val display = if (sender == Sender.AI && text.isBlank()) "（AI 曾播放語音回覆）" else text
+                if (display.isNotBlank() || sender == Sender.AI) {
+                    list.add(ChatMessage(t, sender, display))
                 }
             }
         }
-        tvLog.text = sb.toString()
+        items.clear()
+        items.addAll(list)
+        chatAdapter.notifyDataSetChanged()
         scrollToBottom()
     }
 
-    private fun appendLine(line: String) {
-        tvLog.append(line + "\n")
+    private fun addMessage(msg: ChatMessage) {
+        items.add(msg)
+        chatAdapter.notifyItemInserted(items.lastIndex)
         scrollToBottom()
     }
 
     private fun scrollToBottom() {
-        val layout = tvLog.layout ?: return
-        val scrollAmount = layout.getLineTop(tvLog.lineCount) - tvLog.height
-        tvLog.scrollTo(0, if (scrollAmount > 0) scrollAmount else 0)
+        if (items.isNotEmpty()) {
+            rvChat.scrollToPosition(items.lastIndex)
+        }
+    }
+
+    // ====== 下方是簡易資料類與 Adapter（直接放同檔案最省事） ======
+    enum class Sender { ELDER, AI }
+
+    data class ChatMessage(
+        val ts: Long,
+        val sender: Sender,
+        val text: String,
+        val sessionId: String = ""
+    )
+
+    private class ChatAdapter(
+        private val data: List<ChatMessage>,
+        private val timeFmt: SimpleDateFormat
+    ) : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+
+        companion object {
+            private const val TYPE_ELDER = 0
+            private const val TYPE_AI = 1
+        }
+
+        override fun getItemViewType(position: Int): Int {
+            return if (data[position].sender == Sender.ELDER) TYPE_ELDER else TYPE_AI
+        }
+
+        override fun onCreateViewHolder(parent: android.view.ViewGroup, viewType: Int): RecyclerView.ViewHolder {
+            val inflater = android.view.LayoutInflater.from(parent.context)
+            return if (viewType == TYPE_ELDER) {
+                val v = inflater.inflate(R.layout.item_chat_elder, parent, false)
+                ElderVH(v)
+            } else {
+                val v = inflater.inflate(R.layout.item_chat_ai, parent, false)
+                AIVH(v)
+            }
+        }
+
+        override fun getItemCount(): Int = data.size
+
+        override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+            val item = data[position]
+            val tsStr = if (item.ts > 0) timeFmt.format(Date(item.ts)) else "--:--:--"
+            when (holder) {
+                is ElderVH -> holder.bind(item.text, tsStr, item.sessionId)
+                is AIVH -> holder.bind(item.text, tsStr, item.sessionId)
+            }
+        }
+
+        private class ElderVH(v: android.view.View) : RecyclerView.ViewHolder(v) {
+            private val tvMsg: TextView = v.findViewById(R.id.tvMsg)
+            private val tvTime: TextView = v.findViewById(R.id.tvTime)
+            fun bind(text: String, time: String, sessionId: String) {
+                tvMsg.text = text
+                tvTime.text = if (sessionId.isNotBlank()) "$time · sess:$sessionId" else time
+            }
+        }
+
+        private class AIVH(v: android.view.View) : RecyclerView.ViewHolder(v) {
+            private val tvMsg: TextView = v.findViewById(R.id.tvMsg)
+            private val tvTime: TextView = v.findViewById(R.id.tvTime)
+            fun bind(text: String, time: String, sessionId: String) {
+                tvMsg.text = text
+                tvTime.text = if (sessionId.isNotBlank()) "$time · sess:$sessionId" else time
+            }
+        }
     }
 }

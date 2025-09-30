@@ -31,7 +31,6 @@
             android:layout_marginStart="8dp"/>
     </LinearLayout>
 
-    <!-- 滿版分隔線（用負邊距撐到左右邊） -->
     <View
         android:layout_width="match_parent"
         android:layout_height="1dp"
@@ -68,17 +67,25 @@
             android:adjustViewBounds="true"
             android:padding="4dp"
             android:layout_marginEnd="16dp"/>
-
     </LinearLayout>
 
-    <!-- 紀錄區（可捲動） -->
-    <TextView
-        android:id="@+id/tvLog"
+    <!-- 聊天列表 -->
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvChat"
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:textSize="16sp"
-        android:padding="12dp"
-        android:background="#F3F3F3"
         android:overScrollMode="always" />
+
+    <!-- 聽寫中提示（只顯示 partial） -->
+    <TextView
+        android:id="@+id/tvTyping"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="［長輩·聽寫中］"
+        android:textSize="14sp"
+        android:textColor="#666"
+        android:paddingTop="6dp"
+        android:paddingBottom="6dp"
+        android:visibility="gone"/>
 </LinearLayout>

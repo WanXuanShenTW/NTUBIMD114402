@@ -48,6 +48,7 @@ import androidx.core.view.updateLayoutParams
 import android.widget.FrameLayout
 import kotlin.math.roundToInt
 import android.content.IntentFilter
+import android.util.Base64
 
 
 class MainActivity : AppCompatActivity() {
@@ -68,10 +69,36 @@ class MainActivity : AppCompatActivity() {
     private var imageAnalysis: ImageAnalysis? = null
     private lateinit var cameraExecutor: ExecutorService
 
+    // 在類別欄位加兩個快取（用於 overlay）：
+    private var lastPoseForOverlay: PoseResult? = null
+    private var lastObjForOverlay: ObjectResult? = null
+    private var poseBurstCounter = 0
+
     // FPS 控制
     private var targetFps: Int = 10
     private var allowProcess = false
     private var lastProcessTimeMs = 0L
+
+    // ==== 新增：推論與傳送的時間戳與結果快取 ====
+    // 推論節奏（毫秒）
+    private val POSE_INFER_MS = 200L
+    private val DETECT_INFER_MS = 1000L
+
+    private var lastPoseInferAt = 0L
+    private var lastDetectInferAt = 0L
+
+    // 最後一次成功推論的結果（送包與畫面都用這份）
+    @Volatile private var lastPoseResult: PoseResult? = null
+    @Volatile private var lastObjResult: ObjectResult? = null
+
+    // 送包節拍器
+    private var senderHandler: Handler? = null
+    private var senderRunnable: Runnable? = null
+    private var senderThread: android.os.HandlerThread? = null
+
+    @Volatile private var lastFrameW: Int = 0
+    @Volatile private var lastFrameH: Int = 0
+
 
     companion object {
         private const val CAMERA_PERMISSION_CODE = 1001
@@ -104,12 +131,22 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ws: WsManager
     private var frameId: Long = 0
     // 把你的 WS 位址換成實際值（支援 ws:// 或 wss://）
-    private val WS_URL = "wss://95a66165dfe2.ngrok-free.app/ws/pose?user_id=3"
+    private val WS_URL = "wss://6e8e59bcc446.ngrok-free.app/ws/pose?user_id=3"
 
     private lateinit var switchSendWs: SwitchCompat
     @Volatile private var sendWsEnabled = false
     // 是否在 overlay 繪製（用來測吞吐）
     @Volatile private var renderEnabled = true
+
+    // WS 節流參數
+    private var lastWsSendAt = 0L
+    private var wsTargetFps = 8
+    // 傳輸頻率（Pose 5fps、Detect 2.5fps）
+    private var lastPoseSendAt = 0L
+    private var lastDetectSendAt = 0L
+    private val POSE_SEND_FPS = 5.0
+    private val DETECT_SEND_FPS = 2.5
+
 
     // 開關：執行哪種偵測
     @Volatile private var objectDetectEnabled = true
@@ -170,6 +207,8 @@ class MainActivity : AppCompatActivity() {
     private val audioManager by lazy { getSystemService(Context.AUDIO_SERVICE) as AudioManager }
     private var playbackFocusRequest: android.media.AudioFocusRequest? = null
 
+    private var ttsPlayer: MediaPlayer? = null
+
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -187,6 +226,8 @@ class MainActivity : AppCompatActivity() {
         switchRenderBoxes  = findViewById(R.id.switchRenderBoxes)
         switchObjectDetect = findViewById(R.id.switchObjectDetect)
         switchPoseDetect   = findViewById(R.id.switchPoseDetect)
+        switchSendWs       = findViewById(R.id.switchSendWs)
+
         classes = readClasses()
         recordVoiceButton = findViewById(R.id.saveVoiceButton)
         statusText = findViewById(R.id.statusText)
@@ -272,32 +313,53 @@ class MainActivity : AppCompatActivity() {
         switchPoseDetect.setOnCheckedChangeListener   { _, isChecked -> poseDetectEnabled   = isChecked }
 
         btnBackToImage.setOnClickListener { finish() }
+
         btnStartInfer.setOnClickListener {
-            allowProcess = true
-            lastProcessTimeMs = 0L
-            if (!sendWsEnabled) {
-                switchSendWs.isChecked = true   // 會觸發你現有的 connect() 流程
+            try {
+                lastPoseSendAt = 0L
+                lastDetectSendAt = 0L
+                allowProcess = true
+                lastProcessTimeMs = 0L
+                if (!sendWsEnabled) {
+                    // 用 post 避免同一次點擊引發 listener 裡又改 UI 造成奇怪 re-entrancy
+                    switchSendWs.post { switchSendWs.isChecked = true }
+                }
+                Toast.makeText(this, "開始以 $targetFps fps 擷取幀", Toast.LENGTH_SHORT).show()
+            } catch (t: Throwable) {
+                Log.e(TAG, "start infer click crashed", t)
             }
-            Toast.makeText(this, "開始以 $targetFps fps 擷取幀", Toast.LENGTH_SHORT).show()
-        }
-        btnStopInfer.setOnClickListener {
-            allowProcess = false
-            Toast.makeText(this, "已停止擷取幀", Toast.LENGTH_SHORT).show()
         }
 
-        // WebSocket
+        btnStopInfer.setOnClickListener {
+            allowProcess = false
+            lastProcessTimeMs = 0L
+            stopSenderLoop()
+            if (sendWsEnabled) switchSendWs.isChecked = false
+            Toast.makeText(this, "已停止", Toast.LENGTH_SHORT).show()
+        }
+
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            Log.e(TAG, "FATAL", e)
+        }
+
         ws = WsManager(WS_URL)
-        switchSendWs = findViewById(R.id.switchSendWs)
-        sendWsEnabled = switchSendWs.isChecked
+
         switchSendWs.setOnCheckedChangeListener { _, isChecked ->
             sendWsEnabled = isChecked
             if (isChecked) {
+                lastPoseSendAt = 0L
+                lastDetectSendAt = SystemClock.elapsedRealtime()
                 ws.connect(
                     onState = { ok, err -> if (!ok) Log.w(TAG, "WS connect failed: $err") },
                     onMessage = { msg -> handleServerMessage(msg) }
                 )
+                startSenderLoop()
             } else {
+                stopSenderLoop()
                 ws.close()
+            }
+            Thread.setDefaultUncaughtExceptionHandler { _, e ->
+                Log.e(TAG, "FATAL (default handler)", e)
             }
         }
     }
@@ -400,16 +462,121 @@ class MainActivity : AppCompatActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    fun decodeBase64Audio(b64: String): ByteArray {
+        // 去空白/換行，避免出錯
+        val clean = b64.trim().replace("\\s".toRegex(), "")
+        // 若來源是 URL-safe 的（含 -/_），可改用 Base64.URL_SAFE
+        return Base64.decode(clean, Base64.DEFAULT)
+    }
+
+    // 1) 直接播 MP3 bytes（先存到 cache，再用 FileDescriptor 播放）
+    fun playMp3Bytes(
+        bytes: ByteArray,
+        onDone: (() -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ) {
+        try { ttsPlayer?.release() } catch (_: Exception) {}
+        ttsPlayer = null
+
+        onAiSpeakingStart()
+        pauseVoiceStuffForPlayback()
+
+        try {
+            val f = File(cacheDir, "tts_${System.currentTimeMillis()}.mp3")
+            var fis: FileInputStream? = null
+
+            // 確保檔案完整寫入
+            FileOutputStream(f).use { fos ->
+                fos.write(bytes)
+                fos.flush()
+                fos.fd.sync()
+            }
+
+            val p = MediaPlayer()
+            ttsPlayer = p
+
+            // 一定要在 prepared/complete 後才關閉 fis
+            fis = FileInputStream(f)
+            p.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            p.setDataSource(fis.fd)
+
+            p.setOnPreparedListener { mp ->
+                // (可選) audio focus
+                // requestPlaybackFocus()
+                mp.start()
+            }
+            p.setOnCompletionListener { mp ->
+                try { fis?.close() } catch (_: Exception) {}
+                try { f.delete() } catch (_: Exception) {}
+                // abandonPlaybackFocus()
+                mp.release()
+                ttsPlayer = null
+                resumeVoiceStuffAfterPlayback()
+                onAiSpeakingDone()
+                onDone?.invoke()
+            }
+            p.setOnErrorListener { mp, what, extra ->
+                try { fis?.close() } catch (_: Exception) {}
+                try { f.delete() } catch (_: Exception) {}
+                // abandonPlaybackFocus()
+                mp.release()
+                ttsPlayer = null
+                resumeVoiceStuffAfterPlayback()
+                onAiSpeakingDone()
+                onError?.invoke(RuntimeException("MediaPlayer error $what/$extra"))
+                true
+            }
+            p.prepareAsync()
+
+        } catch (e: Exception) {
+            resumeVoiceStuffAfterPlayback()
+            onAiSpeakingDone()
+            onError?.invoke(e)
+        }
+    }
+
+    // MainActivity 內
+    fun handleTtsResponse(bodyString: String) {
+        val trimmed = bodyString.trim()
+
+        val rootObj = if (trimmed.startsWith("[")) {
+            val arr = org.json.JSONArray(trimmed)
+            if (arr.length() == 0) throw IllegalArgumentException("empty array")
+            arr.getJSONObject(0)
+        } else {
+            org.json.JSONObject(trimmed)
+        }
+
+        val audioObj = rootObj.getJSONObject("audio_data")
+        val b64 = audioObj.getString("data")
+
+        val clean = b64.trim().replace("\\s".toRegex(), "")
+        val mp3Bytes = android.util.Base64.decode(clean, android.util.Base64.DEFAULT)
+
+        playMp3Bytes(
+            bytes = mp3Bytes,
+            onError = { e -> Log.e("TTS", "play bytes failed", e) }
+        )
+    }
+
     private fun analyzeFrame(image: ImageProxy) {
         try {
             val now = SystemClock.elapsedRealtime()
             val interval = (1000L / targetFps.coerceAtLeast(1))
             val shouldProcess = allowProcess && (now - lastProcessTimeMs >= interval)
-
             if (shouldProcess) {
                 lastProcessTimeMs = now
                 val bmp = imageProxyToBitmapRGBA(image)
-                processFrame(bmp)
+                try {
+                    processFrame(bmp)  // ← 包起來
+                } catch (t: Throwable) {
+                    Log.e(TAG, "processFrame crashed", t)
+                }
             }
         } catch (e: Exception) {
             Log.e(TAG, "analyzeFrame error", e)
@@ -418,30 +585,33 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 將 ImageProxy (RGBA_8888) 轉 Bitmap（處理 rowStride 補齊 + 旋正）
     private fun imageProxyToBitmapRGBA(image: ImageProxy): Bitmap {
         val plane = image.planes[0]
         val srcW = image.width
         val srcH = image.height
         val rowStride = plane.rowStride
-        val pixelStride = plane.pixelStride
+        val pixelStride = plane.pixelStride // 對 RGBA_8888 會是 4
 
         val buffer = plane.buffer
         buffer.rewind()
 
-        val bmp = Bitmap.createBitmap(srcW, srcH, Bitmap.Config.ARGB_8888)
-        if (rowStride == srcW * pixelStride) {
-            bmp.copyPixelsFromBuffer(buffer)
-        } else {
-            val row = ByteArray(rowStride)
-            var y = 0
-            while (y < srcH) {
-                buffer.get(row, 0, rowStride)
-                bmp.copyPixelsFromBuffer(ByteBuffer.wrap(row, 0, srcW * pixelStride))
-                y++
-            }
+        // 把每一列的有效像素（srcW * pixelStride）拷到連續的大陣列
+        val rowBytes = srcW * pixelStride
+        val all = ByteArray(srcH * rowBytes)
+        val rowTmp = ByteArray(rowStride)
+
+        var dstOff = 0
+        repeat(srcH) {
+            buffer.get(rowTmp, 0, rowStride)
+            // 只取前面有效的部分（忽略 padding）
+            System.arraycopy(rowTmp, 0, all, dstOff, rowBytes)
+            dstOff += rowBytes
         }
 
+        val bmp = Bitmap.createBitmap(srcW, srcH, Bitmap.Config.ARGB_8888)
+        bmp.copyPixelsFromBuffer(ByteBuffer.wrap(all))
+
+        // 依裝置回報角度旋正
         val degrees = image.imageInfo.rotationDegrees
         if (degrees == 0) return bmp
         val m = android.graphics.Matrix().apply { postRotate(degrees.toFloat()) }
@@ -729,53 +899,61 @@ class MainActivity : AppCompatActivity() {
         runOnUiThread { statusText.text = "AI：$text" }
     }
 
-    private var ttsPlayer: MediaPlayer? = null
-
+    // 2) 播放 URL 或本地路徑：本地路徑用 FileDescriptor，並保持 fis 開著
     fun playTtsFromUrl(url: String, answerText: String) {
         runOnUiThread {
-            try {
-                // 播放前先停掉舊的
-                ttsPlayer?.release()
+            try { ttsPlayer?.release() } catch (_: Exception) {}
+            ttsPlayer = null
+
+            onAiSpeakingStart()
+            pauseVoiceStuffForPlayback()
+
+            val p = MediaPlayer()
+            ttsPlayer = p
+
+            var fis: FileInputStream? = null
+            p.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+
+            if (url.startsWith("/")) {
+                // 本地檔案：用 FileDescriptor，比字串路徑穩
+                val f = File(url)
+                fis = FileInputStream(f)
+                p.setDataSource(fis.fd)
+            } else {
+                // 遠端 URL 照舊
+                p.setDataSource(url)
+            }
+
+            p.setOnPreparedListener { mp ->
+                // requestPlaybackFocus()
+                mp.start()
+            }
+            p.setOnCompletionListener { mp ->
+                try { fis?.close() } catch (_: Exception) {}
+                // abandonPlaybackFocus()
+                mp.release()
                 ttsPlayer = null
-
-                onAiSpeakingStart()
-                pauseVoiceStuffForPlayback() // 停掉 STT / 背景監聽，避免搶麥
-
-                val player = MediaPlayer().apply {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .build()
-                    )
-                    setDataSource(url)
-                    setOnPreparedListener { start() }
-                    setOnCompletionListener {
-                        resumeVoiceStuffAfterPlayback()
-                        onAiSpeakingDone()
-                        release()
-                        ttsPlayer = null
-                    }
-                    setOnErrorListener { _, what, extra ->
-                        Log.e("TTS", "播放錯誤: $what/$extra")
-                        resumeVoiceStuffAfterPlayback()
-                        onAiSpeakingDone()
-                        release()
-                        ttsPlayer = null
-                        true
-                    }
-                    prepareAsync()
-                }
-                ttsPlayer = player
-
-            } catch (e: Exception) {
-                Log.e("TTS", "播放失敗: ${e.message}", e)
                 resumeVoiceStuffAfterPlayback()
                 onAiSpeakingDone()
             }
+            p.setOnErrorListener { mp, what, extra ->
+                try { fis?.close() } catch (_: Exception) {}
+                // abandonPlaybackFocus()
+                Log.e("TTS", "播放錯誤: $what/$extra")
+                mp.release()
+                ttsPlayer = null
+                resumeVoiceStuffAfterPlayback()
+                onAiSpeakingDone()
+                true
+            }
+            p.prepareAsync()
         }
     }
-
 
     private fun sttErrorName(code: Int) = when (code) {
         1 -> "NETWORK_TIMEOUT"
@@ -796,28 +974,26 @@ class MainActivity : AppCompatActivity() {
 
             val text = intent.getStringExtra(EXTRA_AI_TEXT).orEmpty()
             val audioUrl = intent.getStringExtra(EXTRA_AI_AUDIO_URL)
+            val payload = intent.getStringExtra("EXTRA_AI_PAYLOAD")
 
-            appendTranscript(text, "ai")
-
+            // 只有有文字才記錄
             if (text.isNotBlank()) {
                 appendTranscript(text, "ai")
             }
 
             if (!audioUrl.isNullOrBlank()) {
+                // 有 URL（或本機檔路徑）就播放
                 playTtsFromUrl(audioUrl, text)
             } else {
-                showAiAnswer(text)
-                uiHandler.postDelayed({ startSttIfPermitted() }, 200)
+                // 沒音檔時才顯示文字；若正在播音就別覆蓋 UI
+                if (text.isNotBlank() && !aiSpeaking) {
+                    showAiAnswer(text)
+                }
+                if (!aiSpeaking) {                     // ★ 只在沒播音時才重啟 STT
+                    uiHandler.postDelayed({ startSttIfPermitted() }, 200)
+                }
             }
-
             Log.i(TAG_AI_REPLY, "text='${text.take(100)}' audioUrl=${audioUrl ?: "<none>"}")
-
-            if (!audioUrl.isNullOrBlank()) {
-                playTtsFromUrl(audioUrl, text)
-            } else {
-                showAiAnswer(text)
-                uiHandler.postDelayed({ startSttIfPermitted() }, 200)
-            }
         }
     }
 
@@ -991,6 +1167,27 @@ class MainActivity : AppCompatActivity() {
             val sampleRate = 16000
             val frameMs = 120L
             val silenceNeedFrames = 3
+            val hangoverFrames = 1
+            val nonElderEndFrames = 4
+            val silentDbThreshold = -48f
+            val maxSegFrames = 120
+            val preFrames = 6
+            val startStreakNeed = 1
+            val unlockStreakNeed = 2
+            val minElderFramesToUnlock = 5
+
+            var silentFrames = 0
+            var nonElderFrames = 0
+            var nonSpeechFrames = 0
+            var segFrames = 0
+            var elderStreak = 0
+            var elderFramesInSeg = 0
+            var tailFrames = 0
+            var sttRequested = false
+
+            /*
+            val frameMs = 120L
+            val silenceNeedFrames = 3
             val hangoverFrames = 2
             val nonElderEndFrames = 8
             val silentDbThreshold = -48f
@@ -1008,6 +1205,7 @@ class MainActivity : AppCompatActivity() {
             var elderFramesInSeg = 0
             var tailFrames = 0
             var sttRequested = false
+             */
 
             val pre = kotlin.collections.ArrayDeque<ByteArray>(preFrames)
             currentSegment.clear()
@@ -1022,7 +1220,7 @@ class MainActivity : AppCompatActivity() {
                 if (currentSegment.isEmpty()) return false
                 val audible = isSegmentAudible(currentSegment, silentDbThreshold + 3f)
                 val ratio = if (segFrames > 0) elderFramesInSeg.toFloat() / segFrames else 0f
-                return audible && (elderFramesInSeg >= 4 || ratio >= 0.30f)
+                return audible && elderFramesInSeg >= 6 && ratio >= 0.8f
             }
 
             fun finalizeSegment(reason: String) {
@@ -1667,7 +1865,7 @@ class MainActivity : AppCompatActivity() {
 
                     player = MediaPlayer().apply {
                         setDataSource(wavFile.absolutePath)
-                        setOnPreparedListener { start() }
+                        setOnPreparedListener { mp -> mp.start() }
                         setOnCompletionListener {
                             Toast.makeText(
                                 this@MainActivity,
@@ -1891,17 +2089,28 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
+
+        // === 暫停影像擷取（保險）===
+        allowProcess = false
+        lastProcessTimeMs = 0L
+
         // === 暫停語音相關 ===
         sttEmitAllowed = false
         sttGateDeadline = 0L
 
-        // 停止 STT
         runCatching { stt?.stopListening() }
         runCatching { stt?.cancel() }
         if (sttLoopEnabled) stopSttLoop()
 
-        // 停止背景監聽
         stopBackgroundVoiceMonitor()
+
+        // === 關閉 WebSocket，並停自動重連 ===
+        // 1) 真正關連線（WsManager.close() 會設 manualClose=true / wantReconnect=false）
+        try { ws.close(1000, "paused") } catch (_: Exception) {}
+        // 2) 更新內部旗標與 UI（避免回到前景又自動連）
+        sendWsEnabled = false
+        // 切 UI 狀態到「關」；這行會觸發你的 listener 走到 ws.close()，但我們已先 close 所以 OK
+        if (switchSendWs.isChecked) switchSendWs.isChecked = false
     }
 
     override fun onDestroy() {
@@ -2039,13 +2248,6 @@ class MainActivity : AppCompatActivity() {
     }
     override fun onStart() {
         super.onStart()
-        // 先連 WS（你原本的邏輯）
-        if (sendWsEnabled) {
-            ws.connect(
-                onState = { ok, err -> if (!ok) Log.w(TAG, "WS connect failed: $err") },
-                onMessage = { msg -> handleServerMessage(msg) }
-            )
-        }
 
         if (!aiReceiverRegistered) {
             val filter = IntentFilter(ACTION_AI_REPLY)
@@ -2061,9 +2263,6 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStop() {
         super.onStop()
-        // 先關 WS（你原本的邏輯）
-        ws.close()
-
         if (aiReceiverRegistered) {
             try { unregisterReceiver(aiReplyReceiver) } catch (_: Exception) {}
             aiReceiverRegistered = false
@@ -2112,57 +2311,42 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processFrame(bitmap: Bitmap) {
-        var objRes: ObjectResult? = null
-        var poseRes: PoseResult? = null
         var objMs = -1L
         var poseMs = -1L
+        val now = SystemClock.elapsedRealtime()
 
-        if (objectDetectEnabled) {
-            val t0 = SystemClock.elapsedRealtime()
-            objRes = objDetector.detect(bitmap, ortEnv, objSession)
-            objMs = SystemClock.elapsedRealtime() - t0
-        }
-        if (poseDetectEnabled) {
-            val t0 = SystemClock.elapsedRealtime()
-            poseRes = poseDetector.detect(bitmap, ortEnv, poseSession)
+        // 只在到時間時才跑 POSE
+        if (poseDetectEnabled && now - lastPoseInferAt >= POSE_INFER_MS) {
+            val t0 = now
+            val poseRes = poseDetector.detect(bitmap, ortEnv, poseSession)
             poseMs = SystemClock.elapsedRealtime() - t0
+            lastPoseInferAt = SystemClock.elapsedRealtime()
+            lastPoseResult = poseRes
         }
 
-        // 1~60 循環
+        // 只在到時間時才跑 DETECT
+        if (objectDetectEnabled && now - lastDetectInferAt >= DETECT_INFER_MS) {
+            val t0 = SystemClock.elapsedRealtime()
+            val objRes = objDetector.detect(bitmap, ortEnv, objSession)
+            objMs = SystemClock.elapsedRealtime() - t0
+            lastDetectInferAt = SystemClock.elapsedRealtime()
+            lastObjResult = objRes
+        }
+
         frameId = (frameId % 60) + 1
 
-        // —— 送 WS：每幀都送（就算沒偵測，也送空） —— //
-        if (sendWsEnabled) {
-            // 直接把可能為 null 的結果交給 builder（builder 內部負責輸出空陣列）
-            val poseJsonStr = buildPoseJson(frameId, bitmap, poseRes).toString()
-            val objJsonStr  = buildObjectJson(frameId, bitmap, objRes).toString()
+        // —— Overlay 與 HUD（用快取畫） —— //
+        val objResForDraw = lastObjResult
+        val poseResForDraw = lastPoseResult
 
-            // 先 pose 後 object（貼齊後端測試腳本）
-            try {
-                Log.d(TAG, "WS SEND pose len=${poseJsonStr.length}, last='${poseJsonStr.lastOrNull()}'")
-                ws.send(poseJsonStr)
-
-                Log.d(TAG, "WS SEND obj  len=${objJsonStr.length}, last='${objJsonStr.lastOrNull()}'")
-                ws.send(objJsonStr)
-            } catch (e: Exception) {
-                Log.e(TAG, "WS send error", e)
-            }
-        }
-
-
-        // Debug Log：每幀列出結果
-        Log.d(TAG, "obj=${objRes?.outputBox?.size ?: 0} (${objMs}ms), " +
-                "pose=${poseRes?.poses?.size ?: 0} (${poseMs}ms) frame=$frameId")
-
-        // —— Overlay 與 HUD（維持原行為：只有開啟的才畫） —— //
         runOnUiThread {
             overlayView.overlay.clear()
-            objRes?.let { drawDetectionsOnOverlay(overlayView, bitmap.width, bitmap.height, it.outputBox) }
-            poseRes?.let { drawPoseOnOverlay(overlayView, bitmap.width, bitmap.height, it.poses) }
+            objResForDraw?.let { drawDetectionsOnOverlay(overlayView, bitmap.width, bitmap.height, it.outputBox) }
+            poseResForDraw?.let { drawPoseOnOverlay(overlayView, bitmap.width, bitmap.height, it.poses) }
 
             val hud = buildString {
-                if (objectDetectEnabled) append("OBJ:${objRes?.outputBox?.size ?: 0} ${if (objMs>=0) "${objMs}ms" else ""}   ")
-                if (poseDetectEnabled)   append("POSE:${poseRes?.poses?.size ?: 0} ${if (poseMs>=0) "${poseMs}ms" else ""}")
+                if (objectDetectEnabled) append("OBJ:${objResForDraw?.outputBox?.size ?: 0} ${if (objMs>=0) "${objMs}ms" else ""}   ")
+                if (poseDetectEnabled)   append("POSE:${poseResForDraw?.poses?.size ?: 0} ${if (poseMs>=0) "${poseMs}ms" else ""}")
             }.trim()
             if (hud.isNotEmpty()) addTextOverlay(overlayView, hud)
 
@@ -2170,31 +2354,189 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun startSenderLoop() {
+        poseBurstCounter = 0
+        lastPoseSendAt = 0L
+        lastDetectSendAt = 0L
+
+        if (senderHandler != null) return
+
+        senderThread = android.os.HandlerThread("ws-sender").apply { start() }
+        senderHandler = Handler(senderThread!!.looper)
+
+        senderRunnable = object : Runnable {
+            override fun run() {
+                try {
+                    if (!sendWsEnabled) return
+                    val now = SystemClock.elapsedRealtime()
+                    val poseInterval = 200L     // 5 fps
+                    val detectInterval = 1000L  // 1 fps
+
+                    val wantPose = poseDetectEnabled
+                    val wantDetect = objectDetectEnabled
+
+                    // 每 200ms 送一包 Pose；每第 5 包（約每 1s）再夾 Detect
+                    if (wantPose && (now - lastPoseSendAt >= poseInterval)) {
+                        poseBurstCounter++
+
+                        val includePose = true
+                        val includeDetect = wantDetect &&
+                                (poseBurstCounter % 5 == 0) &&         // 第 5、10、15... 包
+                                (now - lastDetectSendAt >= detectInterval)
+
+                        val w = if (lastFrameW > 0) lastFrameW else 640
+                        val h = if (lastFrameH > 0) lastFrameH else 480
+
+                        if (includePose || includeDetect) {
+                            val frameJson = buildFrameJson(
+                                fid = frameId,
+                                width = w,
+                                height = h,
+                                obj = if (includeDetect) lastObjResult else null,
+                                pose = if (includePose)   lastPoseResult else null,
+                                includeDetect = includeDetect,
+                                includePose   = includePose
+                            ).toString()
+                            try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
+                            lastPoseSendAt = now
+                            if (includeDetect) lastDetectSendAt = now
+                        }
+                    } else if (!wantPose && wantDetect && (now - lastDetectSendAt >= detectInterval)) {
+                        // 只開 Detect 的備援路徑：每 1s 單獨送 Detect
+                        val w = if (lastFrameW > 0) lastFrameW else 640
+                        val h = if (lastFrameH > 0) lastFrameH else 480
+                        val frameJson = buildFrameJson(
+                            fid = frameId, width = w, height = h,
+                            obj = lastObjResult, pose = null,
+                            includeDetect = true, includePose = false
+                        ).toString()
+                        try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
+                        lastDetectSendAt = now
+                    }
+                } catch (t: Throwable) {
+                    Log.e(TAG, "sender loop crashed", t)
+                } finally {
+                    senderHandler?.postDelayed(this, 200L) // 200ms 一拍
+                }
+            }
+        }
+        senderHandler?.postDelayed(senderRunnable!!, 200L)
+    }
+
+    private fun stopSenderLoop() {
+        senderHandler?.removeCallbacksAndMessages(null)
+        senderHandler = null
+
+        senderThread?.quitSafely()
+        senderThread = null
+        senderRunnable = null
+    }
+
     private fun handleServerMessage(msg: String) {
         try {
             val j = JSONObject(msg)
-            if (j.optString("type") == "inference") {
-                val pred = j.optString("pred", "")
-                val idx  = j.optInt("pred_idx", -1)
-                val probs = j.optJSONArray("probs")
+            if (j.optString("type") != "inference") return
 
-                // 取得 pred 對應的機率 → 百分比（四捨五入到整數）
-                var pct = ""
-                if (idx >= 0 && probs != null && idx < probs.length()) {
-                    val conf = probs.optDouble(idx, Double.NaN)
-                    if (!conf.isNaN()) pct = " ${"%.0f".format(conf * 100)}%"
+            val multi = j.optJSONObject("multi")
+            val bin   = j.optJSONObject("binary")
+
+            val multiPred = multi?.optString("pred").orEmpty()
+            val multiIdx  = multi?.optInt("pred_idx", -1) ?: -1
+            val multiProbs = multi?.optJSONArray("probs")
+            val multiPct = if (multiIdx >= 0 && multiProbs != null && multiIdx < multiProbs.length())
+                (multiProbs.optDouble(multiIdx, 0.0) * 100.0).toInt() else -1
+
+            val binPred = bin?.optString("pred").orEmpty()             // "fall" 或 "non_fall"
+            val binProbs = bin?.optJSONArray("probs")
+            val binFallProb = binProbs?.optDouble(1, Double.NaN) ?: Double.NaN // probs[1] = fall 機率
+            val binThr = bin?.optDouble("thr", 0.65) ?: 0.65
+
+            val fallAlert = pushFall((binPred == "fall") && !binFallProb.isNaN() && binFallProb >= binThr)
+
+            runOnUiThread {
+                inferenceStatus.text = if (fallAlert) {
+                    "⚠️ 跌倒 ${(binFallProb * 100).toInt()}%"
+                } else {
+                    if (multiPct >= 0) "姿態：$multiPred ${multiPct}%"
+                    else "姿態：$multiPred"
                 }
-
-                runOnUiThread { inferenceStatus.text = "推論：$pred$pct" }
-            } else {
-                // 其他訊息型別：不顯示冗長內容
-                val brief = j.optString("message", j.optString("label", ""))
-                runOnUiThread { if (brief.isNotBlank()) inferenceStatus.text = brief }
             }
         } catch (_: Exception) {
             // 非 JSON 就忽略或簡短顯示
             runOnUiThread { /* inferenceStatus.text = "推論：" */ }
         }
+    }
+
+    private val fallQueue: ArrayDeque<Boolean> = ArrayDeque(3)
+    private fun pushFall(b: Boolean): Boolean {
+        if (fallQueue.size == 3) fallQueue.removeFirst()
+        fallQueue.addLast(b)
+        return fallQueue.all { it }
+    }
+
+    // 取代或並存於 buildObjectJson / buildPoseJson 旁邊
+    private fun buildFrameJson(
+        fid: Long,
+        width: Int,
+        height: Int,
+        obj: ObjectResult?,
+        pose: PoseResult?,
+        includeDetect: Boolean = true,
+        includePose: Boolean = true
+    ): JSONObject {
+        val root = JSONObject()
+        root.put("type", "frame")
+        root.put("frame_id", fid)
+        root.put("timestamp_ms", System.currentTimeMillis())
+        root.put("image_size", JSONObject().apply {
+            put("width", width)
+            put("height", height)
+        })
+
+        // detect
+        if (includeDetect) {
+            val detectArr = JSONArray()
+            obj?.outputBox?.forEach { b ->
+                val clsId = b[5].toInt()
+                val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
+                detectArr.put(JSONObject().apply {
+                    put("cls_id", clsId)
+                    put("cls_name", name)
+                    put("score", b[4].toDouble())
+                    put("bbox", JSONObject().apply {
+                        put("cx", b[0].toDouble()); put("cy", b[1].toDouble())
+                        put("w",  b[2].toDouble()); put("h",  b[3].toDouble())
+                    })
+                })
+            }
+            root.put("detect", detectArr)
+        }
+
+        // pose
+        if (includePose) {
+            val poseArr = JSONArray()
+            pose?.poses?.forEach { p ->
+                val person = JSONObject().apply {
+                    put("score", p.score.toDouble())
+                    put("bbox", JSONObject().apply {
+                        put("cx", p.box[0].toDouble()); put("cy", p.box[1].toDouble())
+                        put("w",  p.box[2].toDouble()); put("h",  p.box[3].toDouble())
+                    })
+                    val kps = JSONArray()
+                    for (kp in p.keypoints) {
+                        kps.put(JSONObject().apply {
+                            put("x", kp[0].toDouble())
+                            put("y", kp[1].toDouble())
+                            put("confidence", kp[2].toDouble())
+                        })
+                    }
+                    put("keypoints", kps)
+                }
+                poseArr.put(person)
+            }
+            root.put("pose", poseArr)
+        }
+        return root
     }
 
     // ★ 新增：建立物件偵測 JSON（與單張輸出對齊：使用 classes 名稱）
@@ -2221,7 +2563,7 @@ class MainActivity : AppCompatActivity() {
                 })
             })
         }
-        root.put("detections", arr) // 即使 res==null 也會是空陣列
+        root.put("detect", arr)
         return root
     }
 
@@ -2256,7 +2598,7 @@ class MainActivity : AppCompatActivity() {
             }
             persons.put(person)
         }
-        root.put("persons", persons) // 即使 res==null 也會是空陣列
+        root.put("pose", persons)
         return root
     }
 }
