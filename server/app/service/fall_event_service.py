@@ -1,7 +1,7 @@
 import datetime
 from ..dao.fall_events_dao import (
     insert_fall_event,
-    select_fall_event_by_user_id
+    select_fall_event_by_user_id_and_time_range
 )
 from ..db import Database
 from ..exceptions import DatabaseError, NotFoundError
@@ -30,19 +30,20 @@ async def add_fall_event(
         except Exception as e:
             raise DatabaseError(f"新增跌倒事件時發生錯誤: {e}")
         
-async def get_fall_event_records(user_id: int, limit: int = 10):
+async def get_fall_event_records_by_time_range(user_id: int, start_time: datetime = None, end_time: datetime = None):
     """
-    根據 user_id 查詢跌倒事件紀錄，移除時間範圍限制。
+    根據 user_id 和時間區段查詢跌倒事件紀錄。
 
     :param user_id: 使用者 ID
-    :param limit: 查詢筆數上限，預設為 10
+    :param start_time: 開始時間 (可選)
+    :param end_time: 結束時間 (可選)
     :return: 跌倒事件紀錄列表
     """
     async with Database.connection() as conn:
         try:
-            records = await select_fall_event_by_user_id(conn, user_id, limit)
+            records = await select_fall_event_by_user_id_and_time_range(conn, user_id, start_time, end_time)
             return records
         except NotFoundError:
-            raise NotFoundError("查無此使用者")
+            raise NotFoundError("查無此使用者或時間區段內無紀錄")
         except Exception as e:
             raise DatabaseError(f"查詢跌倒事件時發生錯誤: {e}")

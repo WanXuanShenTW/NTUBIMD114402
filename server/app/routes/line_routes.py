@@ -290,7 +290,7 @@ async def webhook(request: Request):
             await line_api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(
-                    text="無效的操作。請從底部選單或快速回覆中選擇「個人資訊」「我的長者」「解除綁定」。"
+                    text="無效的操作。請從底部選單或快速回覆中選擇「個人資訊」「推播設定」「解除綁定」。"
                 )]
             ))
             continue

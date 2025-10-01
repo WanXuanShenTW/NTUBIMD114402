@@ -44,7 +44,6 @@ stream_infer_manager.set_handlers(
     on_state_event_start=on_state_event_start,
     on_state_event_recover=on_state_event_recover
 )
-print("[HOOKS] registered:", list(stream_infer_manager._handlers.keys()))
 
 @pose_router.websocket("/ws/pose")
 async def ws_pose(websocket: WebSocket):
