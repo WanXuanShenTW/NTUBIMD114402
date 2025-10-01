@@ -9,9 +9,9 @@ from ..utils.ws_message_dispatcher import handle_ws_text, notify_user_disconnect
 from ..service.fall_event_service import add_fall_event
 pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
 
-async def on_fall_start(user_id: str, start_time: str, result: dict, clip20: dict):
+async def on_fall_start(user_id: str, start_time: str, result: dict, clip: dict):
     print("[FALL_START]", user_id, start_time, result["probs"][result["pred_idx"]])
-    print(f"{clip20}")
+    # print(f"{clip20}")
     # 若你希望一開始就入庫，保留原本功能：
     await add_fall_event(
         user_id=user_id,
@@ -25,17 +25,16 @@ async def on_fall_recover(user_id: str, start_time: str, end_time: str, peak_sco
     return
 
 # 多事件（坐/躺）開始
-async def on_state_event_start(user_id: str, event_name: str, start_time: str, start_frame: int,
-                               peak_score: float, prev_action_name: str, curr_action_name: str, payload: dict):
-    print("[STATE_START]", user_id, event_name, start_time, start_frame, peak_score,
+async def on_state_event_start(user_id: str, event_name: str, start_time: str, peak_score: float, 
+                               prev_action_name: str, curr_action_name: str, payload: dict):
+    print("[STATE_START]", user_id, event_name, start_time, peak_score,
           "prev=", prev_action_name, "curr=", curr_action_name)
     # TODO: 寫 DB / 通知 / 排程（可記錄 prev/curr 便於分析連貫動作）
 
 # 多事件（坐/躺）復原
 async def on_state_event_recover(user_id: str, event_name: str, start_time: str, end_time: str,
-                                 start_frame: int, end_frame: int, peak_score: float,
-                                 prev_action_name: str, curr_action_name: str, payload: dict):
-    print("[STATE_RECOVER]", user_id, event_name, start_time, end_time, start_frame, end_frame, peak_score,
+                                 peak_score: float, prev_action_name: str, curr_action_name: str, payload: dict):
+    print("[STATE_RECOVER]", user_id, event_name, start_time, end_time, peak_score,
           "prev=", prev_action_name, "curr=", curr_action_name)
     # TODO: 結束事件 / 入庫
 
