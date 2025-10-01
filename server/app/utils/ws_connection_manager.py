@@ -52,7 +52,7 @@ class WSConnectionManager:
                 traceback.print_exc()
                 self.disconnect(user_id, ws)
 
-    async def send_json(self, data, user_id: str):
+    async def send_json(self, user_id: str, data):
         print(f"[{self._ts()}][WS] Sending data to user {user_id}: {data}")
         conns = list(self.active_connections.get(user_id, []))
         for ws in conns:

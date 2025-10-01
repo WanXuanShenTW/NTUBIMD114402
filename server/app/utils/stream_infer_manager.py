@@ -1,19 +1,28 @@
 # utils/stream_infer_manager.py
 # -*- coding: utf-8 -*-
 """
-Rebuilt StreamInferManager
-- 兩階段推論（binary → multi），loader 只負責『建立+載權重』；本檔案負責其餘流程：
-  * 接收/緩衝 WS 幀資料（pose / detect）
-  * Kalman 平滑、Relation Map 建構
-  * 低 FPS 補幀到目標 FPS（預設：若 <10fps 自動補到 10fps；也可用 SC_TARGET_FPS 指定）
-  * Motion(9 維) + mask 特徵
-  * 前處理 → 推論 → 事件判定（跌倒、坐、躺）
-  * 送回前端 inference payload（不再輸出 start_frame / end_frame）
+StreamInferManager (remove per-event recover_min_ms; keep fall-level duration if set)
 
-可調常數：見檔頭的環境變數/常數（門檻、視窗長度、類別名…）。
+What’s in this build
+- Two-stage inference (binary -> multi). The two loaders only build+load models;
+  all preprocessing / logic stays here.
+- Robust relation-map rasterization (tolerant to None), Kalman smoothing, motion(9) + mask.
+- FPS normalization (auto upsample to 10fps when input<10, unless SC_TARGET_FPS>0).
+- Event logic:
+    * Fall: trigger/recover with optional FALL_RECOVER_MIN_MS (ms). (This remains.)
+    * Multi events (sit/lie): ONLY use trigger/recover thresholds + consecutive counts.
+      (Removed the per-event recover_min_ms concept.)
+
+WS integration
+- Uses ws_manager.send_json(user_id, payload)  (user first, then data).
+
+Utility hooks
+- set_handlers(on_fall_start, on_fall_recover, on_state_event_start, on_state_event_recover)
+- force_recover(user_id, reason) to clear states and emit recover on errors
+- drop_user(user_id) to clear buffers and states on disconnect
 """
 from __future__ import annotations
-import os, json, asyncio, math
+import os, asyncio, math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -22,20 +31,20 @@ import torch
 import torch.nn as nn
 import cv2
 
-# 專案工具
+# Project utils
 from .ws_connection_manager import ws_manager
 from .paths import SC_MODELS
 
-# 只建立+載權重（極簡 loader）
+# Minimal loaders (build+load only)
 from .binary_cnn_lstm_loader import build_model as build_binary_model
 from .multi_cnn_lstm_loader import build_model as build_multi_model
 
 try:
-    from .cnn_lstm_utils import CNNLSTM  # 僅作為 fallback 用
+    from .cnn_lstm_utils import CNNLSTM  # optional fallback
 except Exception:
     CNNLSTM = None
 
-# =============== 參數區（可用環境變數覆蓋） ===============
+# ================= Config (env-overridable) =================
 H, W = 64, 64
 WINDOW = int(os.getenv("SC_WINDOW", "10"))
 STRIDE = int(os.getenv("SC_STRIDE", "5"))
@@ -50,11 +59,11 @@ ENABLE_KALMAN = True
 KP_CONF_TH = float(os.getenv("SC_KP_CONF_TH", "0.2"))
 SIGMA_KP = float(os.getenv("SC_SIGMA_KP", "3.0"))
 
-# FPS 補幀：若 SC_TARGET_FPS<=0，則當輸入 fps < 10 時自動補到 10fps
-TARGET_FPS = float(os.getenv("SC_TARGET_FPS", "10"))
+# FPS resample: if SC_TARGET_FPS<=0, auto-upsample to 10fps when input < 10fps
+TARGET_FPS = float(os.getenv("SC_TARGET_FPS", "0"))
 UPSAMPLE_MAX_MULT = int(os.getenv("SC_UPSAMPLE_MAX_MULT", "4"))
 
-# 兩階段推論
+# Two-stage inference
 USE_TWO_STAGE = os.getenv("SC_USE_TWO_STAGE", "1") != "0"
 BINARY_MODEL_PATH   = os.getenv("SC_BINARY_MODEL_PATH", f"{SC_MODELS}/binary/best.pt")
 BINARY_CLASSES_PATH = os.getenv("SC_BINARY_CLASSES_PATH", f"{SC_MODELS}/binary/classes.json")
@@ -62,34 +71,34 @@ BINARY_POS_NAME     = os.getenv("SC_BINARY_POS_NAME", "fall")
 BINARY_THR          = float(os.getenv("SC_BINARY_THR", "0.50"))
 MULTI_MODEL_PATH    = os.getenv("SC_MULTI_MODEL_PATH",  f"{SC_MODELS}/multi/best.pt")
 MULTI_CLASSES_PATH  = os.getenv("SC_MULTI_CLASSES_PATH",f"{SC_MODELS}/multi/classes.json")
-# 單模型相容
+# Single-model fallback
 MODEL_PATH   = os.getenv("SC_MODEL_PATH",   f"{SC_MODELS}/best.pt")
 CLASSES_PATH = os.getenv("SC_CLASSES_PATH", f"{SC_MODELS}/classes.json")
 
-# 跌倒事件門檻（中心幀決策）
-FALL_TRIGGER_THR = float(os.getenv("SC_FALL_TRIGGER_THR", "0.50"))
+# Fall thresholds
+FALL_TRIGGER_THR = float(os.getenv("SC_FALL_TRIGGER_THR", "0.55"))
 FALL_RECOVER_THR = float(os.getenv("SC_FALL_RECOVER_THR", "0.40"))
 TRIGGER_CONSEC   = int(os.getenv("SC_FALL_TRIGGER_CONSEC", "2"))
 RECOVER_CONSEC   = int(os.getenv("SC_FALL_RECOVER_CONSEC", "2"))
 
-# 坐/躺事件規則（固定內嵌）
+# Multi-event rules 
 ACTION_EVENTS = {
     "sit": {
-        "pos_labels":     ["lie","walk"],
-        "recover_labels": ["lie","walk"],
-        "trigger_thr":    float(os.getenv("SC_SIT_TRIGGER_THR", "0.40")),
-        "recover_thr":    float(os.getenv("SC_SIT_RECOVER_THR", "0.30")),
+        "pos_labels":     ["sit"],
+        "recover_labels": ["lie", "walk"],
+        "trigger_thr":    float(os.getenv("SC_SIT_TRIGGER_THR", "0.50")),
+        "recover_thr":    float(os.getenv("SC_SIT_RECOVER_THR", "0.40")),
         "trigger_consec": int(os.getenv("SC_SIT_TRIGGER_CONSEC", "2")),
-        "recover_consec": int(os.getenv("SC_SIT_RECOVER_CONSEC", "2"))
+        "recover_consec": int(os.getenv("SC_SIT_RECOVER_CONSEC", "2")),
     },
     "lie": {
-        "pos_labels":     ["sit"],
+        "pos_labels":     ["lie"],
         "recover_labels": ["sit", "walk"],
-        "trigger_thr":    float(os.getenv("SC_LIE_TRIGGER_THR", "0.40")),
-        "recover_thr":    float(os.getenv("SC_LIE_RECOVER_THR", "0.30")),
+        "trigger_thr":    float(os.getenv("SC_LIE_TRIGGER_THR", "0.50")),
+        "recover_thr":    float(os.getenv("SC_LIE_RECOVER_THR", "0.40")),
         "trigger_consec": int(os.getenv("SC_LIE_TRIGGER_CONSEC", "2")),
-        "recover_consec": int(os.getenv("SC_LIE_RECOVER_CONSEC", "2"))
-    }
+        "recover_consec": int(os.getenv("SC_LIE_RECOVER_CONSEC", "2")),
+    },
 }
 
 COCO_EDGES = [
@@ -99,7 +108,7 @@ COCO_EDGES = [
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# =============== 工具函式 ===============
+# ================= Utilities =================
 class RelationMapConfig:
     def __init__(self, H=64, W=64, sigma_kp=3.0, kp_conf_th=0.4,
                  include_bone_lines=True, object_classes=None):
@@ -138,14 +147,23 @@ def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapCon
     C = 2 + num_kp + num_edges + num_obj_ch + coord_ch
     canvas = np.zeros((C, Hc, Wc), dtype=np.float32)
 
+    safe_w = max(1.0, float(img_w) if img_w else 1.0)
+    safe_h = max(1.0, float(img_h) if img_h else 1.0)
+
     ch = 0
-    # 1) person bbox mask
+    # 1) person bbox mask (tolerant to missing coords)
     if bbox_xyxy:
-        x1, y1, x2, y2 = bbox_xyxy
-        x1 = int(np.clip((x1 / img_w) * Wc, 0, Wc - 1)); y1 = int(np.clip((y1 / img_h) * Hc, 0, Hc - 1))
-        x2 = int(np.clip((x2 / img_w) * Wc, 0, Wc - 1)); y2 = int(np.clip((y2 / img_h) * Hc, 0, Hc - 1))
-        if x2 > x1 and y2 > y1:
-            canvas[ch, y1:y2 + 1, x1:x2 + 1] = 1.0
+        try:
+            x1, y1, x2, y2 = bbox_xyxy
+            if None not in (x1, y1, x2, y2):
+                x1 = int(np.clip((float(x1) / safe_w) * Wc, 0, Wc - 1))
+                y1 = int(np.clip((float(y1) / safe_h) * Hc, 0, Hc - 1))
+                x2 = int(np.clip((float(x2) / safe_w) * Wc, 0, Wc - 1))
+                y2 = int(np.clip((float(y2) / safe_h) * Hc, 0, Hc - 1))
+                if x2 > x1 and y2 > y1:
+                    canvas[ch, y1:y2 + 1, x1:x2 + 1] = 1.0
+        except Exception:
+            pass
     ch += 1
 
     # 2) distance transform
@@ -161,7 +179,7 @@ def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapCon
                 conf = float(kp.get('conf', kp.get('confidence', 1.0)))
                 if conf < KP_CONF_TH:
                     continue
-                x = (float(kp['x']) / img_w) * Wc; y = (float(kp['y']) / img_h) * Hc
+                x = (float(kp['x']) / safe_w) * Wc; y = (float(kp['y']) / safe_h) * Hc
                 draw_gaussian(canvas[ch + i], x, y, SIGMA_KP, mag=conf)
             except Exception:
                 pass
@@ -172,8 +190,8 @@ def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapCon
         pts = []
         for i in range(num_kp):
             try:
-                x = int(np.clip((float(kps_list[i]['x']) / img_w) * Wc, 0, Wc - 1))
-                y = int(np.clip((float(kps_list[i]['y']) / img_h) * Hc, 0, Hc - 1))
+                x = int(np.clip((float(kps_list[i]['x']) / safe_w) * Wc, 0, Wc - 1))
+                y = int(np.clip((float(kps_list[i]['y']) / safe_h) * Hc, 0, Hc - 1))
                 c = float(kps_list[i].get('conf', kps_list[i].get('confidence', 1.0)))
                 pts.append((x, y, c))
             except Exception:
@@ -187,7 +205,7 @@ def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapCon
             cv2.line(canvas[ch + e_idx], (x1, y1), (x2, y2), 1.0, 1)
     ch += num_edges
 
-    # 5) object masks per class
+    # 5) object masks (tolerant bbox)
     if num_obj_ch > 0 and dets:
         cls2ch = {name: i for i, name in enumerate(cfg.object_classes)}
         for d in dets:
@@ -202,10 +220,12 @@ def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapCon
                         if d.get("cxcywh"):
                             bb = _bbox_xyxy_from_cxcywh(*bb)
                         x1, y1, x2, y2 = bb
-                xx1 = int(np.clip((float(x1) / img_w) * Wc, 0, Wc - 1))
-                yy1 = int(np.clip((float(y1) / img_h) * Hc, 0, Hc - 1))
-                xx2 = int(np.clip((float(x2) / img_w) * Wc, 0, Wc - 1))
-                yy2 = int(np.clip((float(y2) / img_h) * Hc, 0, Hc - 1))
+                if None in (x1, y1, x2, y2):
+                    continue
+                xx1 = int(np.clip((float(x1) / safe_w) * Wc, 0, Wc - 1))
+                yy1 = int(np.clip((float(y1) / safe_h) * Hc, 0, Hc - 1))
+                xx2 = int(np.clip((float(x2) / safe_w) * Wc, 0, Wc - 1))
+                yy2 = int(np.clip((float(y2) / safe_h) * Hc, 0, Hc - 1))
                 if xx2 > xx1 and yy2 > yy1:
                     canvas[ch + cls2ch[cname], yy1:yy2 + 1, xx1:xx2 + 1] = 1.0
             except Exception:
@@ -269,7 +289,7 @@ def _densify_sequences(kps_seq: List[List[dict]],
                        bbox_seq: List[Optional[Tuple[float, float, float, float]]],
                        dets_seq: List[List[dict]],
                        mult: int):
-    """對相鄰幀做等距插值，mult=1 不變，mult=2 每對幀插 1 幀，以此類推"""
+    """Insert evenly spaced frames: mult=1 no-op, mult=2 insert 1 between each pair, etc."""
     L = len(kps_seq)
     if mult <= 1 or L <= 1:
         return kps_seq, bbox_seq, dets_seq
@@ -361,7 +381,7 @@ def _resample_sequences_to_fps(window: list, kps_seq: list, bbox_seq: list, dets
     return kps_new, bbox_new, dets_new, fr_new
 
 
-# =============== 資料結構 ===============
+# ================= Data Structures =================
 @dataclass
 class FrameRecord:
     frame_id: int
@@ -422,7 +442,7 @@ class UserBuffer:
         return out2
 
 
-# =============== Kalman 與 motion ===============
+# ================= Kalman + Motion =================
 class Kalman2D:
     def __init__(self, x0: float, y0: float):
         self.x = float(x0); self.y = float(y0)
@@ -448,7 +468,7 @@ def kalman_smooth_kps(kps_seq: List[List[dict]]):
     J = 17
     filters = []
     for j in range(J):
-        # 找首個有效量測
+        # seed with first measurement if available
         x0 = y0 = 0.0
         for t in range(L):
             fr = kps_seq[t]
@@ -472,14 +492,7 @@ def kalman_smooth_kps(kps_seq: List[List[dict]]):
 
 
 def _compute_motion_feats_with_mask_from_window(window: List[FrameRecord], kps_seq: List[List[dict]]):
-    img_h_list = [fr.img_h for fr in window]
-    img_w_list = [fr.img_w for fr in window]
-    ycom = []
-    hgt = []
-    area = []
-    trunk = []
-    kneeL = []
-    kneeR = []
+    ycom = []; hgt = []; area = []; trunk = []; kneeL = []; kneeR = []
     for fr, kps in zip(window, kps_seq):
         if not kps or len(kps) < 17:
             ycom.append(None); hgt.append(None); area.append(None); trunk.append(None); kneeL.append(None); kneeR.append(None)
@@ -531,10 +544,12 @@ def _compute_motion_feats_with_mask_from_window(window: List[FrameRecord], kps_s
                 i += 1
         return [0.0 if v is None else v for v in arr]
 
-    ycom = fill_small(ycom); hgt = fill_small(hgt); area = fill_small(area)
-    trunk = fill_small(trunk); kneeL = fill_small(kneeL); kneeR = fill_small(kneeR)
-    ycom = np.array(ycom, np.float32); hgt = np.array(hgt, np.float32); area = np.array(area, np.float32)
-    trunk = np.array(trunk, np.float32); kneeL = np.array(kneeL, np.float32); kneeR = np.array(kneeR, np.float32)
+    ycom = np.array(fill_small(ycom), np.float32)
+    hgt  = np.array(fill_small(hgt),  np.float32)
+    area = np.array(fill_small(area), np.float32)
+    trunk= np.array(fill_small(trunk),np.float32)
+    kneeL= np.array(fill_small(kneeL),np.float32)
+    kneeR= np.array(fill_small(kneeR),np.float32)
 
     def diff1(x):
         v = np.zeros_like(x); v[1:] = x[1:] - x[:-1]; return v
@@ -559,6 +574,7 @@ def _compute_motion_feats_with_mask_from_window(window: List[FrameRecord], kps_s
         np.clip(dkneeR, -3.0, 3.0),
     ], axis=1).astype(np.float32)
 
+    # validity mask based on confident lower-body core keypoints
     valid = []
     for fr, kps in zip(window, kps_seq):
         cnt = 0
@@ -583,13 +599,13 @@ def _make_window(fr_list: List[FrameRecord], end_index: int, window: int = WINDO
     return fr_list[s: end_index + 1]
 
 
-# =============== 主體 ===============
+# ================= Core =================
 class StreamInferManager:
     def __init__(self):
         coord = 2 if COORDCONV_2 else 0
         self.in_ch = 2 + 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + (len(OBJECT_CLASSES) if OBJECT_CLASSES else 0) + coord
 
-        # 預設類別名（載入後會覆蓋）
+        # Class names (overwritten by loaders)
         self.class_names_bin   = ["non_fall", "fall"]
         self.class_names_multi = ["class_0", "class_1"]
 
@@ -659,22 +675,24 @@ class StreamInferManager:
                 print(f"[Load][single] matched={stats_single['matched']}/{stats_single['total_in_ckpt']} missing={stats_single['missing']} unexpected={stats_single['unexpected']}")
             except Exception as e:
                 print(f"[Load][single][WARN] {e}")
-                # fallback to tiny
+                # fallback
                 self.model_multi = self._load_model()
             self.model_multi.eval().to(DEVICE)
 
-        # 狀態與設定
+        # State & config
         self._handlers: Dict[str, callable] = {}
         self._buffers: Dict[str, UserBuffer] = {}
         self._locks: Dict[str, asyncio.Lock] = {}
         self.cfg = RelationMapConfig(H=H, W=W, sigma_kp=SIGMA_KP, kp_conf_th=KP_CONF_TH,
                                      include_bone_lines=INCLUDE_BONE_LINES, object_classes=OBJECT_CLASSES)
-        # 事件狀態
-        self._fall_state: Dict[str, Dict[str, int | bool]] = {}
-        self._event_defs = self._compile_action_events(ACTION_EVENTS, self.class_names_multi)
-        self._multi_event_state: Dict[str, Dict[str, Dict[str, int | bool]]] = {}
 
-    # ---------- 基礎 ----------
+        # Events
+        self._fall_state: Dict[str, Dict[str, int | bool | Optional[int]]] = {}
+        self._event_defs = self._compile_action_events(ACTION_EVENTS, self.class_names_multi)
+        self._multi_event_state: Dict[str, Dict[str, Dict[str, int | bool | Optional[int]]]] = {}
+        self._last_multi_label: Dict[str, str] = {}
+        
+    # ----- Basics -----
     def _load_model(self) -> nn.Module:
         num_classes = len(self.class_names_multi)
         if CNNLSTM is not None:
@@ -689,7 +707,7 @@ class StreamInferManager:
                 dropout=DROPOUT,
                 motion_dim=9,
             )
-        # 極簡備援模型
+        # tiny fallback
         class _Tiny(nn.Module):
             def __init__(self, in_ch, num_classes):
                 super().__init__()
@@ -734,13 +752,13 @@ class StreamInferManager:
             compiled[ev] = {**cfg, "pos_idx": pos_idx, "recover_idx": rec_idx}
         return compiled
 
-    # ---------- 前處理 ----------
+    # ----- Preprocess -----
     def _build_clip(self, window: List[FrameRecord]):
-        # keypoints 平滑
+        # smooth keypoints
         raw_kps = [(fr.kps or []) for fr in window]
         kps_seq = kalman_smooth_kps(raw_kps) if ENABLE_KALMAN else raw_kps
 
-        # 低 FPS → densify/resample
+        # fps normalize
         use_kps = kps_seq
         use_bbox = [fr.bbox for fr in window]
         use_dets = [fr.dets for fr in window]
@@ -755,14 +773,13 @@ class StreamInferManager:
         elif tgt and in_fps > 0 and tgt < in_fps:
             use_kps, use_bbox, use_dets, win_for_feats = _resample_sequences_to_fps(window, use_kps, use_bbox, use_dets, tgt)
 
-        # 若長度變化，裁成最後 WINDOW 幀
+        # crop/pad to WINDOW
         if len(use_kps) > WINDOW:
             use_kps  = use_kps[-WINDOW:]
             use_bbox = use_bbox[-WINDOW:]
             use_dets = use_dets[-WINDOW:]
             win_for_feats = win_for_feats[-WINDOW:]
         elif len(use_kps) < WINDOW:
-            # 前端長度不足就前補空白（基本不會發生，因為 stride 控制）
             pad_n = WINDOW - len(use_kps)
             pad_k = [[{"conf":0.0} for _ in range(17)] for _ in range(pad_n)]
             pad_b = [None for _ in range(pad_n)]
@@ -772,7 +789,7 @@ class StreamInferManager:
             use_dets = pad_d + use_dets
             win_for_feats = ([window[0]] * pad_n) + win_for_feats
 
-        # relation map 堆疊
+        # relation maps
         frames = []
         for fr, kps, bb, dets in zip(win_for_feats, use_kps, use_bbox, use_dets):
             rm = rasterize_frame(bb, kps, dets, fr.img_w, fr.img_h, self.cfg)
@@ -789,7 +806,7 @@ class StreamInferManager:
         mask = torch.from_numpy(mask_np).unsqueeze(0)     # [1,T]
         return x.to(DEVICE), motion.to(DEVICE), mask.to(DEVICE)
 
-    # ---------- 推論 ----------
+    # ----- Inference -----
     @torch.no_grad()
     def _forward_any(self, model: nn.Module, x: torch.Tensor, motion: torch.Tensor, mask: torch.Tensor) -> np.ndarray:
         out = None
@@ -815,7 +832,7 @@ class StreamInferManager:
         except Exception:
             return min(1, len(self.class_names_bin)-1)
 
-    # ---------- 事件狀態 ----------
+    # ----- Event states -----
     def _fall_state_of(self, user_id: str):
         st = self._fall_state.get(user_id)
         if st is None:
@@ -831,26 +848,31 @@ class StreamInferManager:
             D[name] = st
         return st
 
-    async def _handle_fall_timeline(self, user_id: str, fall_prob: float):
+    async def _handle_fall_timeline(self, user_id: str, fall_prob: float, ts_ms: int):
         st = self._fall_state_of(user_id)
+
         if not st["active"]:
+            # 未觸發 → 看是否連續達到觸發門檻
             if fall_prob >= FALL_TRIGGER_THR:
-                st["pos"] += 1; st["rec"] = 0
+                st["pos"] += 1
+                st["rec"] = 0
                 if st["pos"] >= TRIGGER_CONSEC:
                     st["active"] = True
                     await self._emit("on_fall_start", {"user_id": user_id, "score": float(fall_prob)})
             else:
                 st["pos"] = 0
         else:
+            # 已觸發 → 看是否連續達到恢復門檻（不再檢查時間）
             if fall_prob <= FALL_RECOVER_THR:
-                st["rec"] += 1; st["pos"] = 0
+                st["rec"] += 1
+                st["pos"] = 0
                 if st["rec"] >= RECOVER_CONSEC:
                     st["active"] = False
                     await self._emit("on_fall_recover", {"user_id": user_id, "score": float(fall_prob)})
             else:
                 st["rec"] = 0
 
-    async def _handle_action_events(self, user_id: str, probs: np.ndarray):
+    async def _handle_action_events(self, user_id: str, probs: np.ndarray, ts_ms: int):
         # probs shape: [num_classes]
         for name, cfg in self._event_defs.items():
             st = self._evt_state_of(user_id, name)
@@ -873,7 +895,7 @@ class StreamInferManager:
                 else:
                     st["rec"] = 0
 
-    # ---------- 緩衝 ----------
+    # ----- Buffers, locks, send -----
     def _buf(self, user_id: str) -> UserBuffer:
         return self._buffers.setdefault(user_id, UserBuffer())
 
@@ -883,14 +905,42 @@ class StreamInferManager:
             lk = asyncio.Lock(); self._locks[user_id] = lk
         return lk
 
-    # ---------- 送回前端 ----------
     async def _send(self, user_id: str, payload: dict):
         try:
+            if not isinstance(user_id, (str, int)):
+                raise ValueError(f"Invalid user_id type: {type(user_id)}. Expected str or int.")
             await ws_manager.send_json(user_id, payload)
         except Exception as e:
             print(f"[WS][WARN] send to user={user_id} failed: {e}")
 
-    # ---------- 主流程（WS 訊息注入） ----------
+    # ----- Force recover (clear states on error) -----
+    async def force_recover(self, user_id: str, reason: str = "manual"):
+        try:
+            st = self._fall_state.get(user_id)
+            if st and st.get("active"):
+                st["active"] = False
+                st["pos"] = 0
+                st["rec"] = 0
+                await self._emit("on_fall_recover", {"user_id": user_id, "score": 0.0, "reason": reason})
+            # multi 事件照舊
+            evtD = self._multi_event_state.get(user_id) or {}
+            for name, est in list(evtD.items()):
+                if est.get("active"):
+                    est["active"] = False
+                    est["pos"] = 0
+                    est["rec"] = 0
+                    await self._emit("on_state_event_recover", {"user_id": user_id, "name": name, "score": 0.0, "reason": reason})
+        except Exception as e:
+            print(f"[STATE][WARN] force_recover user={user_id} err={e}")
+
+    # ----- Drop user (on disconnect) -----
+    def drop_user(self, user_id: str):
+        self._buffers.pop(user_id, None)
+        self._locks.pop(user_id, None)
+        self._fall_state.pop(user_id, None)
+        self._multi_event_state.pop(user_id, None)
+
+    # ----- WS ingest -----
     async def ingest(self, user_id: str, msg: dict):
         async with self._lock(user_id):
             t = (msg.get("type") or "frame").lower()
@@ -923,11 +973,12 @@ class StreamInferManager:
             if not window:
                 return
 
-            # 前處理
+            # Preprocess
             x_np, feats_np, mask_np = self._build_clip(window)
             x, motion, mask = self._to_tensors(x_np, feats_np, mask_np)
+            ts_cur = int(window[-1].ts_ms)
 
-            # ---- Binary → Multi（兩階段） ----
+            # ---- Binary → Multi ----
             binary_out = None; multi_out = None
             stage = "multi"
 
@@ -944,11 +995,9 @@ class StreamInferManager:
                 binary_out["thr"] = float(BINARY_THR)
 
                 fall_prob = float(probs_bin[fall_idx])
-                # 事件時間線（跌倒）用 binary 機率
-                await self._handle_fall_timeline(user_id, fall_prob)
+                await self._handle_fall_timeline(user_id, fall_prob, ts_cur)
 
                 if fall_prob >= BINARY_THR:
-                    # 直接回報『fall』，不進入 multi
                     stage = "binary"
                     payload = {
                         "type": "inference",
@@ -960,7 +1009,7 @@ class StreamInferManager:
                     await self._send(user_id, payload)
                     return
 
-            # 若未觸發跌倒 → 進多類別
+            # Multi-class stage
             if getattr(self, "model_multi", None) is not None:
                 probs_multi = self._forward_any(self.model_multi, x, motion, mask)[0]
                 multi_out = {
@@ -971,8 +1020,7 @@ class StreamInferManager:
                 multi_out["pred_idx"] = pred_idx_multi
                 multi_out["pred"] = self.class_names_multi[pred_idx_multi]
 
-                # 坐/躺等狀態事件
-                await self._handle_action_events(user_id, probs_multi)
+                await self._handle_action_events(user_id, probs_multi, ts_cur)
 
                 payload = {
                     "type": "inference",
@@ -984,9 +1032,8 @@ class StreamInferManager:
                 if binary_out is not None:
                     payload["binary"] = binary_out
                 await self._send(user_id, payload)
-
             else:
-                # 無 multi 模型：若有 binary 結果就送 binary，否則忽略
+                # no multi: still send binary if available
                 if binary_out is not None:
                     pred_idx = int(np.argmax(binary_out["probs"]))
                     payload = {
@@ -999,5 +1046,5 @@ class StreamInferManager:
                     await self._send(user_id, payload)
 
 
-# 單例
+# Singleton
 stream_infer_manager = StreamInferManager()

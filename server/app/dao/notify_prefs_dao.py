@@ -5,9 +5,11 @@ async def upsert_prefs(conn, user_id: int, weekdays: str, hour: int, minute: int
     """新增或更新通知偏好設定"""
     sql = """
         INSERT INTO notification_preferences (user_id, weekdays, hour, minute)
-        VALUES (%s,%s,%s,%s)
+        VALUES (%s, %s, %s, %s) AS new_prefs
         ON DUPLICATE KEY UPDATE
-            weekdays=VALUES(weekdays), hour=VALUES(hour), minute=VALUES(minute)
+            weekdays = new_prefs.weekdays,
+            hour = new_prefs.hour,
+            minute = new_prefs.minute
     """
     try:
         async with conn.cursor() as cursor:
