@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from aiomysql import create_pool, OperationalError
 from contextlib import asynccontextmanager
 from aiomysql.cursors import DictCursor
+import time, uuid, traceback
 
 load_dotenv()
 
@@ -20,6 +21,9 @@ PING_TIMEOUT = float(os.getenv("DB_PING_TIMEOUT", 3.0))
 # 會自動重試的 MySQL 錯誤碼
 _RETRY_ERRCODES = {2006, 2013}  # MySQL server has gone away / Lost connection during query
 
+ACTIVE_BORROWERS = {}   # 走 Database.connection() 的使用者
+POOL_INUSE = {}         # 直接從 pool.acquire() 借走的原始連線
+DB_HOLD_WARN_MS = int(os.getenv("DB_HOLD_WARN_MS", "800"))  # 超過這毫秒印出告警
 
 class _RetryingCursor:
     """
@@ -262,21 +266,28 @@ class Database:
     @classmethod
     @asynccontextmanager
     async def connection(cls):
-        """
-        連線上下文管理器
-        用法：
-            async with Database.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT 1")
-        """
-        rconn = await cls.get_connection()
+        conn = await cls.get_connection()  # 保持你原本的取得方式
+
+        # 登記這次借用（沒有 middleware，就用 '-' 當標籤）
+        borrow_id = uuid.uuid4().hex[:8]
+        req_label = "-"
+        ACTIVE_BORROWERS[borrow_id] = {
+            "since": time.time(),
+            "request": req_label,
+            "stack": "".join(traceback.format_stack(limit=12)),
+        }
+
+        t0 = time.perf_counter()
         try:
-            yield rconn
+            yield conn
         finally:
-            try:
-                await cls.release_connection(rconn)
-            except Exception as e:
-                print(f"[⚠️] Error in connection context cleanup: {e}")
+            # 退場：移除登記、（可選）持有過久就告警、一定要釋放
+            ACTIVE_BORROWERS.pop(borrow_id, None)
+
+            hold_ms = (time.perf_counter() - t0) * 1000.0
+            if hold_ms > DB_HOLD_WARN_MS:
+                print(f"[DB] held {hold_ms:.1f}ms by {req_label}")
+            await cls.release_connection(conn)
 
     @classmethod
     def debug_status(cls):
@@ -293,5 +304,19 @@ class Database:
                 print("🚨 WARNING: Connection pool is exhausted!")
         else:
             print("❌ Pool not initialized.")
+    
+    @classmethod
+    def borrowers_snapshot(cls):
+        now = time.time()
+        out = []
+        for k, v in ACTIVE_BORROWERS.items():
+            out.append({
+                "id": k,
+                "age_s": round(now - v.get("since", now), 3),
+                "request": v.get("request", "-"),
+                "stack": v.get("stack", ""),
+            })
+        out.sort(key=lambda x: -x["age_s"])  # 先顯示持有最久的
+        return {"count": len(out), "borrowers": out}
             
     

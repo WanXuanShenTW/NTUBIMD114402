@@ -34,7 +34,7 @@ async def select_fall_event_by_user_id(
     try:
         async with conn.cursor(DictCursor) as cursor:
             query = """
-                SELECT record_id, user_id, detected_time, location, pose_before_fall, video_filename
+                SELECT record_id, user_id, detected_time, location, pose_before_fall
                 FROM fall_events
                 WHERE user_id = %s
                 ORDER BY detected_time DESC

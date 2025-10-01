@@ -16,7 +16,7 @@ from linebot.v3.messaging import (
 )
 
 RICHMENU_NAME = "SmartCare 主選單"
-RICHMENU_IMG="static/line_background/1.png"
+RICHMENU_IMG="static/line_background/bg1.png"
 RICHMENU_IMG_TYPE = "image/jpeg" if RICHMENU_IMG.lower().endswith((".jpg", ".jpeg")) else "image/png"
 
 
@@ -33,7 +33,7 @@ def _build_main_richmenu_request() -> RichMenuRequest:
             ),
             RichMenuArea(
                 bounds=RichMenuBounds(x=834, y=0, width=833, height=1686),
-                action=MessageAction(label="我的長者", text="我的長者"),
+                action=MessageAction(label="推播設定", text="推播設定"),
             ),
             RichMenuArea(
                 bounds=RichMenuBounds(x=1667, y=0, width=833, height=1686),

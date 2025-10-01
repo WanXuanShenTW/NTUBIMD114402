@@ -1,4 +1,3 @@
-# app/routes/line_routes.py
 import os
 from fastapi import APIRouter, Request, HTTPException
 from pydantic import BaseModel
@@ -12,6 +11,7 @@ from linebot.v3.webhooks import (
     TextMessageContent,
     FollowEvent,
     UnfollowEvent,
+    PostbackEvent
 )
 from linebot.v3.messaging import (
     AsyncApiClient,
@@ -20,6 +20,11 @@ from linebot.v3.messaging import (
     ReplyMessageRequest,
     TextMessage,
     MessageAction,
+)
+from linebot.v3.messaging.models import (
+    PostbackAction,
+    QuickReply,
+    QuickReplyItem
 )
 
 # ---- services ----
@@ -41,6 +46,10 @@ from app.service.line_richmenu_service import (
     reset_all_and_setup,
 )
 
+from app.service.notify_prefs_service import (
+    parse_sel, toggle_day, human_days, save_prefs_by_line_uid
+)
+
 router = APIRouter(prefix="/line", tags=["LINE"])
 
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
@@ -52,7 +61,7 @@ api_client = AsyncApiClient(config)
 line_api = AsyncMessagingApi(api_client)
 parser = WebhookParser(CHANNEL_SECRET)
 
-ALLOWED_CMDS = {"個人資訊", "我的長者", "解除綁定"}
+ALLOWED_CMDS = {"個人資訊", "推播設定", "解除綁定"}
 
 @router.post("/richmenu/reset")
 async def reset_richmenu():
@@ -128,6 +137,11 @@ async def webhook(request: Request):
         events = parser.parse(body.decode("utf-8"), signature)
     except InvalidSignatureError as e:
         raise HTTPException(status_code=400, detail="Invalid signature")
+
+    for event in events:
+        if isinstance(event, PostbackEvent):
+            await handle_postback(event)
+            continue
 
     for event in events:
         # 1) 新增好友
@@ -231,10 +245,10 @@ async def webhook(request: Request):
                             
                             # 格式化輸出文字
                             formatted_info = f"""{name}的個人資訊：
-姓名：{name}
-電話：{phone}
-性別：{gender_display}
-住址：{address}"""
+                            姓名：{name}
+                            電話：{phone}
+                            性別：{gender_display}
+                            住址：{address}"""
                             
                             await line_api.reply_message(ReplyMessageRequest(
                                 reply_token=event.reply_token,
@@ -253,15 +267,13 @@ async def webhook(request: Request):
                         ))
                     continue
 
-                if text == "我的長者":
-                    elder = await resolve_current_elder(uid)
-                    if elder:
-                        msg = f"目前服務對象：{elder['elder_name']}（ID: {elder['elder_id']}）"
-                    else:
-                        msg = "目前沒有指派服務的長者。"
+                if text == "推播設定":
                     await line_api.reply_message(ReplyMessageRequest(
                         reply_token=event.reply_token,
-                        messages=[TextMessage(text=msg)]
+                        messages=[TextMessage(
+                            text="請選擇每週要通知的『星期』：可多選，選好後按「完成」。",
+                            quick_reply=build_weekday_qr([])
+                        )]
                     ))
                     continue
 
@@ -309,3 +321,110 @@ async def richmenu_debug():
             })
 
     return {"token_fingerprint": fp, "count": len(menus), "menus": out}
+
+#-------------------------------
+def quick_reply_main():
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label="個人資訊", text="個人資訊")),
+        QuickReplyItem(action=MessageAction(label="推播設定", text="推播設定")),
+        QuickReplyItem(action=MessageAction(label="解除綁定", text="解除綁定")),
+    ])
+
+# 選星期
+def build_weekday_qr(sel_days: list[int]):
+    names = ["日","一","二","三","四","五","六"]
+    sel_set = set(sel_days)
+    sel_csv = ",".join(map(str, sel_days))
+    items = []
+    for d, name in enumerate(names):
+        mark = "✅" if d in sel_set else "  "
+        items.append(QuickReplyItem(
+            action=PostbackAction(
+                label=f"{mark} 週{name}",
+                data=f"prefs:weekday:{d}|sel={sel_csv}",
+                display_text=f"週{name}",
+            )
+        ))
+    items.append(QuickReplyItem(action=PostbackAction(label="完成", data=f"prefs:done|sel={sel_csv}", display_text="完成")))
+    items.append(QuickReplyItem(action=PostbackAction(label="取消", data="prefs:cancel", display_text="取消")))
+    return QuickReply(items=items)
+
+# 選時間
+def build_time_qr(sel_days: list[int]):
+    hours = [7, 8, 9, 12, 18, 20, 21]
+    sel_csv = ",".join(map(str, sel_days))
+    items = [QuickReplyItem(
+        action=PostbackAction(
+            label=f"{h:02d}:00",
+            data=f"prefs:time:{h:02d}:00|sel={sel_csv}",
+            display_text=f"{h:02d}:00",
+        )
+    ) for h in hours]
+    items.append(QuickReplyItem(action=PostbackAction(label="取消", data="prefs:cancel", display_text="取消")))
+    return QuickReply(items=items)
+
+async def handle_postback(event: PostbackEvent):
+    uid = event.source.user_id
+    raw = event.postback.data or ""
+
+    # data 範例：
+    #   prefs:weekday:3|sel=1,3
+    #   prefs:done|sel=1,3
+    #   prefs:time:08:00|sel=1,3
+    parts = raw.split("|")
+    key = parts[0]
+    sel_csv = ""
+    for p in parts[1:]:
+        if p.startswith("sel="):
+            sel_csv = p[4:]
+    sel_days = parse_sel(sel_csv)
+
+    try:
+        if key.startswith("prefs:weekday:"):
+            d = int(key.split(":")[2])
+            new_days = toggle_day(sel_days, d)
+            msg = f"已選：{human_days(new_days)}\n繼續勾選或按「完成」。"
+            await line_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg, quick_reply=build_weekday_qr(new_days))]
+            ))
+            return
+
+        if key == "prefs:done":
+            if not sel_days:
+                await line_api.reply_message(ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="尚未選擇任何星期，請至少選一個。", quick_reply=build_weekday_qr([]))]
+                ))
+                return
+            await line_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(
+                    text=f"已選：{human_days(sel_days)}\n請選擇通知時間（24 小時制）。",
+                    quick_reply=build_time_qr(sel_days)
+                )]
+            ))
+            return
+
+        if key.startswith("prefs:time:"):
+            _, _, hh, mm = key.split(":")  # e.g. prefs:time:08:00
+            ok, msg = await save_prefs_by_line_uid(uid, sel_days, int(hh), int(mm))
+            await line_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text=msg, quick_reply=quick_reply_main())]
+            ))
+            return
+
+        if key == "prefs:cancel":
+            await line_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(text="已取消設定。", quick_reply=quick_reply_main())]
+            ))
+            return
+
+    except Exception as ex:
+        print(f"[prefs postback] {ex}")
+        await line_api.reply_message(ReplyMessageRequest(
+            reply_token=event.reply_token,
+            messages=[TextMessage(text="系統忙碌中，請稍後再試。")]
+        ))

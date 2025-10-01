@@ -49,8 +49,6 @@ async def delete_contact(conn, elder_user_id: int, caregiver_user_id: int) -> bo
     async with conn.cursor() as cursor:
         query = "DELETE FROM emergency_contacts WHERE elder_user_id = %s AND caregiver_user_id = %s"
         await cursor.execute(query, (elder_user_id, caregiver_user_id))
-        # 假設您的連線池設定了 autocommit=True，若無，則需下一行
-        # await conn.commit()
         if cursor.rowcount == 0:
             raise NotFoundError(f"找不到 elder_user_id={elder_user_id} 與 caregiver_user_id={caregiver_user_id} 的照護關係可刪除")
         return True
