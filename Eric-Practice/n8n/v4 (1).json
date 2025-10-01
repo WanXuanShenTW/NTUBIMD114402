@@ -1,0 +1,148 @@
+{
+  "name": "骨架分析v4",
+  "nodes": [
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=你是「單一人類姿態判斷器」。\n\nN = {{$json.frames.length}}\n\n請對 frames[0..N-1] 的每一幀各輸出一個物件；最後「只回傳一個 JSON 陣列」（長度必須等於 N）。不得輸出任何解釋或多餘文字。\n\n【輸入 frames】（僅供閱讀，不得複製到輸出）\n{{ JSON.stringify($json.frames) }}\n\n【每幀可用欄位】\n- type: \"keyframe\" | \"delta\"\n- angles.left_knee / angles.right_knee / angles.torso_tilt（度，0~180）\n- height（0~1，越大越直）\n- com_dx, com_dy（相對上一幀重心位移，像素；y 向下為正）\n- angle_change（相對上一幀角度變化）\n- height_change（相對上一幀 height 變化）\n- person.h（人框高度，像素）\n\n【輸出格式（嚴格）】\n- 回傳一個 JSON 陣列，長度 = N。\n- 陣列中每個物件只包含兩個鍵，且鍵序為：\n  {\"status\":\"站立|坐下|蹲下\",\"dangerous\":true|false}\n\n【共同變數】\n- minKnee = min(angles.left_knee, angles.right_knee)；若缺視為未知。\n- tilt = angles.torso_tilt；若缺視為未知。\n- hNow = person.h；若缺則以上一幀 hNow 代用；仍缺則以 1 代用。\n- 第 0 幀：com_dx=0、com_dy=0、height_change=0、angle_change 視為 0；dangerous 一律 false。\n- 姿態分類的優先順序：蹲下 > 坐下 > 站立（避免模糊時誤判成站立）。\n\n【單幀姿態分類（靜態判斷，優先使用角度，其次參考 height 與 tilt）】\n1) 蹲下：\n   - 若 minKnee < 100\n   - 或 (tilt ≥ 60 且 height < 0.80)\n   → \"蹲下\"\n2) 坐下：\n   - 若 minKnee 在 [100,160) 且 tilt < 60\n   - 或 height 在 [0.55,0.85) 且 tilt < 45\n   → \"坐下\"\n3) 站立：\n   - 若 minKnee ≥ 165 且 tilt ≤ 15 且 height ≥ 0.68\n   - 或（資料略差）minKnee ≥ 160 且 tilt ≤ 20\n   → \"站立\"\n4) 若以上皆不滿足：以最近條件挑選\n\n【危險（跌倒）｜僅 i>0】\n定義（混合絕對與相對門檻）：\n  hPrev = 上一幀的 person.h（若缺則以 hNow 代用）\n  hRef  = max(hNow, hPrev)\n  downFast     = com_dy ≥ max(20, 0.18 * hRef)            # 重心快速下移\n  tiltHigh     = tilt ≥ 65\n  tiltGain     = angle_change.torso_tilt ≥ 20\n  kneeCollapse = (angle_change.left_knee ≤ -25 或 angle_change.right_knee ≤ -25 或 minKnee < 90)\n  heightDrop   = height_change ≤ -0.07\n  lateralSmall = |com_dx| ≤ 0.6 * hRef                     # 橫移不大（避免橫向位移誤報）\n規則：\n  若 downFast 且 tiltHigh 且 tiltGain 且 lateralSmall 且 (kneeCollapse 或 heightDrop)\n  → dangerous = true\n  否則 → dangerous = false\n第 0 幀 dangerous = false。\n\n【缺值處理】\n- 角度缺失時，以 tilt 與 height 判斷；仍遵循優先順序：站立 > 坐下 > 蹲下。\n- 無法滿足跌倒條件時，dangerous = false。\n\n【現在只回傳結果 JSON 陣列】\n",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        660,
+        260
+      ],
+      "id": "6629f41b-bd2b-41fe-a03b-d9abc25b9c04",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ==== 讀入（Webhook 可能把資料放在 body）====\nconst payload   = $json.body ?? $json;\nconst root      = Array.isArray(payload) ? payload[0] : (payload || {});\nconst frames    = Array.isArray(root.frames) ? root.frames : [];\nconst elder_id  = root.elder_id ?? \"\";\nconst session_id= root.session_id ?? \"\";\n\n// ==== 小工具 ====\nconst clamp=(v,lo,hi)=>Math.max(lo,Math.min(hi,v));\nconst dist=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);\nconst mid=(a,b)=>[(a[0]+b[0])/2,(a[1]+b[1])/2];\nconst cxwhToXYXY = (b)=>[b.cx-b.w/2, b.cy-b.h/2, b.cx+b.w/2, b.cy+b.h/2];\nconst boxCenter  = (xyxy)=>[(xyxy[0]+xyxy[2])/2,(xyxy[1]+xyxy[3])/2];\nconst boxW=(b)=>b[2]-b[0], boxH=(b)=>b[3]-b[1];\nconst iou=(a,b)=>{const x1=Math.max(a[0],b[0]),y1=Math.max(a[1],b[1]),x2=Math.min(a[2],b[2]),y2=Math.min(a[3],b[3]);\n  const iw=Math.max(0,x2-x1), ih=Math.max(0,y2-y1), inter=iw*ih; if(!inter) return 0;\n  const areaA=boxW(a)*boxH(a), areaB=boxW(b)*boxH(b), uni=areaA+areaB-inter; return uni>0? inter/uni : 0; };\nconst getKP=(kps,i)=>{const p=kps?.[i]; if(!p) return null;\n  if(Array.isArray(p)) return [p[0],p[1]];\n  if(p?.x!=null && p?.y!=null) return [p.x,p.y];\n  return null;};\nconst angleStable=(a,b,c)=>{ if(!a||!b||!c) return null;\n  const ux=a[0]-b[0], uy=a[1]-b[1], vx=c[0]-b[0], vy=c[1]-b[1];\n  const dot=ux*vx+uy*vy, cross=ux*vy-uy*vx;\n  return +(Math.atan2(Math.abs(cross),dot)*180/Math.PI).toFixed(1); };\nconst torsoTiltDeg=(kps)=>{ const L_SH=getKP(kps,5), R_SH=getKP(kps,6), L_H=getKP(kps,11), R_H=getKP(kps,12);\n  if(!L_SH||!R_SH||!L_H||!R_H) return null; const sh=mid(L_SH,R_SH), hip=mid(L_H,R_H);\n  const vx=sh[0]-hip[0], vy=sh[1]-hip[1], mag=Math.hypot(vx,vy)||1; const cos=clamp((-vy)/mag,-1,1);\n  return +(Math.acos(cos)*180/Math.PI).toFixed(1); };\n\n// ==== 取 pose / object 幀 ====\nconst poseF   = frames.find(f => f?.type==='pose'   || f?.persons);\nconst objectF = frames.find(f => f?.type==='object' || f?.detections);\n\n// 影像資訊\nconst W = (poseF?.image_size?.width  ?? objectF?.image_size?.width  ?? 640);\nconst H = (poseF?.image_size?.height ?? objectF?.image_size?.height ?? 480);\nconst diag = Math.hypot(W,H);\nconst frame_id     = poseF?.frame_id ?? objectF?.frame_id ?? null;\nconst timestamp_ms = poseF?.timestamp_ms ?? objectF?.timestamp_ms ?? null;\n\n// ==== 人框 / KPs ====\nlet person=null, kps=null, personBoxXYXY=null;\nif (poseF?.persons?.length){\n  const p=poseF.persons[0];\n  if (p.bbox){\n    personBoxXYXY=cxwhToXYXY(p.bbox);\n    person={ box: personBoxXYXY, center:[+p.bbox.cx.toFixed(2), +p.bbox.cy.toFixed(2)],\n             w:+(p.bbox.w).toFixed(2), h:+(p.bbox.h).toFixed(2), conf: p.score ?? null };\n  }\n  if (Array.isArray(p.keypoints)) kps=p.keypoints;\n}\n\n// === 單幀姿態特徵（新增） ===\nlet torso_tilt=null, left_knee=null, right_knee=null, height_norm=null, ankle_gap_norm=null;\nlet com=null, kp_coverage=null, kp_mean_conf=null;\nlet bbox_w_norm=null, bbox_h_norm=null, head_y_norm=null, hip_y_norm=null;\n\nif (person && kps){\n  torso_tilt = torsoTiltDeg(kps);\n\n  const L_H=getKP(kps,11), L_K=getKP(kps,13), L_A=getKP(kps,15);\n  const R_H=getKP(kps,12), R_K=getKP(kps,14), R_A=getKP(kps,16);\n  left_knee  = angleStable(L_H,L_K,L_A);\n  right_knee = angleStable(R_H,R_K,R_A);\n\n  const L_SH=getKP(kps,5), R_SH=getKP(kps,6);\n  if (L_SH && R_SH && L_A && R_A){\n    const seg = dist( mid(L_SH,R_SH), mid(L_A,R_A) );\n    height_norm = person.h>0 ? +(clamp(seg/person.h,0,1)).toFixed(3) : null;\n    ankle_gap_norm = person.w>0 ? +(dist(L_A,R_A)/person.w).toFixed(3) : null;\n  }\n\n  // COM + 量測品質\n  let n=0, sx=0, sy=0, sc=0, validKP=0;\n  for (const q of kps){\n    const pt = Array.isArray(q) ? q : (q?.x!=null ? [q.x,q.y] : null);\n    const cf = (q?.confidence ?? q?.c ?? 1);\n    if (pt && Number.isFinite(pt[0]) && Number.isFinite(pt[1])){\n      n++; sx+=pt[0]; sy+=pt[1]; sc += (Number.isFinite(cf)? cf: 0);\n      if (cf>=0.5) validKP++;\n    }\n  }\n  if (n>0){\n    com = [ +(sx/n).toFixed(2), +(sy/n).toFixed(2) ];\n    kp_mean_conf = +(sc/n).toFixed(3);\n    kp_coverage  = +(validKP / n).toFixed(3);\n  }\n\n  // bbox 與畫面比例、頭/髖高度\n  bbox_w_norm = +(person.w / W).toFixed(3);\n  bbox_h_norm = +(person.h / H).toFixed(3);\n  const head=getKP(kps,0);\n  const hipMid = (L_H && R_H) ? mid(L_H,R_H) : null;\n  if (head)   head_y_norm = +(head[1]   / H).toFixed(3);\n  if (hipMid) hip_y_norm  = +(hipMid[1] / H).toFixed(3);\n}\n\n// === 場景幾何（與 bed/chair/sofa 的距離與 IoU） ===\nlet iou_bed=0, iou_chair=0, iou_sofa=0;\nlet dist_bed=null, dist_chair=null, dist_sofa=null;\nlet near_object=null, near_d=null;\n\nconst MAIN = new Set(['bed','chair','sofa']);\nif (objectF?.detections?.length && person){\n  const pc = person.center;\n  let best=Infinity, bestName=null;\n  for (const d of objectF.detections){\n    if (!MAIN.has(d.cls_name)) continue;\n    const obXY=cxwhToXYXY(d.bbox), oc=[d.bbox.cx, d.bbox.cy];\n    const dn = +( (Math.hypot(oc[0]-pc[0], oc[1]-pc[1]) / diag).toFixed(3) );\n    const iv = +(iou(person.box, obXY).toFixed(3));\n\n    if (d.cls_name==='bed'){ iou_bed=iv; dist_bed=dn; }\n    if (d.cls_name==='chair'){ iou_chair=iv; dist_chair=dn; }\n    if (d.cls_name==='sofa'){ iou_sofa=iv; dist_sofa=dn; }\n\n    if (dn < best){ best=dn; bestName=d.cls_name; }\n  }\n  if (bestName){ near_object=bestName; near_d=+best.toFixed(3); }\n}\n\n// === relations（維持你原本的輸出習慣） ===\nconst relations=[];\nfunction pushRel(name, dn, iv){\n  if (dn==null && iv==null) return;\n  const onThr = (name==='bed') ? 0.15 : 0.20;\n  const nearThr = 0.18;\n  let relation='far';\n  if ((iv ?? 0) >= onThr) relation='on';\n  else if ((dn ?? 1) <= nearThr) relation='beside';\n  relations.push({ object:name, distance_norm:dn ?? null, iou:iv ?? 0, relation });\n}\npushRel('bed', dist_bed, iou_bed);\npushRel('chair', dist_chair, iou_chair);\npushRel('sofa', dist_sofa, iou_sofa);\n\n// === Fallback 粗判（提供給前端或 Agent 參考） ===\nconst kneesMin = Math.min( left_knee ?? 999, right_knee ?? 999 );\nlet status_fallback='unknown';\nif (height_norm!=null && torso_tilt!=null){\n  if (height_norm>0.75 && torso_tilt<25 && iou_bed<0.15 && kneesMin>150) status_fallback='standing';\n  else if (height_norm>=0.45 && height_norm<=0.70 && kneesMin<120)      status_fallback='sitting';\n  else if ((height_norm<0.40 && torso_tilt>50) || iou_bed>0.15)          status_fallback='lying';\n  else status_fallback='transition';\n}\nconst near_fallback = near_object || ((iou_bed>0.15) ? 'bed' : 'none');\nconst isDangrous_fallback = false; // 單幀不判跌倒；要用時間窗訊號（Δheight/Δtilt）才可靠\n\n// === 組輸出（給 Agent 超好消化，也保留你原本的欄位） ===\nreturn {\n  json: {\n    elder_id,\n    session_id,\n    frame: { frame_id, timestamp_ms, image_size:{ width:W, height:H } },\n\n    person: person || null,\n    features: {\n      torso_tilt, height_norm, left_knee, right_knee, ankle_gap_norm,\n      com, kp_coverage, kp_mean_conf,\n      bbox_w_norm, bbox_h_norm, head_y_norm, hip_y_norm\n    },\n    scene: {\n      near_object, near_d,\n      iou_bed, iou_chair, iou_sofa,\n      dist_bed, dist_chair, dist_sofa\n    },\n\n    // 舊格式相容\n    person_center: person?.center || null,\n    relations,\n\n    // 簡易回退（可直接給前端用；最終還是建議讓 Agent 產生正式判斷）\n    status_fallback: status_fallback,\n    isDangrous_fallback: isDangrous_fallback,\n    near_fallback: near_fallback,\n\n    // 給 Agent 的輸出約束\n    expect_output_schema: {\n      status: \"standing|sitting|lying|falling|transition|unknown\",\n      isDangrous: \"boolean\",\n      near: \"bed|chair|sofa|none\"\n    }\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        220,
+        260
+      ],
+      "id": "0f3620a0-7056-4ba4-be0d-3e06de337f98",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        560,
+        440
+      ],
+      "id": "59412e5d-4681-4e92-8574-00b70acb5771",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        260
+      ],
+      "id": "8e814792-c7c5-4650-b25f-0fe4d9006db5",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 1) 取請求攜帶的歷史 window（可能為空）\nconst reqWindow = Array.isArray($json.window) ? $json.window : [];\n\n// 2) 把本幀轉成精簡記錄，推進 window，裁成最多 20 幀\nconst r = $json;\nconst nowRec = {\n  ts: r.frame?.timestamp_ms ?? Date.now(),\n  height_norm: r.features?.height_norm ?? null,\n  torso_tilt:  r.features?.torso_tilt  ?? null,\n  knees_min: Math.min(r.features?.left_knee ?? 999, r.features?.right_knee ?? 999),\n  com_y: Array.isArray(r.features?.com) ? r.features.com[1] : null,\n  iou_bed: r.scene?.iou_bed ?? 0,\n  near_object: r.scene?.near_object ?? null\n};\nconst windowArr = [...reqWindow, nowRec]\n  .sort((a,b)=>a.ts-b.ts)\n  .slice(-20);\n\n// 3) 產生 last5 / prev5 / last3 / prev3\nconst takeLast = (arr,n)=>arr.slice(-Math.min(n,arr.length));\nconst last5 = takeLast(windowArr,5);\nconst prev5 = windowArr.slice(-10,-5);\nconst last3 = takeLast(windowArr,3);\nconst prev3 = windowArr.slice(-6,-3);\n\nconst mean = (arr, sel) => {\n  const v = arr.map(sel).filter(x=>Number.isFinite(x));\n  return v.length ? +(v.reduce((s,x)=>s+x,0)/v.length).toFixed(3) : null;\n};\nconst diffMean = (a1,a2,sel)=>{\n  if(!a1.length||!a2.length) return null;\n  return +(mean(a1,sel) - mean(a2,sel)).toFixed(3);\n};\n\n// 4) 指標\nconst height_mean = mean(last5, r=>r.height_norm);\nconst tilt_mean   = mean(last5, r=>r.torso_tilt);\nconst knees_mean  = mean(last5, r=>r.knees_min);\nconst dHeight     = diffMean(last5, prev5, r=>r.height_norm);\nconst dTilt       = diffMean(last5, prev5, r=>r.torso_tilt);\nconst dHeight3    = diffMean(last3, prev3, r=>r.height_norm);\nconst dTilt3      = diffMean(last3, prev3,  r=>r.torso_tilt);\n\n// 即時重心速度\nlet vy_now = null;\nif (windowArr.length >= 2) {\n  const a = windowArr[windowArr.length-2];\n  const b = windowArr[windowArr.length-1];\n  if (Number.isFinite(a.com_y) && Number.isFinite(b.com_y)) {\n    const dt = (b.ts - a.ts) || 1;\n    vy_now = +((b.com_y - a.com_y) / dt).toFixed(4); // px/ms\n  }\n}\nconst last = windowArr[windowArr.length-1] || {};\nconst scene = { near_object: last.near_object ?? null, iou_bed: last.iou_bed ?? 0 };\n\n// 5) Hints（同之前）\nconst hint_stand = (height_mean!=null && tilt_mean!=null)\n  ? (height_mean>0.75 && tilt_mean<30 && (knees_mean??151)>150 && scene.iou_bed<0.15) : false;\nconst hint_sit = (height_mean!=null && knees_mean!=null)\n  ? (height_mean>=0.45 && height_mean<=0.70 && knees_mean<120) : false;\nconst hint_lie = (height_mean!=null && tilt_mean!=null)\n  ? ((height_mean<0.40 && tilt_mean>50) || scene.iou_bed>0.15) : false;\n\nconst fast_drop_now  = ((dHeight3!=null && dTilt3!=null) && (dHeight3<=-0.18 && dTilt3>=+25) && scene.iou_bed<0.15)\n                    || (vy_now!=null && vy_now>=0.04);\nconst fast_drop_long = (dHeight!=null && dTilt!=null) && (dHeight<=-0.30 && dTilt>=+40) && (scene.iou_bed<0.15);\n\n// 6) 輸出：保留 window（回傳給父流程/前端/後端，下次請求直接帶回來）\nreturn {\n  json: {\n    ...$json,\n    window: windowArr,   // <<--- 下次請求請把它帶回來（最多 20 筆）\n    summary: {\n      window: { size: windowArr.length, last_block: last5.length },\n      features: {\n        height_norm: { mean_last: height_mean, delta_vs_prev: dHeight, delta_vs_prev3: dHeight3 },\n        torso_tilt:  { mean_last: tilt_mean,  delta_vs_prev: dTilt,   delta_vs_prev3: dTilt3 },\n        knees_min_mean: knees_mean,\n        vy_now\n      },\n      scene,\n      hints: { stand: hint_stand, sit: hint_sit, lie: hint_lie, fast_drop_now, fast_drop_long }\n    }\n  }\n};\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        260
+      ],
+      "id": "c8579185-689e-49c0-9b03-6c8a7532a9ba",
+      "name": "Code"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "AI Agent1": {
+      "main": [
+        []
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "2ccfdf64-85ee-49a1-b4a4-98939bbe457a",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "hs6NnGOZ4RZNqewk",
+  "tags": []
+}

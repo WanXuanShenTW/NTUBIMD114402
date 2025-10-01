@@ -1,0 +1,547 @@
+{
+  "name": "ASK",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ask",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1100,
+        300
+      ],
+      "id": "8d0c1859-6f1c-4696-9e5d-29eb175e353a",
+      "name": "Webhook",
+      "webhookId": "5f8bd45d-3394-45c9-a877-2b3d964ab6f0"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=你是一個智慧助理，必須根據使用者的問題決定只輸出以下三種文字之一（完全一致，其他都不能多）：\nweather\nnews\n{{ $json.query.Q }}\n\n請遵守以下規則：\n- 如果跟天氣等相關字，就只輸出：weather\n- 如果問題提到「新聞」「發生什麼事」「有什麼新消息」等相關新聞字眼，就只輸出：news\n- 如果完全與天氣或新聞無關，就直接輸出：{{ $json.query.Q }}\n\n注意：\n- 請只輸出這三種其中之一（完全相同），不要加句號、不要加文字、不要加標點或註解。\n- 例如：\n  - 使用者問「今天天氣如何」→ 輸出：weather\n  - 使用者問「今天有什麼新聞」→ 輸出：news\n  - 使用者問「你最喜歡什麼顏色」→ 輸出：你最喜歡什麼顏色\n\n以下是使用者的問題：\n{{ $json.query.Q }}\n",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        300
+      ],
+      "id": "b111dcd4-5b63-4463-92f4-ed1d8707d0ce",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": "=gemma3:4b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        -860,
+        520
+      ],
+      "id": "21bd9394-6095-4423-8c85-74fd7bf2b0c6",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "IisuVXPg7Ce0W0vh",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.output.trim() }}",
+                    "rightValue": "news",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "4eab4d3a-0855-480b-8d00-1c28046abd10"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8b97ffc7-bbf6-4ac2-92d8-937443021c8b",
+                    "leftValue": "={{ $json.output.trim() }}",
+                    "rightValue": "=weather",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "8e668bb5-77e9-417a-ad1e-1b13f29eeed9",
+                    "leftValue": "={{ $json.output.trim() }}",
+                    "rightValue": "none",
+                    "operator": {
+                      "type": "string",
+                      "operation": "notEmpty",
+                      "singleValue": true
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -480,
+        300
+      ],
+      "id": "8f3c8f1c-2c88-4f63-9406-49ee50fe8e6a",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "cityName": "Taipei",
+        "language": "tw"
+      },
+      "type": "n8n-nodes-base.openWeatherMap",
+      "typeVersion": 1,
+      "position": [
+        -20,
+        400
+      ],
+      "id": "eb3a83c8-9296-4f27-aabb-86b01100f6f3",
+      "name": "OpenWeatherMap",
+      "credentials": {
+        "openWeatherMapApi": {
+          "id": "VQiPRG8y9sp4gc2s",
+          "name": "OpenWeatherMap account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=這是我用\n(以下是今天的天氣資料，請用輕鬆、溫暖、容易理解的語氣講給爺爺或奶奶聽：\n- 天氣情況：{{ $json.weather[0].main }}（{{ $json.weather[0].description }}）\n- 氣溫：{{ $json.main.temp }}°C\n- 體感溫度：{{ $json.main.feels_like }}°C\n- 濕度：{{ $json.main.humidity }}%\n\n請根據這些資訊，用親切的方式告訴他/她今天適不適合外出，要不要多帶件外套或帶傘。)",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        200,
+        400
+      ],
+      "id": "a03a8701-bc1d-41c5-8121-a9a4c7dd9c81",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {
+        "model": "gemma3:4b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        220,
+        580
+      ],
+      "id": "946e61da-5fae-4d5d-b973-7ef80f8b6297",
+      "name": "Ollama Chat Model1",
+      "credentials": {
+        "ollamaApi": {
+          "id": "IisuVXPg7Ce0W0vh",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=以下是今天的新聞資料，請你用輕鬆、愉快、容易理解的語氣講給長輩聽。\n請挑選裡面比較溫暖、有趣、正面的新聞內容來分享，\n盡量避開負面、驚悚或太複雜的政治經濟話題。\n可以用像是鄰居聊天、陪爺爺奶奶說話的方式來說這些新聞。\n\n以下是新聞資料：\n{{ $json }}\n\n",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        400,
+        100
+      ],
+      "id": "eaf2c046-831c-4081-bab6-5a56a72f1e44",
+      "name": "AI Agent2"
+    },
+    {
+      "parameters": {
+        "model": "gemma3:4b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        420,
+        240
+      ],
+      "id": "bb540330-517e-48e6-8e9a-65bb6de4091c",
+      "name": "Ollama Chat Model2",
+      "credentials": {
+        "ollamaApi": {
+          "id": "IisuVXPg7Ce0W0vh",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## 還在修",
+        "height": 320,
+        "width": 860
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        40
+      ],
+      "id": "63854f1e-0ce6-4b81-a581-1893e923f5e4",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=你是一個智慧助理，會根據使用者的問題自動決定要用什麼工具。\n請你用最合適的方式直接回答，像在陪長輩聊天。\n {{ $json.output }}",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        600
+      ],
+      "id": "b6cd0981-e6c4-49a7-a31e-1dca880bc242",
+      "name": "AI Agent3"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -200,
+        800
+      ],
+      "id": "7abd9d51-4a89-485e-af37-3e6af976f252",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "oDKavUn69OfBnKh1",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "speech",
+        "voice": {
+          "__rl": true,
+          "value": "kGjJqO6wdwRN9iJsoeIC",
+          "mode": "list",
+          "cachedResultName": "Yui - Elegant & Soothing"
+        },
+        "text": "={{ $json.output }}",
+        "additionalOptions": {},
+        "requestOptions": {}
+      },
+      "type": "@elevenlabs/n8n-nodes-elevenlabs.elevenLabs",
+      "typeVersion": 1,
+      "position": [
+        560,
+        400
+      ],
+      "id": "d07c4fa9-fcd4-424b-ab06-d21cadf3b7dd",
+      "name": "Convert text to speech",
+      "credentials": {
+        "elevenLabsApi": {
+          "id": "3TMT8MkLMXU8VnJE",
+          "name": "ElevenLabs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "speech",
+        "voice": {
+          "__rl": true,
+          "value": "pTOe8BQRdydOEIgv0wFL",
+          "mode": "list",
+          "cachedResultName": "LiuPing"
+        },
+        "text": "={{ $json.output }}",
+        "additionalOptions": {},
+        "requestOptions": {}
+      },
+      "type": "@elevenlabs/n8n-nodes-elevenlabs.elevenLabs",
+      "typeVersion": 1,
+      "position": [
+        880,
+        80
+      ],
+      "id": "9145b07d-ec88-4907-b3c1-b3b6caa20d35",
+      "name": "Convert text to speech1",
+      "credentials": {
+        "elevenLabsApi": {
+          "id": "3TMT8MkLMXU8VnJE",
+          "name": "ElevenLabs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "speech",
+        "voice": {
+          "__rl": true,
+          "value": "pTOe8BQRdydOEIgv0wFL",
+          "mode": "list",
+          "cachedResultName": "LiuPing"
+        },
+        "text": "={{ $json.output }}",
+        "additionalOptions": {},
+        "requestOptions": {}
+      },
+      "type": "@elevenlabs/n8n-nodes-elevenlabs.elevenLabs",
+      "typeVersion": 1,
+      "position": [
+        320,
+        700
+      ],
+      "id": "ccc12573-5d20-44c9-9cd7-4d7767292dd5",
+      "name": "Convert text to speech2",
+      "credentials": {
+        "elevenLabsApi": {
+          "id": "3TMT8MkLMXU8VnJE",
+          "name": "ElevenLabs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:8000/search",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"keyword\": \"Trump\"\n}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        80,
+        140
+      ],
+      "id": "c98e0744-108b-403c-aed8-6a627931f5e2",
+      "name": "HTTP Request"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "OpenWeatherMap",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "AI Agent3",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenWeatherMap": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "Convert text to speech",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent2": {
+      "main": [
+        [
+          {
+            "node": "Convert text to speech1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent3": {
+      "main": [
+        [
+          {
+            "node": "Convert text to speech2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent3",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "e01f01c6-dce8-4188-8724-d6fffc68fc86",
+  "meta": {
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "Oo2MEOl1k9wiG62W",
+  "tags": []
+}

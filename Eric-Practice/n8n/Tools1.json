@@ -1,0 +1,260 @@
+{
+  "name": "分流器",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "2d397473-31e1-4fb5-b2cb-5c4e2be82e8c",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -120,
+        60
+      ],
+      "id": "269a7e2e-1213-4b2d-aecd-801878c37ab6",
+      "name": "Webhook",
+      "webhookId": "2d397473-31e1-4fb5-b2cb-5c4e2be82e8c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === 讀入（有些來源把資料放在 body） ===\nconst raw = items[0].json?.body ?? items[0].json;\n\n// 基本中繼資料（你要傳下去的欄位）\nconst meta = {};\nfor (const k of ['elder_id','session_id','timestamp_ms','lang']) {\n  if (raw && raw[k] != null) meta[k] = raw[k];\n}\n\nconst outputs = [];\n\n// ------------ chat ------------\nif (typeof raw?.message === 'string' && raw.message.trim()) {\n  outputs.push({\n    json: { method: 'talk', ...meta, message: raw.message.trim() }\n  });\n}\n\n// ------------ detect（frames 版）------------\nfunction validFrame(f) {\n  if (!f || typeof f !== 'object') return false;\n  if (['pose','object'].includes(f.type)) return true;\n  if (Array.isArray(f.persons) || Array.isArray(f.detections)) return true;\n  return false;\n}\nfunction toFrames(b) {\n  if (!b) return [];\n  if (Array.isArray(b.frames)) return b.frames.filter(validFrame);\n  if (validFrame(b)) return [b];\n  // 也支援 {pose: {...}, object: {...}} 這種包法\n  const arr = [];\n  if (validFrame(b.pose))   arr.push(b.pose);\n  if (validFrame(b.object)) arr.push(b.object);\n  return arr;\n}\nconst frames = toFrames(raw);\nif (frames.length) {\n  outputs.push({\n    json: { method: 'detect', ...meta, frames }\n  });\n}\n\n// ------------ 都沒有命中 ------------\nif (!outputs.length) {\n  outputs.push({ json: { method: 'unknown', ...meta, raw } });\n}\n\nreturn outputs;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        60
+      ],
+      "id": "6dcf7e47-d32a-45fc-848e-2ffe2ed6a942",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "hs6NnGOZ4RZNqewk",
+          "mode": "list",
+          "cachedResultName": "骨架分析v4"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        760,
+        160
+      ],
+      "id": "60b63db3-1ac8-4af9-9d30-895dce127bd4",
+      "name": "Execute Workflow1"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "8WsJLR6X8i4P1VL1",
+          "mode": "list",
+          "cachedResultName": "語音助手"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        760,
+        -40
+      ],
+      "id": "e86709b1-23f7-47fa-b899-e890c885f90f",
+      "name": "Execute Workflow"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.method }}",
+                    "rightValue": "talk",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "abfbe3cc-d360-4f64-a1b4-627c36910210"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2b3dfa72-5f40-4a75-a0ab-3b33fe22c0f5",
+                    "leftValue": "={{ $json.method }}",
+                    "rightValue": "detect",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        320,
+        60
+      ],
+      "id": "76fc4072-019f-4df9-a328-85df0d19d822",
+      "name": "分支"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"elder_id\": \"{{ $json.elder_id || '' }}\",\n  \"session_id\": \"{{ $json.session_id || '' }}\",\n  \"message\": \"{{ $json.message || $json.body?.message || $json.text }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        540,
+        -40
+      ],
+      "id": "3deb65f3-8e47-4a94-aa99-8a44a61ebeb6",
+      "name": "語音"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"elder_id\": \"{{ $json.elder_id || $json.body?.elder_id || '' }}\",\n  \"session_id\": \"{{ $json.session_id || $json.body?.session_id || '' }}\",\n  \"timestamp_ms\": {{ $json.timestamp_ms ?? $json.body?.timestamp_ms ?? $json.frames?.[0]?.timestamp_ms ?? null }},\n  \"frames\": {{ $json.frames || $json.body?.frames || ( $json.pose || $json.object ? [].concat($json.pose ? [$json.pose] : [], $json.object ? [$json.object] : []) : [] ) }}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        540,
+        160
+      ],
+      "id": "194cb3b3-c06f-4af1-96bf-f0d0d55fb6b8",
+      "name": "骨架"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "分支",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "分支": {
+      "main": [
+        [
+          {
+            "node": "語音",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "骨架",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "語音": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "骨架": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Taipei",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "ff02b848-72b7-42ca-a796-50f7c8db5b93",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "8kyUzIRhKszUSeaj",
+  "tags": []
+}

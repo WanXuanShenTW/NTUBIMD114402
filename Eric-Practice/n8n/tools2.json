@@ -1,0 +1,471 @@
+{
+  "name": "語音助手",
+  "nodes": [
+    {
+      "parameters": {
+        "model": "sonar",
+        "messages": {
+          "message": [
+            {
+              "content": "={{ $json.output}}"
+            }
+          ]
+        },
+        "simplify": true,
+        "options": {},
+        "requestOptions": {}
+      },
+      "type": "n8n-nodes-base.perplexity",
+      "typeVersion": 1,
+      "position": [
+        860,
+        0
+      ],
+      "id": "728792d6-ebe3-463f-8056-d2fa900baa7b",
+      "name": "Message a model",
+      "credentials": {
+        "perplexityApi": {
+          "id": "HXMQIKmf5o65lI7l",
+          "name": "Perplexity account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": "gemma3:4b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        1180,
+        360
+      ],
+      "id": "85c3a86d-26aa-4a7b-bd45-5fd27e416d69",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "OzE5LtXZQK43oVdT",
+          "name": "Ollama account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        580,
+        220
+      ],
+      "id": "e248ef11-94cb-4035-b4f9-a4b3eca63144",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -540,
+        140
+      ],
+      "id": "a9a7b05f-f058-439a-a8f8-df6896a13357",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1900,
+        140
+      ],
+      "id": "aafe0f75-d72f-486d-ab06-900d9de559fc",
+      "name": "No Operation, do nothing"
+    },
+    {
+      "parameters": {
+        "mode": "chooseBranch"
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1680,
+        140
+      ],
+      "id": "52c78ede-697f-4abb-a5b6-3948ad25b926",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "table": {
+          "__rl": true,
+          "value": "interactions_records",
+          "mode": "list",
+          "cachedResultName": "interactions_records"
+        },
+        "dataMode": "defineBelow",
+        "valuesToSend": {
+          "values": [
+            {
+              "column": "elder_text",
+              "value": "={{ $node[\"When Executed by Another Workflow\"].json.message }}"
+            },
+            {
+              "column": "elder_id",
+              "value": "={{ $node[\"When Executed by Another Workflow\"].json.elder_id }}"
+            },
+            {
+              "column": "created_at",
+              "value": "={{ $now.setZone('Asia/Taipei').toFormat('yyyy-LL-dd HH:mm') }}"
+            },
+            {
+              "column": "ai_text",
+              "value": "={{ $json.output }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        1460,
+        200
+      ],
+      "id": "b293c21d-d494-4206-a6f8-829ace4def4c",
+      "name": "Insert rows in a table",
+      "credentials": {
+        "mySql": {
+          "id": "BBBQQfzfp2FEoC6o",
+          "name": "MySQL account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}",
+        "options": {
+          "systemMessage": "=你是一個語意辨識助理，請根據以下訊息進行推測，來將使用者的問題填充完整，你只要加入缺少的資訊，不需要回答\n\n若無缺少資訊，直接交給下一個節點\n\n---------------------------------------\n以下是使用者的資訊：\n名字：Eric\n居住地：台北市士林區\n性別：男\n年紀：78歲"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        500,
+        0
+      ],
+      "id": "cd2f30e8-45ec-4285-83b1-b64e8f47b356",
+      "name": "語意補充"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}",
+        "options": {
+          "systemMessage": "你是一個資料摘要專家。我等等會餵給你一些資訊，請你將他整理成適合播報給老人家聽的格式，不需要太長，只要回答問題就好了\n\n像日常對話那樣，不需要太多的擬聲詞，大概三句話\n\n說的話請符合邏輯，不要亂說"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        140
+      ],
+      "id": "9acf89b8-e924-4c66-a9a3-cbfe9d61010e",
+      "name": "生成摘要"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.output}}",
+                    "rightValue": "chat",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "a6f092c0-e22a-4824-aeb1-1b2a87d1f7cf"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4caa1736-c486-40c4-b4f8-66dd4756b4fb",
+                    "leftValue": "={{$json.output}}",
+                    "rightValue": "search",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        280,
+        140
+      ],
+      "id": "efbd4edd-982e-453b-9507-5b0942fba1f0",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -240,
+        360
+      ],
+      "id": "1c8c4f87-1d9d-4501-b3e0-816116494c6d",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// base：原始輸入（或你的正規化 Code 節點）\nconst base = $item(0).$node['When Executed by Another Workflow'].json;\n// agent：AI Agent 的輸出（只有 {output: ...}）\nconst agent = $json;\n\n// 合併；若有同名鍵，以 agent 覆蓋 base\nreturn [{ ...base, ...agent }];   // 得到 {elder_id, session_id, message, output}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        140
+      ],
+      "id": "36599415-78c2-4745-8658-dbe7ecb61832",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "{{ $json.message }}",
+        "options": {
+          "systemMessage": "你是一個語句分辨。輸入是一句中文。只回傳 chat 或 search（全部小寫，不能有空白、引號、括號、標點或其他字）。\n\n請嚴格依序執行，命中即決，不要推理：\n1) 若句子含以下任一片語 ⇒ 回 chat（優先級最高）\n   聊、聊天、聊聊、陪聊、陪我聊、陪我聊天、一起聊聊、想聊天、跟我聊天、陪我說話、陪我講話、說說話、講講話、作伴、陪伴\n2) 若句子含以下任一字詞 ⇒ 回 search\n   天氣、新聞、日期、時間、今天、明天、現在、哪裡、地點、地址、路線、電話、台北、臺北、幾點、多少、價格、價錢、匯率、股價、播放、回放、顯示、查、查詢、搜尋、找、列出、統計、紀錄、報表、我的、睡覺、睡眠、步數、影片、收藏、貼文、女兒、兒子、近期、最近\n3) 若同時命中 1 與 2 ⇒ 回 chat\n4) 其他或不確定 ⇒ 回 search\n\n只回：chat 或 search。\n\n【範例】\n可以跟我聊天嗎 → chat\n陪我說說話好嗎 → chat\n今天天氣如何 → search\n那台北呢 → search\n你好，我叫Eric → chat\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        140
+      ],
+      "id": "3139b59b-82d9-4038-afbd-cab2add724eb",
+      "name": "chat/search"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "生成摘要",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "生成摘要",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "語意補充",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "chat/search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insert rows in a table": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "語意補充": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "生成摘要": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Insert rows in a table",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "生成摘要",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "語意補充",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "chat/search",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "chat/search": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "03fac38f-9a05-46cf-8dcd-b70bd3b8eff8",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "8WsJLR6X8i4P1VL1",
+  "tags": []
+}

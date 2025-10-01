@@ -1,12 +1,12 @@
 from ..dao.role_dao import select_role_name_by_id
-from ..db import get_connection
+from ..db import Database
 from ..exceptions import NotFoundError, DatabaseError
 
 async def get_role_name(role_id: int) -> str:
     """
     根據角色 ID 查詢角色名稱。
     """
-    async with get_connection() as conn:
+    async with Database.connection() as conn:
         try:
             role_name = await select_role_name_by_id(conn, role_id)
             if role_name is None:

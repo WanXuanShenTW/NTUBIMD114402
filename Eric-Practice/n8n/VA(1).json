@@ -1,0 +1,249 @@
+{
+  "name": "語音助手",
+  "nodes": [
+    {
+      "parameters": {
+        "model": "sonar",
+        "messages": {
+          "message": [
+            {
+              "content": "={{ $json.output }}"
+            }
+          ]
+        },
+        "simplify": true,
+        "options": {},
+        "requestOptions": {}
+      },
+      "type": "n8n-nodes-base.perplexity",
+      "typeVersion": 1,
+      "position": [
+        220,
+        0
+      ],
+      "id": "728792d6-ebe3-463f-8056-d2fa900baa7b",
+      "name": "Message a model",
+      "credentials": {
+        "perplexityApi": {
+          "id": "HXMQIKmf5o65lI7l",
+          "name": "Perplexity account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.message }}",
+        "options": {
+          "systemMessage": "你是一個資料摘要專家。我等等會餵給你一些資訊，請你將他整理成適合播報給老人家聽的格式，不需要太長，只要回答問題就好了\n\n像日常對話那樣，不需要太多的擬聲詞，大概三句話"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "id": "9acf89b8-e924-4c66-a9a3-cbfe9d61010e",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        800,
+        0
+      ],
+      "id": "0d617513-3d8b-4693-bf33-9687422dbcf1",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "elder-voice",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        60
+      ],
+      "id": "923d121a-dde2-4971-a1f1-dd0d85d4beea",
+      "name": "Webhook1",
+      "webhookId": "a2682804-0219-43c6-bfa4-c8c4bf0b6c49"
+    },
+    {
+      "parameters": {
+        "httpMethod": "=POST",
+        "path": "b624cb81-212d-4f3a-be47-f4761324aeef",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -360,
+        20
+      ],
+      "id": "1efd11c6-fa14-4251-8737-7825f721123f",
+      "name": "Webhook",
+      "webhookId": "b624cb81-212d-4f3a-be47-f4761324aeef"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.query.Q }}",
+        "options": {
+          "systemMessage": "你是一個語意辨識助理，請根據以下訊息進行推測，來將使用者的問題填充完整\n\n---------------------------------------\n以下是使用者的資訊：\n居住地：台北市士林區\n性別：男\n年紀：78歲"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        -160,
+        20
+      ],
+      "id": "cd2f30e8-45ec-4285-83b1-b64e8f47b356",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -120,
+        220
+      ],
+      "id": "e248ef11-94cb-4035-b4f9-a4b3eca63144",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        460,
+        220
+      ],
+      "id": "5d4f5d53-ceae-4831-b711-cf9284554f76",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook1": {
+      "main": [
+        []
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "eea601f8-64ca-4ebe-ad75-e3faec7fee24",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "8WsJLR6X8i4P1VL1",
+  "tags": []
+}

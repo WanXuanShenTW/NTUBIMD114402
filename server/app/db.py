@@ -3,22 +3,27 @@ import asyncio
 from dotenv import load_dotenv
 from aiomysql import create_pool, OperationalError
 from contextlib import asynccontextmanager
+from aiomysql.cursors import DictCursor
+import time, uuid, traceback
 
 load_dotenv()
 
 USE_POOL_TIMEOUT = os.getenv("USE_POOL_TIMEOUT", "false").lower() == "true"
-POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 2))  # acquire 逾時（秒）
+POOL_TIMEOUT = int(os.getenv("POOL_TIMEOUT", 15))  # acquire 逾時（秒）
 
 # 連線最長存活（秒）：應小於 MySQL wait_timeout；避免 NAT/防火牆閒置回收
-POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", 1800))
+POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", 300))  # 改為5分鐘
 
 # 借出時 pre-ping，避免用到壞連線
 PRE_PING = os.getenv("DB_PRE_PING", "true").lower() == "true"
-PING_TIMEOUT = float(os.getenv("DB_PING_TIMEOUT", 1.0))
+PING_TIMEOUT = float(os.getenv("DB_PING_TIMEOUT", 3.0))
 
 # 會自動重試的 MySQL 錯誤碼
 _RETRY_ERRCODES = {2006, 2013}  # MySQL server has gone away / Lost connection during query
 
+ACTIVE_BORROWERS = {}   # 走 Database.connection() 的使用者
+POOL_INUSE = {}         # 直接從 pool.acquire() 借走的原始連線
+DB_HOLD_WARN_MS = int(os.getenv("DB_HOLD_WARN_MS", "800"))  # 超過這毫秒印出告警
 
 class _RetryingCursor:
     """
@@ -80,7 +85,8 @@ class _RetryingConnection:
         self._db = db
         self._raw = None
         self._closed = False
-
+        self._released = False
+        
     async def _acquire_initial(self):
         self._raw = await self._db._acquire_from_pool()
         if PRE_PING:
@@ -130,16 +136,22 @@ class _RetryingConnection:
         return _RetryingCursor(self, args, kwargs)
 
     async def ensure_closed(self):
-        if self._raw:
+        if self._raw and not self._closed:
             try:
                 await self._raw.ensure_closed()
-            except Exception:
-                pass
+                self._closed = True
+                print(f"[✅] Connection properly closed")
+            except Exception as e:
+                print(f"[⚠️] Error closing connection: {e}")
 
     def close(self):
         if self._raw and not self._closed:
-            self._raw.close()
-            self._closed = True
+            try:
+                self._raw.close()
+                self._closed = True
+                print(f"[✅] Connection closed")
+            except Exception as e:
+                print(f"[⚠️] Error in close(): {e}")
 
     def __getattr__(self, name):
         return getattr(self._raw, name)
@@ -150,21 +162,28 @@ class Database:
 
     @classmethod
     async def init_pool(cls):
-        """初始化連線池"""
+        """初始化連線池 - 遠端資料庫適用版"""
         if cls._pool is not None:
             return
+        
+        # 根據MySQL max_connections=151，使用保守設定
+        min_size = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
+        max_size = int(os.getenv("DB_POOL_MAX_SIZE", "8"))  # 保守設定，避免耗盡連線
+        
         cls._pool = await create_pool(
             host=os.getenv("DB_HOST"),
+            port=int(os.getenv("DB_PORT", "3306")),
             user=os.getenv("DB_USER"),
             password=os.getenv("DB_PASSWORD"),
             db=os.getenv("DB_NAME"),
-            minsize=1,
-            maxsize=10,
+            minsize=min_size,
+            maxsize=max_size,
             autocommit=True,
-            pool_recycle=POOL_RECYCLE,   # ✅ 定期回收舊連線
-            # connect_timeout=5,
+            pool_recycle=POOL_RECYCLE,
+            connect_timeout=int(os.getenv("DB_CONNECT_TIMEOUT", "20")),
+            charset=os.getenv("DB_CHARSET", "utf8mb4"),
         )
-        print(f"[✅] Connection pool initialized (recycle={POOL_RECYCLE}s, pre_ping={PRE_PING})")
+        print(f"[✅] Connection pool initialized (min={min_size}, max={max_size}, recycle={POOL_RECYCLE}s)")
 
     @classmethod
     async def close_pool(cls):
@@ -172,15 +191,38 @@ class Database:
         if cls._pool:
             cls._pool.close()
             await cls._pool.wait_closed()
+            cls._pool = None
             print("[❎] Connection pool closed")
 
     @classmethod
     async def _acquire_from_pool(cls):
-        if cls._pool is None:
-            raise RuntimeError("❌ Connection pool not initialized")
-        if USE_POOL_TIMEOUT:
-            return await asyncio.wait_for(cls._pool.acquire(), timeout=POOL_TIMEOUT)
-        return await cls._pool.acquire()
+        """從連線池取得原始連線"""
+        if not cls._pool:
+            raise RuntimeError("Connection pool not initialized")
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                if USE_POOL_TIMEOUT:
+                    raw_conn = await asyncio.wait_for(cls._pool.acquire(), timeout=POOL_TIMEOUT)
+                else:
+                    raw_conn = await cls._pool.acquire()
+                
+                return raw_conn
+                
+            except asyncio.TimeoutError:
+                print(f"[⚠️] Pool acquire timeout on attempt {attempt + 1}")
+                if attempt == max_retries - 1:
+                    raise RuntimeError("Connection pool acquire timeout after retries")
+            except Exception as e:
+                print(f"[⚠️] Pool acquire failed on attempt {attempt + 1}: {e}")
+                if attempt == max_retries - 1:
+                    raise
+            
+            # 短暫等待後重試
+            await asyncio.sleep(0.1 * (attempt + 1))
+        
+        raise RuntimeError("Failed to acquire connection after retries")
 
     @classmethod
     async def get_connection(cls):
@@ -194,42 +236,87 @@ class Database:
 
     @classmethod
     async def release_connection(cls, conn):
-        """釋放連線（支援包裝器或原生連線）"""
-        if cls._pool and conn:
+        """修正版釋放連線 - 確保連線被正確釋放"""
+        if not cls._pool or not conn:
+            return
+            
+        try:
+            # 確保關閉連線相關資源
+            if hasattr(conn, '_raw') and conn._raw:
+                raw_conn = conn._raw
+                # 重要：將原始連線還給池子
+                cls._pool.release(raw_conn)
+                print(f"[✅] Connection released to pool")
+            elif hasattr(conn, 'close'):
+                # 直接是原始連線的情況
+                cls._pool.release(conn)
+                print(f"[✅] Raw connection released to pool")
+                
+        except Exception as e:
+            print(f"[⚠️] Error releasing connection: {e}")
+            # 如果釋放失敗，強制關閉連線
             try:
-                raw = getattr(conn, "_raw", None) or conn
-                try:
-                    await getattr(raw, "ensure_closed")()
-                except Exception:
-                    pass
-                cls._pool.release(raw)
-            except Exception:
+                if hasattr(conn, '_raw') and conn._raw:
+                    conn._raw.close()
+                elif hasattr(conn, 'close'):
+                    conn.close()
+            except:
                 pass
 
     @classmethod
     @asynccontextmanager
     async def connection(cls):
-        """
-        用法：
-            async with Database.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT 1")
-        """
-        rconn = await cls.get_connection()
+        conn = await cls.get_connection()  # 保持你原本的取得方式
+
+        # 登記這次借用（沒有 middleware，就用 '-' 當標籤）
+        borrow_id = uuid.uuid4().hex[:8]
+        req_label = "-"
+        ACTIVE_BORROWERS[borrow_id] = {
+            "since": time.time(),
+            "request": req_label,
+            "stack": "".join(traceback.format_stack(limit=12)),
+        }
+
+        t0 = time.perf_counter()
         try:
-            yield rconn
+            yield conn
         finally:
-            try:
-                await cls.release_connection(rconn)
-            except Exception:
-                pass
+            # 退場：移除登記、（可選）持有過久就告警、一定要釋放
+            ACTIVE_BORROWERS.pop(borrow_id, None)
+
+            hold_ms = (time.perf_counter() - t0) * 1000.0
+            if hold_ms > DB_HOLD_WARN_MS:
+                print(f"[DB] held {hold_ms:.1f}ms by {req_label}")
+            await cls.release_connection(conn)
 
     @classmethod
     def debug_status(cls):
         """列出目前 pool 狀態（僅供除錯用）"""
         if cls._pool:
             print(f"[🌀] Pool size      : {cls._pool.size}")
-            print(f"[🔒] Used          : {cls._pool._used}")
+            print(f"[🔒] Used          : {cls._pool.size - cls._pool.freesize}")
             print(f"[🆓] Free          : {cls._pool.freesize}")
+            print(f"[📊] Min size      : {cls._pool.minsize}")
+            print(f"[📊] Max size      : {cls._pool.maxsize}")
+            
+            # 如果連線池滿了，這是問題所在
+            if cls._pool.freesize == 0:
+                print("🚨 WARNING: Connection pool is exhausted!")
         else:
             print("❌ Pool not initialized.")
+    
+    @classmethod
+    def borrowers_snapshot(cls):
+        now = time.time()
+        out = []
+        for k, v in ACTIVE_BORROWERS.items():
+            out.append({
+                "id": k,
+                "age_s": round(now - v.get("since", now), 3),
+                "request": v.get("request", "-"),
+                "stack": v.get("stack", ""),
+            })
+        out.sort(key=lambda x: -x["age_s"])  # 先顯示持有最久的
+        return {"count": len(out), "borrowers": out}
+            
+    

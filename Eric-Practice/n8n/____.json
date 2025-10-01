@@ -1,0 +1,89 @@
+{
+  "name": "骨架分析",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -100,
+        40
+      ],
+      "id": "85f99054-4fdf-4545-a56a-b8c34426f217",
+      "name": "When chat message received",
+      "webhookId": "b1a493ba-3f15-4cfe-8603-472684466a19"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=你是電腦視覺與行為分析專家，請根據以下兩份「不同來源」的 JSON 資料，判斷每個人的動作、是否與場景物件（如 tv、chair、bed）互動，並詳列你的推理過程。\n\n骨架點 JSON 格式舉例（每個人一筆）：\n{\n  \"keypoints\": [\n    [x0, y0], [x1, y1], ..., [x16, y16]\n  ]\n}\n每個點依序為：[鼻子, 左眼, 右眼, 左耳, 右耳, 左肩, 右肩, 左肘, 右肘, 左手腕, 右手腕, 左臀, 右臀, 左膝, 右膝, 左腳踝, 右腳踝]\n\n物件框 JSON 格式舉例（多個物件）：\n{\n  \"objects\": [\n    {\"class_id\": 0, \"class_name\": \"person\", \"confidence\": 0.9, \"bbox\": [左上x, 左上y, 右下x, 右下y]},\n    {\"class_id\": 62, \"class_name\": \"tv\", \"confidence\": 0.4, \"bbox\": [左上x, 左上y, 右下x, 右下y]},\n    ...\n  ]\n}\nbbox 用 [左上x, 左上y, 右下x, 右下y] 表示物件在影像中的方框範圍。\n\n---\n\n【請依下列步驟操作，並用條列說明：】\n1. 分別解析「骨架點資料」與「物件框資料」，說明兩者資料結構。\n2. 將每組骨架點與對應的 person 物件框對應（比對骨架點分布是否落在 bbox 內）。\n3. 判斷人物動作（如站立、坐下、舉手、跌倒），請根據骨架點之間的相對位置說明推理依據。\n4. 分析人物與其他物件（如 tv、chair）的空間關係，判斷有無互動、碰觸、靠近（如手部、身體是否接近其他 bbox），並解釋你的空間判斷依據。\n**4.5. 請簡要描述每個場景物件（如 tv、chair 等）在畫面中的大致位置（例如「在畫面左上角」、「偏右下」、「人物右側」等），方便理解空間分布。**\n5. 輸出結論：每個人是什麼動作，是否與場景物件有互動。\n6.請告訴我空間中，物件的分布情形(位置)\n\n\n---\n\n【輸出格式範例】\n（1）人物動作判斷：\n- 這個人的骨架點分布呈直立狀態，雙腳分開，手臂下垂，推斷為「站立」。\n（2）與物件空間互動判斷：\n- 這個人 bbox 與 tv bbox 之間有明顯距離，手部骨架點也未接近 tv，推斷沒有互動。\n（3）綜合結論：\n- 人物為「自然站立」，未與 tv 互動。\n\n---\n\n【更多範例】\nA. 如果手部骨架點落在 tv 或 chair 物框範圍，請判斷為「觸碰」該物件。\nB. 如果身體橫躺，頭和腳與物件 bbox 水平靠近，推斷可能是「倒地在物件前」。\nC. 如果人物骨架點和 person bbox 完全重疊，但與其他物件 bbox 保持距離，請推斷「未互動」。\nD. 若骨架點分布異常（如都集中一點），請說明推論困難並建議檢查資料。\n\n---\n\n【請用下方這份資料開始分析】\n\n{{ $json.chatInput }}\n",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        140,
+        40
+      ],
+      "id": "9e1e7534-3c68-4ac0-8146-b9941d99cb22",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": "gemma3:4b",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        140,
+        240
+      ],
+      "id": "adbff360-1270-4118-a959-444388e66de2",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "IisuVXPg7Ce0W0vh",
+          "name": "Ollama account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "a700855a-7f12-408e-837f-0b54d0e379a6",
+  "meta": {
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "QBs1RMdZ5X6JNHJ7",
+  "tags": []
+}
