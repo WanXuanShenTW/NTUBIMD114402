@@ -15,7 +15,8 @@ from .routes.fall_event_routes import fall_event_router
 from .routes.line_routes import router as line_router
 from .routes.debug_routes import debug_router
 from .routes.debug_borrowers import borrowers_router
-
+from .routes.weekly_interaction_reports_routes import weekly_reports_router
+from .routes.sleep_records_routes import sleep_records_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -59,4 +60,6 @@ def create_app():
     app.include_router(line_router)
     app.include_router(debug_router)
     app.include_router(borrowers_router)
+    app.include_router(weekly_reports_router)
+    app.include_router(sleep_records_router)
     return app

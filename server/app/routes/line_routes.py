@@ -63,6 +63,36 @@ parser = WebhookParser(CHANNEL_SECRET)
 
 ALLOWED_CMDS = {"個人資訊", "推播設定", "解除綁定"}
 
+# 追蹤使用者推播設定狀態
+USER_PREFS_STATE = {}  # key: line_user_id -> {"step": "waiting_time", "selected_days": [1,2,3]}
+
+def validate_time_format(time_str: str) -> tuple[bool, str, int, int]:
+    """
+    驗證時間格式 HHMM (24小時制)
+    返回: (是否有效, 錯誤訊息, 小時, 分鐘)
+    """
+    try:
+        time_str = time_str.strip()
+        
+        # 檢查是否為4位數字
+        if len(time_str) != 4 or not time_str.isdigit():
+            return False, "請輸入正確格式", 0, 0
+        
+        hour = int(time_str[:2])
+        minute = int(time_str[2:])
+        
+        # 接受0-23小時制
+        if hour < 0 or hour > 23:
+            return False, "請輸入正確格式", 0, 0
+        
+        if minute < 0 or minute > 59:
+            return False, "請輸入正確格式", 0, 0
+            
+        return True, "", hour, minute
+        
+    except (ValueError, IndexError):
+        return False, "請輸入正確格式", 0, 0
+
 @router.post("/richmenu/reset")
 async def reset_richmenu():
     import httpx
@@ -243,12 +273,25 @@ async def webhook(request: Request):
                             else:
                                 gender_display = gender if gender else "未提供"
                             
+                            # 避免電話號碼被識別為連結，加入空格或其他符號
+                            if phone and phone != "未提供":
+                                # 將電話號碼格式化，避免自動連結
+                                formatted_phone = phone.replace("-", "").strip()
+                                if len(formatted_phone) == 10 and formatted_phone.startswith("09"):
+                                    # 格式：09XX-XXX-XXX
+                                    formatted_phone = f"{formatted_phone[:4]}-{formatted_phone[4:7]}-{formatted_phone[7:]}"
+                                else:
+                                    # 在數字間加入空格避免自動識別
+                                    formatted_phone = " ".join(formatted_phone)
+                            else:
+                                formatted_phone = phone
+                            
                             # 格式化輸出文字
                             formatted_info = f"""{name}的個人資訊：
-                            姓名：{name}
-                            電話：{phone}
-                            性別：{gender_display}
-                            住址：{address}"""
+姓名：{name}
+電話：{formatted_phone}
+性別：{gender_display}
+住址：{address}"""
                             
                             await line_api.reply_message(ReplyMessageRequest(
                                 reply_token=event.reply_token,
@@ -271,7 +314,7 @@ async def webhook(request: Request):
                     await line_api.reply_message(ReplyMessageRequest(
                         reply_token=event.reply_token,
                         messages=[TextMessage(
-                            text="請選擇每週要通知的『星期』：可多選，選好後按「完成」。",
+                            text="請選擇每週要通知的『星期』：",
                             quick_reply=build_weekday_qr([])
                         )]
                     ))
@@ -286,11 +329,47 @@ async def webhook(request: Request):
                     ))
                     continue
 
-            # 3-4) 其它任何輸入 → 無效的操作
+            # 3-4) 檢查是否正在等待時間輸入
+            user_state = USER_PREFS_STATE.get(uid)
+            if user_state and user_state.get("step") == "waiting_time":
+                # 檢查是否要取消
+                if text == "取消":
+                    # 清除使用者狀態
+                    USER_PREFS_STATE.pop(uid, None)
+                    await line_api.reply_message(ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text="已取消設定。", quick_reply=quick_reply_main())]
+                    ))
+                    continue
+                
+                # 使用者正在輸入時間
+                is_valid, error_msg, hour, minute = validate_time_format(text)
+                
+                if not is_valid:
+                    await line_api.reply_message(ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=error_msg)]
+                    ))
+                    continue
+                
+                # 時間格式正確，保存設定
+                selected_days = user_state["selected_days"]
+                ok, msg = await save_prefs_by_line_uid(uid, selected_days, hour, minute)
+                
+                # 清除使用者狀態
+                USER_PREFS_STATE.pop(uid, None)
+                
+                await line_api.reply_message(ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=msg, quick_reply=quick_reply_main())]
+                ))
+                continue
+
+            # 3-5) 其它任何輸入 → 無效的操作
             await line_api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(
-                    text="無效的操作。請從底部選單或快速回覆中選擇「個人資訊」「我的長者」「解除綁定」。"
+                    text="無效的操作。請從底部選單或快速回覆中選擇「個人資訊」「推播設定」「解除綁定」。"
                 )]
             ))
             continue
@@ -330,36 +409,18 @@ def quick_reply_main():
         QuickReplyItem(action=MessageAction(label="解除綁定", text="解除綁定")),
     ])
 
-# 選星期
+# 選星期（單選）
 def build_weekday_qr(sel_days: list[int]):
     names = ["日","一","二","三","四","五","六"]
-    sel_set = set(sel_days)
-    sel_csv = ",".join(map(str, sel_days))
     items = []
     for d, name in enumerate(names):
-        mark = "✅" if d in sel_set else "  "
         items.append(QuickReplyItem(
             action=PostbackAction(
-                label=f"{mark} 週{name}",
-                data=f"prefs:weekday:{d}|sel={sel_csv}",
+                label=f"週{name}",
+                data=f"prefs:weekday_single:{d}",
                 display_text=f"週{name}",
             )
         ))
-    items.append(QuickReplyItem(action=PostbackAction(label="完成", data=f"prefs:done|sel={sel_csv}", display_text="完成")))
-    items.append(QuickReplyItem(action=PostbackAction(label="取消", data="prefs:cancel", display_text="取消")))
-    return QuickReply(items=items)
-
-# 選時間
-def build_time_qr(sel_days: list[int]):
-    hours = [7, 8, 9, 12, 18, 20, 21]
-    sel_csv = ",".join(map(str, sel_days))
-    items = [QuickReplyItem(
-        action=PostbackAction(
-            label=f"{h:02d}:00",
-            data=f"prefs:time:{h:02d}:00|sel={sel_csv}",
-            display_text=f"{h:02d}:00",
-        )
-    ) for h in hours]
     items.append(QuickReplyItem(action=PostbackAction(label="取消", data="prefs:cancel", display_text="取消")))
     return QuickReply(items=items)
 
@@ -380,6 +441,26 @@ async def handle_postback(event: PostbackEvent):
     sel_days = parse_sel(sel_csv)
 
     try:
+        # 處理單選星期
+        if key.startswith("prefs:weekday_single:"):
+            d = int(key.split(":")[2])
+            selected_days = [d]  # 單選，只有一個星期
+            
+            # 儲存使用者狀態，等待時間輸入
+            USER_PREFS_STATE[uid] = {
+                "step": "waiting_time",
+                "selected_days": selected_days
+            }
+            
+            await line_api.reply_message(ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[TextMessage(
+                    text=f"已選：{human_days(selected_days)}\n請輸入通知時間（24小時制，格式：HHMM）\n例如：0830、1400、0015，若要退出請輸入取消"
+                )]
+            ))
+            return
+
+        # 舊的多選邏輯（保留以防萬一）
         if key.startswith("prefs:weekday:"):
             d = int(key.split(":")[2])
             new_days = toggle_day(sel_days, d)
@@ -390,32 +471,9 @@ async def handle_postback(event: PostbackEvent):
             ))
             return
 
-        if key == "prefs:done":
-            if not sel_days:
-                await line_api.reply_message(ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text="尚未選擇任何星期，請至少選一個。", quick_reply=build_weekday_qr([]))]
-                ))
-                return
-            await line_api.reply_message(ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(
-                    text=f"已選：{human_days(sel_days)}\n請選擇通知時間（24 小時制）。",
-                    quick_reply=build_time_qr(sel_days)
-                )]
-            ))
-            return
-
-        if key.startswith("prefs:time:"):
-            _, _, hh, mm = key.split(":")  # e.g. prefs:time:08:00
-            ok, msg = await save_prefs_by_line_uid(uid, sel_days, int(hh), int(mm))
-            await line_api.reply_message(ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=msg, quick_reply=quick_reply_main())]
-            ))
-            return
-
         if key == "prefs:cancel":
+            # 清除使用者狀態
+            USER_PREFS_STATE.pop(uid, None)
             await line_api.reply_message(ReplyMessageRequest(
                 reply_token=event.reply_token,
                 messages=[TextMessage(text="已取消設定。", quick_reply=quick_reply_main())]

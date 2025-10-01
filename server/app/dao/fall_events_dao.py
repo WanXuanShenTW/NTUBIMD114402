@@ -25,22 +25,31 @@ async def insert_fall_event(
     except Exception as e:
         raise DatabaseError(f"新增跌倒事件失敗: {e}")
 
-async def select_fall_event_by_user_id(
+async def select_fall_event_by_user_id_and_time_range(
     conn,
     user_id: int,
-    limit: int = 10
+    start_time: Optional[datetime.datetime] = None,
+    end_time: Optional[datetime.datetime] = None
 ) -> List[Dict[str, Any]]:
-    """根據 user_id 查詢跌倒事件紀錄"""
+    """根據 user_id 和時間區段查詢跌倒事件紀錄"""
     try:
         async with conn.cursor(DictCursor) as cursor:
             query = """
                 SELECT record_id, user_id, detected_time, location, pose_before_fall
                 FROM fall_events
                 WHERE user_id = %s
-                ORDER BY detected_time DESC
-                LIMIT %s
             """
-            values = [user_id, limit]
+            values = [user_id]
+
+            # 添加時間篩選條件
+            if start_time:
+                query += " AND detected_time >= %s"
+                values.append(start_time)
+            if end_time:
+                query += " AND detected_time <= %s"
+                values.append(end_time)
+
+            query += " ORDER BY detected_time DESC"
             await cursor.execute(query, values)
             records = await cursor.fetchall()
             return records
@@ -48,17 +57,3 @@ async def select_fall_event_by_user_id(
         raise
     except Exception as e:
         raise DatabaseError(f"查詢跌倒事件失敗: {e}")
-
-async def update_fall_event_video(conn, record_id: int, video_filename: str) -> bool:
-    """更新跌倒事件的影片檔案名稱"""
-    try:
-        async with conn.cursor() as cursor:
-            query = "UPDATE fall_events SET video_filename = %s WHERE record_id = %s"
-            await cursor.execute(query, (video_filename, record_id))
-            if cursor.rowcount == 0:
-                raise NotFoundError(f"找不到 record_id={record_id} 的跌倒事件可更新")
-            return True
-    except NotFoundError:
-        raise
-    except Exception as e:
-        raise DatabaseError(f"更新跌倒事件影片檔名失敗: {e}")
