@@ -25,7 +25,7 @@ from __future__ import annotations
 import datetime
 import os, asyncio, math
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import torch
@@ -40,7 +40,7 @@ from .paths import SC_MODELS
 from .binary_cnn_lstm_loader import build_model as build_binary_model
 from .multi_cnn_lstm_loader import build_model as build_multi_model
 
-from .time_utils import format_time
+from .time_utils import now_str
 
 try:
     from .cnn_lstm_utils import CNNLSTM  # optional fallback
@@ -690,9 +690,9 @@ class StreamInferManager:
                                      include_bone_lines=INCLUDE_BONE_LINES, object_classes=OBJECT_CLASSES)
 
         # Events
-        self._fall_state: Dict[str, Dict[str, int | bool | Optional[int]]] = {}
-        self._event_defs = self._compile_action_events(ACTION_EVENTS, self.class_names_multi)
-        self._multi_event_state: Dict[str, Dict[str, Dict[str, int | bool | Optional[int]]]] = {}
+        self._fall_state: Dict[str, Dict[str, Any]] = {}
+        self.action_events = self._compile_action_events(ACTION_EVENTS, self.class_names_multi)
+        self._multi_event_state: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._last_multi_label: Dict[str, str] = {}
         
     # ----- Basics -----
@@ -732,10 +732,7 @@ class StreamInferManager:
         return _Tiny(self.in_ch, num_classes)
 
     def set_handlers(self, **handlers):
-        """設定事件處理的 hooks"""
-        for name, handler in handlers.items():
-            if name in self._handlers:
-                self._handlers[name] = handler
+        self._handlers.update(handlers)
 
     async def _emit(self, name: str, payload: dict):
         """觸發對應的事件處理 hook"""
@@ -860,13 +857,13 @@ class StreamInferManager:
         if fall_prob >= FALL_TRIGGER_THR and not state.get("active"):
             # 跌倒事件開始
             state["active"] = True
-            state["start_time"] = ts_ms
+            state["start_time"] = now_str()
             state["peak_score"] = fall_prob
 
             # 準備回傳的參數
             payload = {
                 "user_id": user_id,
-                "start_time": format_time(ts_ms),
+                "start_time": state["start_time"],  
                 "result": {
                     "probs": state.get("probs", []),
                     "pred_idx": state.get("pred_idx", 0),
@@ -878,12 +875,12 @@ class StreamInferManager:
         elif fall_prob < FALL_RECOVER_THR and state.get("active"):
             # 跌倒事件結束
             state["active"] = False
-            end_time = ts_ms
+            state["end_time"] = now_str()
 
             payload = {
                 "user_id": user_id,
-                "start_time": format_time(start_time),
-                "end_time": format_time(end_time),
+                "start_time": state["start_time"],  # 修正這裡
+                "end_time": state["end_time"],  # 修正這裡
                 "peak_score": peak_score,
                 "result": {
                     "probs": state.get("probs", []),
@@ -891,48 +888,76 @@ class StreamInferManager:
                 },
             }
             await self._emit("on_fall_recover", payload)
-
+        
     async def _handle_action_events(self, user_id: str, probs: np.ndarray, ts_ms: int):
-        """處理多事件（如坐下、躺下）的時間線"""
-        for event_name, event_def in self.action_events.items():
+        """處理多事件（如坐下、躺下）的時間線（使用 pos_idx/recover_idx 列表 + consecutive 次數）"""
+        for event_name, event_def in (self.action_events or {}).items():
             state = self._evt_state_of(user_id, event_name)
-            peak_score = state.get("peak_score", 0.0)
-            prev_action_name = state.get("prev_action", "unknown")
-            curr_action_name = state.get("curr_action", "unknown")
 
-            if probs[event_def["trigger_idx"]] >= event_def["trigger_thr"] and not state.get("active"):
-                # 狀態事件開始
-                state["active"] = True
-                state["start_time"] = ts_ms
-                state["peak_score"] = probs[event_def["trigger_idx"]]
+            # 取該事件「觸發集合」與「恢復集合」的分數（多標籤取最大值）
+            pos_idx = event_def.get("pos_idx") or []
+            rec_idx = event_def.get("recover_idx") or []
 
-                payload = {
-                    "user_id": user_id,
-                    "event_name": event_name,
-                    "start_time": format_time(ts_ms),
-                    "peak_score": state["peak_score"],
-                    "prev_action_name": prev_action_name,
-                    "curr_action_name": curr_action_name,
-                    "payload": state.get("payload", {}),
-                }
-                await self._emit("on_state_event_start", payload)
+            pos_score = max((float(probs[i]) for i in pos_idx), default=0.0)
+            rec_score = max((float(probs[i]) for i in rec_idx), default=0.0)
 
-            elif probs[event_def["recover_idx"]] >= event_def["recover_thr"] and state.get("active"):
-                # 狀態事件結束
-                state["active"] = False
-                end_time = ts_ms
+            trig_thr = float(event_def.get("trigger_thr", 0.5))
+            recv_thr = float(event_def.get("recover_thr", 0.4))
+            trig_need = int(event_def.get("trigger_consec", 1))
+            recv_need = int(event_def.get("recover_consec", 1))
 
-                payload = {
-                    "user_id": user_id,
-                    "event_name": event_name,
-                    "start_time": format_time(state["start_time"]),
-                    "end_time": format_time(end_time),
-                    "peak_score": peak_score,
-                    "prev_action_name": prev_action_name,
-                    "curr_action_name": curr_action_name,
-                    "payload": state.get("payload", {}),
-                }
-                await self._emit("on_state_event_recover", payload)
+            # 初始化計數
+            state.setdefault("pos", 0)
+            state.setdefault("rec", 0)
+            state.setdefault("active", False)
+            state.setdefault("peak_score", 0.0)
+
+            if not state["active"]:
+                # 累積觸發計數
+                state["pos"] = state["pos"] + 1 if pos_score >= trig_thr else 0
+                if pos_score > state["peak_score"]:
+                    state["peak_score"] = pos_score
+
+                # 達到連續門檻 → 事件開始
+                if state["pos"] >= trig_need:
+                    state["active"] = True
+                    state["start_time"] = now_str()
+                    # 清空恢復計數
+                    state["rec"] = 0
+
+                    payload = {
+                        "user_id": user_id,
+                        "event_name": event_name,
+                        "start_time": state["start_time"],
+                        "peak_score": state["peak_score"],
+                        "payload": state.get("payload", {}),
+                    }
+                    await self._emit("on_state_event_start", payload)
+
+            else:
+                # 事件進行中：累積恢復計數
+                state["rec"] = state["rec"] + 1 if rec_score >= recv_thr else 0
+
+                # 達到連續門檻 → 事件結束
+                if state["rec"] >= recv_need:
+                    state["active"] = False
+                    state["end_time"] = now_str()
+                    peak = state.get("peak_score", 0.0)
+
+                    payload = {
+                        "user_id": user_id,
+                        "event_name": event_name,
+                        "start_time": state["start_time"],
+                        "end_time": state["end_time"],
+                        "peak_score": peak,
+                        "payload": state.get("payload", {}),
+                    }
+                    # 重置計數與峰值
+                    state["pos"] = 0
+                    state["rec"] = 0
+                    state["peak_score"] = 0.0
+
+                    await self._emit("on_state_event_recover", payload)
 
     # ----- Buffers, locks, send -----
     def _buf(self, user_id: str) -> UserBuffer:
@@ -968,7 +993,7 @@ class StreamInferManager:
                     est["active"] = False
                     est["pos"] = 0
                     est["rec"] = 0
-                    await self._emit("on_state_event_recover", {"user_id": user_id, "name": name, "score": 0.0, "reason": reason})
+                    await self._emit("on_state_event_recover", {"user_id": user_id, "event_name": name, "score": 0.0, "reason": reason})
         except Exception as e:
             print(f"[STATE][WARN] force_recover user={user_id} err={e}")
 
