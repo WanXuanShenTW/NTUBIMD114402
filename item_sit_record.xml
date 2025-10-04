@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="@android:color/white"
+    android:layout_marginTop="8dp"
+    android:layout_marginBottom="4dp"
+    android:layout_marginHorizontal="0dp">
+
+    <!-- 固定顯示日期（如：2025-09-01（週一）） -->
+    <TextView
+        android:id="@+id/textDate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="12sp"
+        android:text="2025-09-01（週一）"
+        android:textColor="#7A7A7A"
+        android:layout_marginBottom="2dp" />
+
+    <!-- 時間區間（例：10:56:00 → 11:30:00） -->
+    <TextView
+        android:id="@+id/tvRange"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="16sp"
+        android:text="10:56:00 → 11:30:00"
+        android:textColor="#111111" />
+
+    <!-- 副文字（例：時長 34分） -->
+    <TextView
+        android:id="@+id/tvSub"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="13sp"
+        android:text="時長 34分"
+        android:textColor="#6B7280"
+        android:layout_marginTop="5dp" />
+</LinearLayout>

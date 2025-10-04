@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:orientation="vertical"
@@ -52,7 +54,7 @@
         android:textColor="#333333"
         android:gravity="center_horizontal" />
 
-    <!-- 狀態類別選單 -->
+    <!-- 保持：Spinner + Filter 在同一列 -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -65,12 +67,89 @@
 
         <Spinner
             android:id="@+id/spinnerCategory"
-            android:layout_width="match_parent"
-            android:layout_height="44dp"
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
             android:background="@drawable/bg_spinner_ripple"
             android:spinnerMode="dropdown"
-            android:paddingStart="12dp"
-            android:paddingEnd="12dp"/>
+            android:paddingStart="14dp"
+            android:paddingEnd="12dp" />
+
+        <ImageButton
+            android:id="@+id/btnFilter"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="8dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:src="@drawable/ic_filter_list"
+            app:tint="#333333"
+            android:contentDescription="@string/desc_filter"
+            android:importantForAccessibility="yes" />
+    </LinearLayout>
+
+    <LinearLayout
+        android:id="@+id/barDateNav"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:paddingStart="8dp"
+        android:paddingEnd="4dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp"
+        android:gravity="center_vertical"
+        android:visibility="gone">
+
+        <ImageButton
+            android:id="@+id/btnPrevDay"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="上一段"
+            android:src="@drawable/ic_chevron_left"
+            app:tint="#666666"/>
+
+        <TextView
+            android:id="@+id/textRange"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="1dp"
+            android:layout_marginEnd="1dp"
+            android:gravity="center"
+            android:textColor="#444444"
+            android:textSize="16sp"
+            android:includeFontPadding="false"
+            android:fontFamily="monospace"
+            android:fontFeatureSettings="tnum"
+            android:maxLines="2"
+            android:ellipsize="middle"
+            android:lineSpacingExtra="2dp"
+            android:breakStrategy="simple"
+            android:hyphenationFrequency="none"
+            tools:text="週期：\n2025-07-13 ~ 07-19"/>
+
+
+        <ImageButton
+            android:id="@+id/btnNextDay"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="下一段"
+            android:src="@drawable/ic_chevron_right"
+            app:tint="#666666"/>
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/switchWeekly"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="週"
+            android:textSize="18sp"
+            android:layout_marginStart="1dp"
+            android:layout_marginEnd="2dp"
+            android:visibility="gone"
+            android:scaleX="0.72"
+            android:scaleY="0.72"
+            app:useMaterialThemeColors="true"/>
     </LinearLayout>
 
     <!-- 內容區（列表/空狀態/載入中） -->
@@ -93,7 +172,9 @@
                 android:paddingEnd="20dp"
                 android:paddingTop="2dp"
                 android:paddingBottom="2dp"
-                android:clipToPadding="false"/>
+                android:clipToPadding="false"
+                android:contentDescription="@string/desc_events_list"
+                tools:ignore="SpeakableTextPresentCheck" />
         </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
 
         <!-- 載入中 -->
@@ -103,7 +184,7 @@
             android:layout_height="48dp"
             android:layout_gravity="center"/>
 
-        <!-- 空畫面 / 錯誤畫面（已移除重新整理按鈕） -->
+        <!-- 空畫面 / 錯誤畫面 -->
         <LinearLayout
             android:id="@+id/emptyState"
             android:layout_width="match_parent"
@@ -115,11 +196,15 @@
 
             <TextView
                 android:id="@+id/emptyView"
-                android:layout_width="wrap_content"
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:text="請先選擇類別"
                 android:textSize="16sp"
-                android:textColor="#666666"/>
+                android:textColor="#666666"
+                android:textAlignment="center"
+                android:gravity="center_horizontal"
+                android:fontFamily="monospace"
+                android:fontFeatureSettings="tnum"/>
         </LinearLayout>
     </FrameLayout>
 </LinearLayout>

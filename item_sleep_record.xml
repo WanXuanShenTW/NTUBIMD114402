@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="12dp"
+    android:background="@android:color/white"
+    android:layout_marginTop="8dp"
+    android:layout_marginBottom="4dp"
+    android:layout_marginHorizontal="0dp">
+
+    <TextView
+        android:id="@+id/textDate"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="2025-07-13（日）"
+        android:textSize="12sp"
+        android:textColor="#7A7A7A"
+        android:layout_marginBottom="2dp"/>
+
+    <TextView
+        android:id="@+id/tvRange"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="23:48 → 07:12"
+        android:textSize="16sp"
+        android:textColor="#111111" />
+
+    <TextView
+        android:id="@+id/tvSub"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="時長 7小時24分"
+        android:textSize="13sp"
+        android:textColor="#6B7280"
+        android:layout_marginTop="5dp"/>
+</LinearLayout>
