@@ -8,8 +8,9 @@ from ..service.user_service import (
     get_user_info,
     delete_user_account
 )
+from ..service.emergency_contacts_service import remove_all_contacts_by_caregiver, get_contacts_by_caregiver
 from ..utils.response_util import make_json_response
-from ..exceptions import AlreadyExistsError
+from ..exceptions import AlreadyExistsError, NotFoundError
 
 user_router = APIRouter(tags=["使用者資料"])
 
@@ -50,11 +51,11 @@ async def register(data: RegisterRequest):
             gender=data.gender,
             address=data.address,
         )
-        return await make_json_response(data={"user_id": user_id}, message="註冊成功")
+        return await make_json_response(data={"user_id": user_id}, message="註冊成功", code=200)
     except AlreadyExistsError as ae:
         return await make_json_response(code=409, message="此號碼已被註冊", success=False)
     except Exception as e:
-        return await make_json_response(code=409, message=str(e), success=False)
+        return await make_json_response(code=500, message=str(e), success=False)
 
 @user_router.patch("/user")
 async def update_user(data: UpdateUserRequest):
@@ -70,9 +71,11 @@ async def update_user(data: UpdateUserRequest):
 
     try:
         success = await update_user_info(data.phone, **update_data)
-        return {"message": "更新成功"} if success else {"message": "更新失敗"}
+        return await make_json_response(message="更新成功" if success else "更新失敗", code=200)
+    except NotFoundError as ne:
+        return await make_json_response(code=404, message=str(ne), success=False)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return await make_json_response(code=500, message=str(e), success=False)
 
 @user_router.patch("/user/password")
 async def change_password(data: ChangePasswordRequest):
@@ -84,9 +87,11 @@ async def change_password(data: ChangePasswordRequest):
 
     try:
         success = await change_user_password(data.phone, data.old_password, data.new_password)
-        return {"message": "密碼修改成功"} if success else {"message": "密碼修改失敗"}
+        return await make_json_response(message="密碼修改成功" if success else "密碼修改失敗", code=200)
+    except NotFoundError as ne:
+        return await make_json_response(code=404, message=str(ne), success=False)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return await make_json_response(code=500, message=str(e), success=False)
 
 @user_router.get("/user")
 async def get_user(phone: str = Query(..., description="使用者電話")):
@@ -95,11 +100,11 @@ async def get_user(phone: str = Query(..., description="使用者電話")):
     """
     try:
         user = await get_user_info(phone)
-        return user
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return await make_json_response(data=user, message="查詢成功", code=200)
+    except NotFoundError as ne:
+        return await make_json_response(code=200, message="找不到使用者", success=True)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return await make_json_response(code=500, message=str(e), success=False)
 
 @user_router.delete("/user")
 async def delete_user(data: DeleteUserRequest):
@@ -107,10 +112,17 @@ async def delete_user(data: DeleteUserRequest):
         刪除使用者帳號
     """
     try:
-        success = await delete_user_account(data.phone)
-        if success:
-            return {"message": "刪除成功"}
-        else:
-            raise HTTPException(status_code=404, detail="刪除失敗，使用者不存在")
+        await get_user_info(data.phone)
+        
+        # 檢查是否存在與該使用者相關的緊急聯絡人關係
+        contacts = await get_contacts_by_caregiver(data.phone)
+        if contacts:
+            await remove_all_contacts_by_caregiver(data.phone)
+        
+        # 再刪除使用者帳號
+        await delete_user_account(data.phone)
+        return await make_json_response(code=200, message="刪除成功", success=True)
+    except NotFoundError as e:
+        return await make_json_response(code=404, message="刪除失敗，使用者不存在", success=False)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        return await make_json_response(code=500, message=str(e), success=False)

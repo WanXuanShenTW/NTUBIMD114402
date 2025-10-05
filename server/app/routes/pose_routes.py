@@ -1,6 +1,9 @@
+import json
 from fastapi import APIRouter, WebSocket
+import requests
 from starlette.websockets import WebSocketDisconnect
 import traceback
+import aiohttp  
 
 from ..utils.ws_connection_manager import ws_manager
 from ..utils.stream_infer_manager import stream_infer_manager
@@ -9,29 +12,43 @@ from ..utils.ws_message_dispatcher import handle_ws_text, notify_user_disconnect
 from ..service.fall_event_service import add_fall_event
 pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
 
-async def on_fall_start(user_id: str, start_time: str, result: dict, clip: dict):
-    print("[FALL_START]", user_id, start_time, result["probs"][result["pred_idx"]])
-    # print(f"{clip20}")
-    # 若你希望一開始就入庫，保留原本功能：
-    await add_fall_event(
-        user_id=user_id,
-        detected_time=start_time,
-        location="客廳",
-        pose_before_fall="正常行走"
-    )
+def on_fall_start(payload: dict):
+    # 從 StreamInferManager 收到的 payload 裡會含有剛才整理過的 clip
+    clip = payload.get("result", {}).get("clip")  # 這裡已經是 JSON 友善的結構了
+    elder_id = int(payload.get("user_id"))        # 統一成 int
 
-async def on_fall_recover(user_id: str, start_time: str, end_time: str, peak_score: float, result: dict):
-    print("[FALL_RECOVER]", user_id, start_time, end_time, peak_score)
+    body = {
+        "elder_id": elder_id,
+        "start": clip.get("start"),
+        "end": clip.get("end"),
+    }
+
+    # 正確的送法 + 正確的 log
+    url = "https://17c5b07c0a11.ngrok-free.app/webhook/elder"
+    r = requests.post(url, json=body, timeout=5)
+    print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", r.status_code)
+
+async def on_fall_recover(
+    user_id: str,
+    start_time: str | None = None,
+    end_time: str | None = None,
+    peak_score: float | None = None,
+    result: dict | None = None,
+    score: float | None = None,
+    reason: str | None = None,
+    **kwargs,
+):
+    print("[FALL_RECOVER]", user_id, start_time, end_time, peak_score, "reason=", reason)
     return
 
-# 多事件（坐/躺）開始
+# 多分類事件（坐/躺）開始
 async def on_state_event_start(user_id: str, event_name: str, start_time: str, peak_score: float, 
                                prev_action_name: str, curr_action_name: str, payload: dict):
     print("[STATE_START]", user_id, event_name, start_time, peak_score,
           "prev=", prev_action_name, "curr=", curr_action_name)
     # TODO: 寫 DB / 通知 / 排程（可記錄 prev/curr 便於分析連貫動作）
 
-# 多事件（坐/躺）復原
+# 多分類事件（坐/躺）復原
 async def on_state_event_recover(user_id: str, event_name: str, start_time: str, end_time: str,
                                  peak_score: float, prev_action_name: str, curr_action_name: str, payload: dict):
     print("[STATE_RECOVER]", user_id, event_name, start_time, end_time, peak_score,
@@ -86,3 +103,5 @@ async def ws_pose(websocket: WebSocket):
     finally:
         # 保險回復
         await stream_infer_manager.force_recover(user_id, reason="finally")
+
+

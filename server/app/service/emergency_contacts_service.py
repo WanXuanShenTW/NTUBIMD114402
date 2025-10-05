@@ -1,6 +1,7 @@
 import aiomysql
 from ..db import Database
 from ..dao.emergency_contacts_dao import (
+    delete_all_contacts_by_caregiver_user_id,
     insert_emergency_contacts,
     select_contacts_by_elder_user_id,
     select_contacts_by_caregiver_user_id,
@@ -9,19 +10,16 @@ from ..dao.emergency_contacts_dao import (
 )
 from ..dao.users_dao import select_user_by_id, select_user_by_phone
 from ..dao.role_dao import select_role_name_by_id
+
 from ..exceptions import NotFoundError, AlreadyExistsError, DatabaseError
 
 async def add_contact_by_phone(elder_phone, caregiver_phone, relationship):
     async with Database.connection() as conn:
-        elder = await select_user_by_phone(conn, elder_phone)
-        if not elder:
-            raise NotFoundError(f"phone {elder_phone} 不存在")
-        caregiver = await select_user_by_phone(conn, caregiver_phone)
-        if not caregiver:
-            raise NotFoundError(f"phone {caregiver_phone} 不存在")
+        elder_user = await select_user_by_phone(conn, elder_phone)  # 修正：先存入變數
+        caregiver_user = await select_user_by_phone(conn, caregiver_phone)  # 修正：先存入變數
 
-        elder_user_id = elder["user_id"]
-        caregiver_user_id = caregiver["user_id"]
+        elder_user_id = elder_user["user_id"]
+        caregiver_user_id = caregiver_user["user_id"]
 
         # 檢查是否已存在單向關係
         try:
@@ -39,18 +37,9 @@ async def add_contact_by_phone(elder_phone, caregiver_phone, relationship):
             raise DatabaseError(f"新增照護關係時發生錯誤: {e}")
 
 async def get_contacts_by_elder(elder_phone: str) -> list:
-    """
-    根據長者電話取得其所有的照護者關係。
-    :param elder_phone: 長者電話
-    :return: 照護者列表
-    ✅ 修正：使用單一連線 + 移除 line_id
-    """
-    async with Database.connection() as conn:  # ✅ 使用單一連線處理整個操作
-        caregiver = await select_user_by_phone(conn, elder_phone)
-        if not caregiver:
-            raise NotFoundError(f"phone {elder_phone} 不存在")
-
-        elder_user_id = caregiver["user_id"]
+    async with Database.connection() as conn:
+        elder_user = await select_user_by_phone(conn, elder_phone)  # 修正：先存入變數
+        elder_user_id = elder_user["user_id"]
 
         try:
             contacts = await select_contacts_by_elder_user_id(conn, elder_user_id)
@@ -77,8 +66,6 @@ async def get_contacts_by_elder(elder_phone: str) -> list:
                 "phone": caregiver.get("phone"),
                 "role_id": caregiver.get("role_id"),
                 "role_name": role_name,
-                # ❌ 移除這行：line_id 不存在了
-                # "line_id": caregiver.get("line_id"),
                 "relationship": contact["relationship"]
             }
             result.append(contact_info)
@@ -86,17 +73,9 @@ async def get_contacts_by_elder(elder_phone: str) -> list:
         return result
 
 async def get_contacts_by_caregiver(caregiver_phone: str) -> list:
-    """
-    根據照護者電話取得其所有的長者關係。
-    :param caregiver_phone: 照護者電話
-    :return: 長者列表
-    """
     async with Database.connection() as conn:
-        caregiver = await select_user_by_phone(conn, caregiver_phone)
-        if not caregiver:
-            raise NotFoundError(f"phone {caregiver_phone} 不存在")
-
-        caregiver_user_id = caregiver["user_id"]
+        caregiver_user = await select_user_by_phone(conn, caregiver_phone)  # 修正：先存入變數
+        caregiver_user_id = caregiver_user["user_id"]
 
         try:
             contacts = await select_contacts_by_caregiver_user_id(conn, caregiver_user_id)
@@ -131,15 +110,11 @@ async def get_contacts_by_caregiver(caregiver_phone: str) -> list:
 
 async def remove_contact(elder_phone: str, caregiver_phone: str) -> str:
     async with Database.connection() as conn:
-        elder = await select_user_by_phone(conn, elder_phone)
-        if not elder:
-            raise NotFoundError(f"phone {elder_phone} 不存在")
-        caregiver = await select_user_by_phone(conn, caregiver_phone)
-        if not caregiver:
-            raise NotFoundError(f"phone {caregiver_phone} 不存在")
+        elder_user = await select_user_by_phone(conn, elder_phone)  # 修正：先存入變數
+        caregiver_user = await select_user_by_phone(conn, caregiver_phone)  # 修正：先存入變數
 
-        elder_user_id = elder["user_id"]
-        caregiver_user_id = caregiver["user_id"]
+        elder_user_id = elder_user["user_id"]
+        caregiver_user_id = caregiver_user["user_id"]
 
         try:
             success = await delete_contact(conn, elder_user_id, caregiver_user_id)
@@ -148,5 +123,18 @@ async def remove_contact(elder_phone: str, caregiver_phone: str) -> str:
             return "刪除成功"
         except NotFoundError:
             raise NotFoundError("該關係不存在")
+        except Exception as e:
+            raise DatabaseError(f"刪除照護關係時發生錯誤: {e}")
+
+async def remove_all_contacts_by_caregiver(caregiver_phone: str) -> str:
+    async with Database.connection() as conn:
+        caregiver_user = await select_user_by_phone(conn, caregiver_phone)  # 修正：先存入變數
+        caregiver_user_id = caregiver_user["user_id"]
+
+        try:
+            deleted_count = await delete_all_contacts_by_caregiver_user_id(conn, caregiver_user_id)
+            return f"成功刪除 {deleted_count} 筆照護關係"
+        except NotFoundError:
+            raise NotFoundError(f"找不到 phone {caregiver_phone} 的任何照護關係可刪除")
         except Exception as e:
             raise DatabaseError(f"刪除照護關係時發生錯誤: {e}")

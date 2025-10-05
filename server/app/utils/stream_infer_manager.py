@@ -121,11 +121,9 @@ class RelationMapConfig:
         self.include_bone_lines = bool(include_bone_lines)
         self.object_classes = [c.strip() for c in (object_classes or []) if c and c.strip()]
 
-
 def gaussian2d(H, W, cx, cy, sigma):
     y, x = np.ogrid[:H, :W]
     return np.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2.0 * sigma ** 2))
-
 
 def draw_gaussian(canvas, x, y, sigma, mag=1.0):
     Hc, Wc = canvas.shape
@@ -133,12 +131,10 @@ def draw_gaussian(canvas, x, y, sigma, mag=1.0):
     g = gaussian2d(Hc, Wc, x, y, sigma).astype(np.float32)
     canvas[:] = np.maximum(canvas, g * float(mag))
 
-
 def _bbox_xyxy_from_cxcywh(cx, cy, w, h):
     x1 = cx - w/2.0; y1 = cy - h/2.0
     x2 = cx + w/2.0; y2 = cy + h/2.0
     return (x1, y1, x2, y2)
-
 
 def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapConfig):
     Hc, Wc = cfg.H, cfg.W
@@ -244,7 +240,6 @@ def rasterize_frame(bbox_xyxy, kps_list, dets, img_w, img_h, cfg: RelationMapCon
 
     return canvas
 
-
 def _interp_val(a: Optional[float], b: Optional[float], w: float) -> Optional[float]:
     if a is None and b is None:
         return None
@@ -253,7 +248,6 @@ def _interp_val(a: Optional[float], b: Optional[float], w: float) -> Optional[fl
     if b is None:
         return a
     return a * (1.0 - w) + b * w
-
 
 def _interp_kp(kpa: dict, kpb: dict, w: float) -> dict:
     ax = kpa.get('x'); ay = kpa.get('y'); ac = float(kpa.get('conf', kpa.get('confidence', 1.0)))
@@ -267,7 +261,6 @@ def _interp_kp(kpa: dict, kpb: dict, w: float) -> dict:
         out['y'] = float(y)
     out['conf'] = float(c)
     return out
-
 
 def _interp_bbox_xyxy(bba: Optional[Tuple[float, float, float, float]],
                       bbb: Optional[Tuple[float, float, float, float]],
@@ -286,7 +279,6 @@ def _interp_bbox_xyxy(bba: Optional[Tuple[float, float, float, float]],
         _interp_val(x2a, x2b, w),
         _interp_val(y2a, y2b, w),
     )
-
 
 def _densify_sequences(kps_seq: List[List[dict]],
                        bbox_seq: List[Optional[Tuple[float, float, float, float]]],
@@ -317,7 +309,6 @@ def _densify_sequences(kps_seq: List[List[dict]],
     new_kps.append(kps_seq[-1]); new_bbox.append(bbox_seq[-1]); new_dets.append(dets_seq[-1])
     return new_kps, new_bbox, new_dets
 
-
 def _estimate_fps(ts_ms_list: List[int]) -> float:
     if not ts_ms_list or len(ts_ms_list) < 2:
         return 0.0
@@ -328,7 +319,6 @@ def _estimate_fps(ts_ms_list: List[int]) -> float:
     avg = sum(dts) / len(dts)
     return 1000.0 / avg
 
-
 def _normalize_in_fps(in_fps: float) -> float:
     if in_fps <= 0:
         return 0.0
@@ -337,7 +327,6 @@ def _normalize_in_fps(in_fps: float) -> float:
     if in_fps < 0.1:
         return 0.1
     return in_fps
-
 
 def _resample_sequences_to_fps(window: list, kps_seq: list, bbox_seq: list, dets_seq: list, target_fps: float):
     ts = np.array([fr.ts_ms for fr in window], np.float64)
@@ -383,7 +372,6 @@ def _resample_sequences_to_fps(window: list, kps_seq: list, bbox_seq: list, dets
             fr_new.append(window[lo])
     return kps_new, bbox_new, dets_new, fr_new
 
-
 # ================= Data Structures =================
 @dataclass
 class FrameRecord:
@@ -394,7 +382,6 @@ class FrameRecord:
     kps: Optional[List[dict]] = None
     bbox: Optional[Tuple[float, float, float, float]] = None
     dets: List[dict] = field(default_factory=list)
-
 
 class UserBuffer:
     def __init__(self):
@@ -444,7 +431,6 @@ class UserBuffer:
             out2.append(fr)
         return out2
 
-
 # ================= Kalman + Motion =================
 class Kalman2D:
     def __init__(self, x0: float, y0: float):
@@ -464,7 +450,6 @@ class Kalman2D:
         self.vy += 0.3 * ry
         self.x += 0.6 * rx
         self.y += 0.6 * ry
-
 
 def kalman_smooth_kps(kps_seq: List[List[dict]]):
     L = len(kps_seq)
@@ -492,7 +477,6 @@ def kalman_smooth_kps(kps_seq: List[List[dict]]):
             sm.append({'x': kf.x, 'y': kf.y, 'conf': float(fr[j].get('conf', fr[j].get('confidence', 1.0))) if (fr and j < len(fr)) else 0.0})
         out.append(sm)
     return out
-
 
 def _compute_motion_feats_with_mask_from_window(window: List[FrameRecord], kps_seq: List[List[dict]]):
     ycom = []; hgt = []; area = []; trunk = []; kneeL = []; kneeR = []
@@ -592,7 +576,6 @@ def _compute_motion_feats_with_mask_from_window(window: List[FrameRecord], kps_s
     mask = np.array(valid, np.float32)
     return feats, mask
 
-
 def _make_window(fr_list: List[FrameRecord], end_index: int, window: int = WINDOW) -> Optional[List[FrameRecord]]:
     if end_index < 0:
         return None
@@ -600,7 +583,6 @@ def _make_window(fr_list: List[FrameRecord], end_index: int, window: int = WINDO
     if s < 0:
         return None
     return fr_list[s: end_index + 1]
-
 
 # ================= Core =================
 class StreamInferManager:
@@ -849,45 +831,70 @@ class StreamInferManager:
         return st
 
     async def _handle_fall_timeline(self, user_id: str, fall_prob: float, ts_ms: int):
-        """處理跌倒事件的時間線"""
-        state = self._fall_state_of(user_id)
-        start_time = state.get("start_time")
-        peak_score = state.get("peak_score", 0.0)
+        """處理跌倒事件時間線：採用『連續次數』門檻"""
+        st = self._fall_state_of(user_id)
+        st.setdefault("pos", 0)
+        st.setdefault("rec", 0)
+        st.setdefault("active", False)
+        st.setdefault("peak_score", 0.0)
 
-        if fall_prob >= FALL_TRIGGER_THR and not state.get("active"):
-            # 跌倒事件開始
-            state["active"] = True
-            state["start_time"] = now_str()
-            state["peak_score"] = fall_prob
+        # 觸發門檻：採最大值，等同「binary=fall」的門檻（符合『看到 fall 兩次才 start』）
+        trig_thr = max(float(FALL_TRIGGER_THR), float(BINARY_THR))
+        recv_thr = float(FALL_RECOVER_THR)
+        trig_need = int(TRIGGER_CONSEC)
+        recv_need = int(RECOVER_CONSEC)
 
-            # 準備回傳的參數
-            payload = {
-                "user_id": user_id,
-                "start_time": state["start_time"],  
-                "result": {
-                    "probs": state.get("probs", []),
-                    "pred_idx": state.get("pred_idx", 0),
-                },
-                "clip": state.get("clip", {}),
-            }
-            await self._emit("on_fall_start", payload)
+        if not st["active"]:
+            # 未啟動：累積觸發計數
+            if fall_prob >= trig_thr:
+                st["pos"] += 1
+                st["peak_score"] = max(st["peak_score"], fall_prob)
+            else:
+                st["pos"] = 0
+                st["peak_score"] = 0.0
 
-        elif fall_prob < FALL_RECOVER_THR and state.get("active"):
-            # 跌倒事件結束
-            state["active"] = False
-            state["end_time"] = now_str()
+            if st["pos"] >= trig_need:
+                st["active"] = True
+                st["start_time"] = now_str()
+                st["rec"] = 0
+                payload = {
+                    "user_id": user_id,
+                    "start_time": st["start_time"],
+                    "result": {
+                        "probs": st.get("probs", []),
+                        "pred_idx": st.get("pred_idx", 0),
+                    },
+                    "clip": st.get("clip", {}),
+                }
+                await self._emit("on_fall_start", payload)
 
-            payload = {
-                "user_id": user_id,
-                "start_time": state["start_time"],  # 修正這裡
-                "end_time": state["end_time"],  # 修正這裡
-                "peak_score": peak_score,
-                "result": {
-                    "probs": state.get("probs", []),
-                    "pred_idx": state.get("pred_idx", 0),
-                },
-            }
-            await self._emit("on_fall_recover", payload)
+        else:
+            # 已啟動：累積恢復計數
+            if fall_prob < recv_thr:
+                st["rec"] += 1
+            else:
+                st["rec"] = 0
+                st["peak_score"] = max(st["peak_score"], fall_prob)
+
+            if st["rec"] >= recv_need:
+                st["active"] = False
+                st["end_time"] = now_str()
+                peak = st.get("peak_score", 0.0)
+                payload = {
+                    "user_id": user_id,
+                    "start_time": st.get("start_time"),
+                    "end_time": st.get("end_time"),
+                    "peak_score": float(peak),
+                    "result": {
+                        "probs": st.get("probs", []),
+                        "pred_idx": st.get("pred_idx", 0),
+                    },
+                }
+                # 重置計數與峰值
+                st["pos"] = 0
+                st["rec"] = 0
+                st["peak_score"] = 0.0
+                await self._emit("on_fall_recover", payload)
         
     async def _handle_action_events(self, user_id: str, probs: np.ndarray, ts_ms: int):
         """處理多事件（如坐下、躺下）的時間線（使用 pos_idx/recover_idx 列表 + consecutive 次數）"""
@@ -985,7 +992,7 @@ class StreamInferManager:
                 st["active"] = False
                 st["pos"] = 0
                 st["rec"] = 0
-                await self._emit("on_fall_recover", {"user_id": user_id, "score": 0.0, "reason": reason})
+                await self._emit("on_fall_recover", {"user_id": user_id, "reason": reason})
             # multi 事件照舊
             evtD = self._multi_event_state.get(user_id) or {}
             for name, est in list(evtD.items()):
@@ -1006,6 +1013,7 @@ class StreamInferManager:
 
     # ----- WS ingest -----
     async def ingest(self, user_id: str, msg: dict):
+        user_id = str(user_id)  # ★ 統一 user_id 型別，避免 state 分裂
         async with self._lock(user_id):
             t = (msg.get("type") or "frame").lower()
             fid = int(msg.get("frame_id", -1))
@@ -1025,6 +1033,7 @@ class StreamInferManager:
             elif t in ("object","detect"):
                 if detect is not None: buf.upsert_detect(fid, ts, img_w, img_h, detect)
             else:
+                print(f"[WARN] Unknown message type")
                 return
 
             fr_list = buf.get_monotonic()
@@ -1057,9 +1066,62 @@ class StreamInferManager:
                 binary_out["pred_idx"] = pred_idx_bin
                 binary_out["pred"] = self.class_names_bin[pred_idx_bin]
                 binary_out["thr"] = float(BINARY_THR)
-
                 fall_prob = float(probs_bin[fall_idx])
-                await self._handle_fall_timeline(user_id, fall_prob, ts_cur)
+
+                # 寫回當前 state（probs / pred_idx / clip）
+                st = self._fall_state_of(user_id)
+                st["probs"] = [float(p) for p in probs_bin]
+                st["pred_idx"] = int(pred_idx_bin)
+                try:
+                    def _bbox_to_jsonable(b):
+                        if not b:
+                            return None
+                        try:
+                            arr = list(b)  # tuple → list
+                        except Exception:
+                            return None
+                        if len(arr) != 4:
+                            return None
+                        # 全 None 則視為沒有 bbox
+                        if all(v is None for v in arr):
+                            return None
+                        # 轉成 float 或 None
+                        out = []
+                        for v in arr:
+                            try:
+                                out.append(float(v) if v is not None else None)
+                            except Exception:
+                                out.append(None)
+                        return out
+
+                    # 取原資料
+                    start_fr = window[0]; end_fr = window[-1]
+                    start_bbox = _bbox_to_jsonable(getattr(start_fr, "bbox", None))
+                    end_bbox   = _bbox_to_jsonable(getattr(end_fr, "bbox", None))
+
+                    clip = {
+                        "start": {
+                            "frame_id": start_fr.frame_id,
+                            "ts_ms": int(start_fr.ts_ms),
+                            "kps":  getattr(start_fr, "kps", None) or None,
+                        },
+                        "end": {
+                            "frame_id": end_fr.frame_id,
+                            "ts_ms": int(end_fr.ts_ms),
+                            "kps":  getattr(end_fr, "kps", None) or None,
+                        },
+                    }
+                    
+                    # 只有在 bbox 有效時才放進去
+                    if start_bbox is not None:
+                        clip["start"]["bbox"] = start_bbox
+                    if end_bbox is not None:
+                        clip["end"]["bbox"] = end_bbox
+
+                    st["clip"] = clip
+                    
+                except Exception:
+                    pass
 
                 if fall_prob >= BINARY_THR:
                     stage = "binary"
@@ -1071,6 +1133,8 @@ class StreamInferManager:
                         "binary": binary_out,
                     }
                     await self._send(user_id, payload)
+                    # 先送給前端，再更新時間線（確保觀察到『出現 2 次 fall 才 start』）
+                    await self._handle_fall_timeline(user_id, fall_prob, ts_cur)
                     return
 
             # Multi-class stage
@@ -1096,19 +1160,12 @@ class StreamInferManager:
                 if binary_out is not None:
                     payload["binary"] = binary_out
                 await self._send(user_id, payload)
-            else:
-                # no multi: still send binary if available
-                if binary_out is not None:
-                    pred_idx = int(np.argmax(binary_out["probs"]))
-                    payload = {
-                        "type": "inference",
-                        "stage": "binary-only",
-                        "pred_idx": pred_idx,
-                        "pred": self.class_names_bin[pred_idx],
-                        "binary": binary_out,
-                    }
-                    await self._send(user_id, payload)
 
+                # # multi 送出後再更新跌倒時間線（此時 fall_prob 仍用 binary 的）
+                # if binary_out is not None:
+                #     fall_idx = self._fall_idx()
+                #     fall_prob = float(binary_out["probs"][fall_idx])
+                #     await self._handle_fall_timeline(user_id, fall_prob, ts_cur)
 
 # Singleton
 stream_infer_manager = StreamInferManager()

@@ -98,7 +98,7 @@ async def get_user_info(phone: str) -> dict:
             raise NotFoundError("找不到該使用者")
         except Exception as e:
             raise DatabaseError(f"查詢使用者資料時發生錯誤: {e}")
-
+        
 async def delete_user_account(phone: str) -> bool:
     async with Database.connection() as conn:
         try:

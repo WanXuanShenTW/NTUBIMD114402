@@ -52,3 +52,13 @@ async def delete_contact(conn, elder_user_id: int, caregiver_user_id: int) -> bo
         if cursor.rowcount == 0:
             raise NotFoundError(f"找不到 elder_user_id={elder_user_id} 與 caregiver_user_id={caregiver_user_id} 的照護關係可刪除")
         return True
+    
+async def delete_all_contacts_by_caregiver_user_id(conn, caregiver_user_id: int) -> int:
+    """根據照護者 user_id 刪除所有關係"""
+    async with conn.cursor() as cursor:
+        query = "DELETE FROM emergency_contacts WHERE caregiver_user_id = %s"
+        await cursor.execute(query, (caregiver_user_id,))
+        deleted_count = cursor.rowcount
+        if deleted_count == 0:
+            raise NotFoundError(f"找不到 caregiver_user_id={caregiver_user_id} 的任何照護關係可刪除")
+        return deleted_count

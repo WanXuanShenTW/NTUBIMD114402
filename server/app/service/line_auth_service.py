@@ -13,12 +13,6 @@ PENDING: Dict[str, Dict[str, Any]] = {}  # key: line_uid → {user_id, name, exp
 PENDING_TTL = int(os.getenv("LINE_BIND_TTL", 300))
 MAX_ATTEMPTS = int(os.getenv("LINE_BIND_MAX_ATTEMPTS", 5))
 
-try:
-    import bcrypt  # type: ignore
-    _HAS_BCRYPT = True
-except Exception:
-    _HAS_BCRYPT = False
-
 def _now() -> int:
     return int(time.time())
 
@@ -55,16 +49,6 @@ async def start_phone_step(line_user_id: str, text: str) -> Tuple[bool, str]:
         }
         return True, "請輸入密碼以完成驗證。"
 
-def _check_password(plain: str, stored: Optional[str]) -> bool:
-    if not stored:
-        return False
-    if stored.startswith("$2") and _HAS_BCRYPT:
-        try:
-            return bcrypt.checkpw(plain.encode("utf-8"), stored.encode("utf-8"))
-        except Exception:
-            return False
-    return plain == stored
-
 async def confirm_password_step(line_user_id: str, password: str) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
     st = PENDING.get(line_user_id)
     if not st or st["expires"] <= _now():
@@ -81,7 +65,7 @@ async def confirm_password_step(line_user_id: str, password: str) -> Tuple[bool,
             PENDING.pop(line_user_id, None)
             return False, "使用者尚未設定密碼，請洽系統管理員。", None
 
-        if not _check_password(password, auth.get("password")):
+        if not auth.get("password") or password != auth.get("password"):
             attempts += 1
             if attempts >= MAX_ATTEMPTS:
                 PENDING.pop(line_user_id, None)

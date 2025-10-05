@@ -22,8 +22,8 @@ async def get_fall_records(
     """
     try:
         records = await get_fall_event_records_by_time_range(user_id, start_time, end_time)
-        return await make_json_response(data={"records": records}, message="查詢成功")
+        return await make_json_response(code=200, data={"records": records}, message="查詢成功")
     except NotFoundError as ne:
-        return await make_json_response(code=404, message=str(ne), success=False)
+        return await make_json_response(code=200, message="尚為空值", success=True)
     except Exception as e:
         return await make_json_response(code=500, message=str(e), success=False)

@@ -1,7 +1,36 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from aiomysql.cursors import DictCursor
 from datetime import datetime, timedelta
-from ..exceptions import NotFoundError
+from pymysql.err import IntegrityError
+from ..exceptions import DatabaseError, NotFoundError
+
+async def insert_sleep_record(
+    conn,
+    user_id: int,
+    sleep_time: str,
+    wake_time: str
+) -> Optional[int]:
+    """
+    新增一筆睡眠紀錄到資料庫
+    :param conn: 資料庫連線
+    :param user_id: 使用者 ID
+    :param sleep_time: 睡眠開始時間 (格式: YYYY-MM-DD HH:MM:SS)
+    :param wake_time: 睡眠結束時間 (格式: YYYY-MM-DD HH:MM:SS)
+    :return: 新增的紀錄 record_id
+    """
+    async with conn.cursor() as cursor:
+        try:
+            query = """
+                INSERT INTO `114-402`.sleep_records (user_id, sleep_time, wake_time)
+                VALUES (%s, %s, %s)
+            """
+            values = (user_id, sleep_time, wake_time)
+            await cursor.execute(query, values)
+            return cursor.lastrowid
+        except IntegrityError as e:
+            raise DatabaseError(f"資料庫新增睡眠紀錄失敗: {e}")
+        except Exception as e:
+            raise DatabaseError(f"新增睡眠紀錄時發生錯誤: {e}")
 
 async def get_sleep_time_by_date(conn, user_id: int, date: str) -> Dict[str, Any]:
     """

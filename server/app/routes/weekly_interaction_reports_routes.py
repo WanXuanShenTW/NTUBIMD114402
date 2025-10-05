@@ -1,5 +1,6 @@
+from datetime import datetime
 from fastapi import APIRouter, Query
-from ..service.weekly_interaction_reports_service import get_latest_report
+from ..service.weekly_interaction_reports_service import get_latest_report, get_reports_by_week
 from ..service.weekly_report_push_service import push_weekly_reports_batch, push_weekly_report_to_elder, push_weekly_reports_by_time
 from ..utils.response_util import make_json_response
 from ..exceptions import NotFoundError, DatabaseError
@@ -14,6 +15,27 @@ async def get_latest_weekly_report(elder_id: int = Query(..., description="長�
     try:
         report = await get_latest_report(elder_id)
         return await make_json_response(data=report, message="成功取得最新報告")
+    except NotFoundError as e:
+        return await make_json_response(code=404, message=str(e), success=False)
+    except DatabaseError as e:
+        return await make_json_response(code=500, message=str(e), success=False)
+    except Exception as e:
+        return await make_json_response(code=500, message=f"未知錯誤: {e}", success=False)
+
+@weekly_reports_router.get("/weekly-report/by-week")
+async def get_weekly_report_by_date(
+    elder_id: int = Query(..., description="長者 ID"),
+    date: str = Query(..., description="查詢日期 (格式: YYYY-MM-DD)"),
+    sunday_as_first_day: bool = Query(False, description="是否以星期日為一週的第一天")
+):
+    """
+        取得指定 elder_id 和日期所在週的每週互動報告
+    """
+    try:
+        reports = await get_reports_by_week(elder_id, date, sunday_as_first_day)
+        return await make_json_response(data=reports, message="成功取得該週報告")
+    except ValueError as e:
+        return await make_json_response(code=400, message=str(e), success=False)
     except NotFoundError as e:
         return await make_json_response(code=404, message=str(e), success=False)
     except DatabaseError as e:
