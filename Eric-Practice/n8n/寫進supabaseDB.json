@@ -1,0 +1,103 @@
+{
+  "name": "寫進supabaseDB",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO family_posts\n(user_id, platform, content, post_time, topic_tag, target_person, is_shareable, reason, platform_post_id)\nVALUES (\n  {{$json.user_id}},                                   -- 數字不加引號\n  'FB',\n  {{ $json.content ? \"'\" + $json.content.replace(/'/g, \"''\") + \"'\" : 'NULL' }},\n  {{ $json.post_time_fmt ? \"TIMESTAMP '\" + $json.post_time_fmt + \"'\" : 'NULL' }},\n  {{ $json.topic_tag ? \"'\" + $json.topic_tag.replace(/'/g, \"''\") + \"'\" : 'NULL' }},\n  {{ $json.target_person ? \"'\" + $json.target_person.replace(/'/g, \"''\") + \"'\" : 'NULL' }},\n  {{ $json.is_shareable ?? 0 }},\n  {{ $json.reason ? \"'\" + $json.reason.replace(/'/g, \"''\") + \"'\" : 'NULL' }},\n  {{ $json.post_id ? \"'\" + $json.post_id.replace(/'/g, \"''\") + \"'\" : 'NULL' }}\n)\nON CONFLICT (platform_post_id) DO NOTHING;\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        144,
+        -16
+      ],
+      "id": "4828f245-270e-42df-a567-2475436bffc6",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "postgres": {
+          "id": "FjN23gDyFCTgUNdA",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  post_id,\n  platform,\n  user_id,\n  content,\n  DATE_FORMAT(post_time, '%Y-%m-%d %H:%i:%s') AS post_time_fmt,\n  topic_tag,\n  target_person,\n  is_shareable,\n  reason\nFROM family_posts;\n",
+        "options": {}
+      },
+      "name": "MySQL - Get family_posts",
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2,
+      "position": [
+        -64,
+        -16
+      ],
+      "id": "55528ed1-f473-4525-a8f5-664a073714ac",
+      "alwaysOutputData": false,
+      "credentials": {
+        "mySql": {
+          "id": "5dqLLDh1gLNgtU7C",
+          "name": "smcare"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -288,
+        -16
+      ],
+      "id": "9dae89fc-179e-4195-abd3-a52334255d4d",
+      "name": "Schedule Trigger"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "MySQL - Get family_posts": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "MySQL - Get family_posts",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "c7ee932e-a14f-44ee-be72-6ddd541e2e13",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "lu1FBepj7dUxa7NL",
+  "tags": []
+}

@@ -1,0 +1,104 @@
+{
+  "name": "kill sleep",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyX",
+              "value": 5,
+              "unit": "minutes"
+            }
+          ]
+        }
+      },
+      "name": "Tick every mins",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        -176,
+        16
+      ],
+      "typeVersion": 1,
+      "id": "62f149a6-7bef-4e53-a333-d5aad663b0b6"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- 查詢要 KILL 的連線\nSELECT \n    Id,\n    User,\n    Host,\n    Command,\n    Time,\n    State\nFROM information_schema.PROCESSLIST \nWHERE User = 'smartcare_db' \nAND Command = 'Sleep' \nAND Time > 300\nAND Id != CONNECTION_ID();",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [
+        32,
+        16
+      ],
+      "id": "d5db9816-422b-477d-8fb0-130ebbff6cab",
+      "name": "Execute a SQL query",
+      "credentials": {
+        "mySql": {
+          "id": "5dqLLDh1gLNgtU7C",
+          "name": "smcare"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "KILL {{ $json.Id }};",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [
+        240,
+        16
+      ],
+      "id": "fedf7f73-48bb-4999-b1e3-4c5a921a485f",
+      "name": "Execute a SQL query1",
+      "credentials": {
+        "mySql": {
+          "id": "5dqLLDh1gLNgtU7C",
+          "name": "smcare"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Tick every mins": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "68a9732a-c24e-4d20-a317-10999dcb99c8",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "dcaxUqylfvpBbiaB",
+  "tags": []
+}

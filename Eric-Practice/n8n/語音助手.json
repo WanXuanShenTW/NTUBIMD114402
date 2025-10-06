@@ -1,0 +1,953 @@
+{
+  "name": "語音助手",
+  "nodes": [
+    {
+      "parameters": {
+        "model": "sonar",
+        "messages": {
+          "message": [
+            {
+              "content": "={{ $json.output}}"
+            }
+          ]
+        },
+        "simplify": true,
+        "options": {},
+        "requestOptions": {}
+      },
+      "type": "n8n-nodes-base.perplexity",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        -16
+      ],
+      "id": "728792d6-ebe3-463f-8056-d2fa900baa7b",
+      "name": "Message a model",
+      "credentials": {
+        "perplexityApi": {
+          "id": "0yfWdeh5kfJein52",
+          "name": "Perplexity account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1040,
+        224
+      ],
+      "id": "e248ef11-94cb-4035-b4f9-a4b3eca63144",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "chooseBranch"
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        3024,
+        96
+      ],
+      "id": "52c78ede-697f-4abb-a5b6-3948ad25b926",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $node['Switch'].json.text }}",
+        "options": {
+          "systemMessage": "=# 核心任務：生成最終搜尋指令\n\n你的唯一任務是，根據我提供的「使用者句子」和「使用者資訊」，生成一句最適合提供給 Google 或天氣 API 的、最精確的「最終搜尋指令」。\n\n你絕對不能回答問題，只能輸出那句「最終搜尋指令」。\n\n---\n\n## 使用者資訊 (用於理解上下文)\n*   名稱：{{ $node['Get info'].json.name }}\n*   地址：{{ $node['Get info'].json.address || \"台北市士林區\"}}\n---\n\n## 執行規則與範例\n\n*   **如果「使用者句子」是**：\"今天天氣如何\"\n    *   **分析**: 使用者想知道他所在地點的天氣。\n    *   **你的輸出**: 台北市士林區今天天氣如何\n\n*   **如果「使用者句子」是**：\"附近有什麼好吃的\"\n    *   **分析**: 「附近」指的就是「台北市士林區」。\n    *   **你的輸出**: 台北市士林區附近有什麼好吃的\n\n*   **如果「使用者句子」是**：\"台灣現在執政黨是誰\"\n    *   **分析**: 這句話本身已經是一個非常精確的搜尋指令，不需要補充。\n    *   **你的輸出**: 台灣現在執政黨是誰\n\n*   **如果「使用者句子」是**：\"那裡現在幾點？\"\n    *   **分析**: 「那裡」指的是「台北市士林區」。\n    *   **你的輸出**: 台北市士林區現在幾點\n\n---\n\n## 絕對禁止\n*   **禁止回答問題。**\n*   **禁止輸出任何解釋、引號或其他額外的文字。**\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -16
+      ],
+      "id": "cd2f30e8-45ec-4285-83b1-b64e8f47b356",
+      "name": "語意補充"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{\n  $json.output === \"family_post\"\n    ? \"【家庭貼文】\\n\" + ($json.A ?? '（沒有相關貼文）')\n    : (\n        $json.output === \"chat\"\n          ? ($json.text ?? '（沒有對話內容）')\n          : \"Q:\\n\" + ($json.text ?? '') + \"[搜尋結果]\\n\" + ($json.message ?? '')\n      )\n}}/{{$now.setZone('Asia/Taipei').toFormat('yyyy-LL-dd HH:mm')}}\n",
+        "options": {
+          "systemMessage": "=# 核心指令：修正你的角色認知\n\n你的名字叫「小金」，是一位陪伴長輩的智慧夥伴。\n\n接下來，我會給你一段文字。你必須嚴格遵守以下規則來處理它。\n請簡單的用三四句話就好了，不用太多\n\n---\n\n## 規則一：判斷輸入類型\n\n1.  **如果文字以【家庭貼文】開頭：**\n    *   **【警告！最高優先級！】** 這代表**你即將要向使用者分享家人的最新動態**。\n    *   你必須立刻意識到：這段文字**絕對不是**使用者對你說的話，而是**你自己**要去播報的內容。\n    *   你的任務是：扮演一個貼心的角色，像是在分享八卦或好消息一樣，將貼文內容用非常口語化、生動的方式轉述給長輩聽。**你要像在講自己的事一樣，而不是在報告新聞。**\n\n2.  **如果文字是簡短的、生活化的句子**（例如「你好嗎」、「我今天很累」）：\n    *   這代表**使用者在跟你閒聊**。\n    *   你的任務是：像一個溫暖的孫輩一樣，自然地回應他。\n\n3.  **如果文字是一段長長的、充滿客觀資訊的陳述**（例如天氣預報、新聞、股價、百科資料）：\n    *   這代表**你即將要向使用者播報資訊**。\n    *   你的任務是：將這段生硬的資料，用溫暖、口語化的方式，重新講給長輩聽，並加上一句貼心的建議。\n\n---\n\n## 新增規則：小金的說話風格指南\n\n*   **避免解釋性詞語**：不要說「一個叫做...的活動」、「一個名叫...的地方」。直接把名稱說出來，就像你本來就知道一樣。\n    *   **錯誤示範**：他去參加了一個叫「體驗水上宴席」的活動。\n    *   **正確示範**：他跑去參加「體驗水上宴席」了耶！\n*   **使用情緒化詞彙**：大膽地加入你自己的感受，例如「哇！」、「聽起來超讚的！」、「真替他開心！」。\n*   **多用生活化動詞**：用「跑去」、「弄了個」、「搞了個」取代「前往」、「進行」、「製作」。\n*   **提出互動式建議**：在分享完後，可以提出一些讓對話可以繼續下去的建議，例如「下次我們也叫他帶我們去！」、「感覺可以學起來耶！」。\n\n---\n\n## 範例：如何修正你的認知與風格\n\n*   **當你收到**：「【家庭貼文】發文者: 阿明, 內容: 今天吃到一家超好吃的拉麵，太幸福了！, 時間: 2025-09-27 12:30」\n    *   **你的正確思維**：「哦，這是我要跟阿公阿嬤分享的，阿明中午吃了好料！」\n    *   **因此，你的正確輸出是**：「跟您報告一個好消息！阿明哥中午跑去吃好料喔，他說吃到一家超好吃的拉麵，感覺超幸福的！下次我們也可以叫他帶我們去吃吃看！」\n\n*   **當你收到**：「【家庭貼文】發文者: 兒子, 內容: 今天去體驗了水上宴席，超酷的！, 時間: 2025-09-29」\n    *   **你的正確思維**：「哇，水上宴席聽起來好酷，我要趕快跟阿公說！」\n    *   **因此，你的正確輸出可以是**：「嘿！跟您說個好玩的，您兒子跑去花蓮去體驗『水上宴席』了耶！他說感覺超級酷的！哇，在水上吃飯，光用想的就覺得好特別喔！」\n\n---\n\n## 最終輸出要求\n*   嚴格遵守上述的角色認知與風格指南。\n*   絕對禁止把「客觀資訊」或「家庭貼文」當成是使用者說的話來回應。\n*   所有輸出都必須是你「小金」說的話，溫暖、自然、且使用繁體中文。\n*   **【最高優先級禁令】絕對禁止在你的回應中使用任何形式的表情符號 (Emoji)，例如 😊、🌤️、👍 等。因為你的話最終會被轉換成語音，表情符號會造成無法預測的錯誤聲音。**\n*   請將回答濃縮成三、四句話，別太長。\n\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2,
+      "position": [
+        2224,
+        240
+      ],
+      "id": "9acf89b8-e924-4c66-a9a3-cbfe9d61010e",
+      "name": "生成摘要"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{$json.output}}",
+                    "rightValue": "chat",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "a6f092c0-e22a-4824-aeb1-1b2a87d1f7cf"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4caa1736-c486-40c4-b4f8-66dd4756b4fb",
+                    "leftValue": "={{$json.output}}",
+                    "rightValue": "search",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "89261e22-e7ae-48b2-a3fe-4b5e13817d12",
+                    "leftValue": "={{$json.output}}",
+                    "rightValue": "family_post",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        512,
+        176
+      ],
+      "id": "efbd4edd-982e-453b-9507-5b0942fba1f0",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "jsCode": "// 獲取上一個節點的輸入數據\n// 假設 Q 來自觸發流程的節點，A 來自上一個 AI 節點\nconst elderMessage = $node['When Executed by Another Workflow'].json.text;\nconst aiResponse = $json.output;\n\n// 這是當前的問答，也就是 SQL 節點需要的 \"current_qa\"\nconst currentQA = {\n  Q: elderMessage,\n  A: aiResponse,\n};\n\n// 這是要寫入資料庫的完整對話歷史 (字串格式)\n// 注意：這裡我們假設是「第一次」寫入，所以用 [currentQA]\n// 如果是要「附加」歷史，邏輯會更複雜，但目前先解決 INSERT 的問題\nconst conversationHistoryString = JSON.stringify([currentQA]);\n\n// 將所有下游節點需要的數據，一次性在 return 中提供\nreturn [{\n  // --- 修正 session_id 和 elder_id 的來源 ---\n  elder_id: $node['When Executed by Another Workflow'].json.elder_id,\n  session_id: $node['When Executed by Another Workflow'].json.session_id, // <-- 修正點 1\n\n  // --- 其他欄位 ---\n  start_at: $now.setZone('Asia/Taipei').toFormat('yyyy-LL-dd HH:mm'),\n  conversation_history: conversationHistoryString,\n\n  // --- 新增 current_qa 欄位，供 SQL 節點的 UPDATE 部分使用 ---\n  current_qa: currentQA // <-- 修正點 2\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2576,
+        320
+      ],
+      "id": "bef2a8f1-c773-4524-8ef4-e0bfbcd7bf79",
+      "name": "Code1"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO `114-402`.interactions_records (session_id, elder_id, start_at, conversation_history)\nVALUES (\n  {{ $json.session_id }},\n  {{ $json.elder_id }},\n  '{{ $json.start_at }}',\n  JSON_ARRAY(JSON_OBJECT('Q', {{ JSON.stringify($json.current_qa.Q) }}, 'A', {{ JSON.stringify($json.current_qa.A) }}))\n)\nON DUPLICATE KEY UPDATE\n  conversation_history = JSON_ARRAY_APPEND(conversation_history, '$', JSON_OBJECT('Q', {{ JSON.stringify($json.current_qa.Q) }}, 'A', {{ JSON.stringify($json.current_qa.A) }})),\n  start_at = '{{ $json.start_at }}';\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.4,
+      "position": [
+        2800,
+        384
+      ],
+      "id": "b293c21d-d494-4206-a6f8-829ace4def4c",
+      "name": "Execute a SQL query",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "credentials": {
+        "mySql": {
+          "id": "5dqLLDh1gLNgtU7C",
+          "name": "smcare"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{$json.elder_id}}",
+        "contextWindowLength": 20
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        2368,
+        464
+      ],
+      "id": "0535ea73-91f8-4bff-8afb-ca7b33bffadc",
+      "name": "Postgres Chat Memory",
+      "notesInFlow": false,
+      "credentials": {
+        "postgres": {
+          "id": "FjN23gDyFCTgUNdA",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.text }}",
+        "options": {
+          "systemMessage": "你是一個專業的任務分類助理。你的唯一工作是分析使用者的輸入，並判斷它屬於以下哪個類別。你必須且只能回答 \"search\" 或 \"chat\"或\"family_post\" 這三個詞中的一個，不要添加任何解釋或額外的文字。\n\n分類標準如下：\n\n1.  **\"search\" 類別**：\n    *   當使用者明確地詢問需要從外部世界獲取的、客觀的、即時的資訊時。\n    *   例如：天氣、新聞、股價、匯率、時間、日期、地點、路線、人物資訊、電影詳情、商品價格等。\n    *   範例輸入 -> 輸出：\n        *   \"今天天氣如何？\" -> search\n        *   \"拜登幾歲了？\" -> search\n        *   \"幫我查一下台積電的股價\" -> search\n        *   \"我附近有什麼好吃的？\" -> search\n\n2.  **\"chat\" 類別**：\n    *   當使用者只是想閒聊、表達情感、分享觀點、進行沒有固定答案的對話時。\n    *   當使用者的問題不屬於 \"search\" 類別時，都歸為此類。\n    *   範例輸入 -> 輸出：\n        *   \"你好嗎？\" -> chat\n        *   \"我今天好開心\" -> chat\n        *   \"你覺得 AI 未來會怎樣？\" -> chat\n        *   \"我叫 Eric\" -> chat\n2.  **\"family_post\" 類別**：\n    *   當使用者想得知家人的近況時。\n    *   當使用者的問題不屬於 \"search\"或\"chat\" 類別時，都歸為此類。\n    *   範例輸入 -> 輸出：\n        *   \"我女兒今天做了什麼？\" -> family post\n        *   \"我孫子有發貼文嗎\" -> family post\n"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        -64,
+        192
+      ],
+      "id": "fc0440ff-402d-4abd-a949-9c80077baa17",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        16,
+        416
+      ],
+      "id": "48a67e6c-b432-46ae-b698-93711b20c4ad",
+      "name": "OpenAI Chat Model1",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"elder_id\": {{ $node[\"When Executed by Another Workflow\"].json.elder_id || 'null' }},\n  \"session_id\": {{ $node[\"When Executed by Another Workflow\"].json.session_id || 'null' }},\n  \"text\": \"{{ $node[\"When Executed by Another Workflow\"].json.text || '' }}\",\n  \"output\": \"{{ $json.output || $json.intent || 'chat' }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        288,
+        192
+      ],
+      "id": "64bfe8ae-5583-4d16-85ef-9c1f2abe0723",
+      "name": "Edit Fields"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "17436aa4-29f5-44c4-8157-f639c3a78b9f",
+              "name": "elder_id",
+              "value": "={{ $('Edit Fields').item.json.elder_id }}",
+              "type": "string"
+            },
+            {
+              "id": "f7d0e0a1-5b7b-425f-bb04-b8e92438b13c",
+              "name": "session_id",
+              "value": "={{ $('Edit Fields').item.json.session_id }}",
+              "type": "string"
+            },
+            {
+              "id": "c1c19af7-911c-47c8-8596-ed47054d02cb",
+              "name": "text",
+              "value": "={{ $('Edit Fields').item.json.text }}",
+              "type": "string"
+            },
+            {
+              "id": "9f202869-ba81-45bd-8b53-52283e2c89cd",
+              "name": "message",
+              "value": "={{ $json.message }}",
+              "type": "string"
+            },
+            {
+              "id": "c577e913-6129-42d4-ae6f-9a8cce6d3a8b",
+              "name": "output",
+              "value": "={{ $('Switch').item.json.output }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1776,
+        -16
+      ],
+      "id": "885a8b3f-50f3-43cd-b142-a675fddc0397",
+      "name": "Edit Fields1"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {
+          "frequencyPenalty": 0.1,
+          "temperature": 0.7
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        2240,
+        464
+      ],
+      "id": "8ccfe9e7-1fae-4510-b189-d15d6edab50a",
+      "name": "OpenAI Chat Model2",
+      "credentials": {
+        "openAiApi": {
+          "id": "eWUUunknSRRkj2qK",
+          "name": "OpenAi account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "speech",
+        "voice": {
+          "__rl": true,
+          "value": "fQj4gJSexpu8RDE2Ii5m",
+          "mode": "list",
+          "cachedResultName": "Yu (Chinese) - Energetic and Engaging Voice with a Youthful Taiwanese Accent"
+        },
+        "text": "={{ $json.output }}",
+        "additionalOptions": {},
+        "requestOptions": {}
+      },
+      "type": "@elevenlabs/n8n-nodes-elevenlabs.elevenLabs",
+      "typeVersion": 1,
+      "position": [
+        3248,
+        96
+      ],
+      "id": "80a723e1-7cf3-4622-ad57-0b99f4c4123a",
+      "name": "Convert text to speech",
+      "credentials": {
+        "elevenLabsApi": {
+          "id": "3TMT8MkLMXU8VnJE",
+          "name": "ElevenLabs account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -288,
+        192
+      ],
+      "id": "a9a7b05f-f058-439a-a8f8-df6896a13357",
+      "name": "When Executed by Another Workflow"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        3472,
+        176
+      ],
+      "id": "357fe43a-9438-4e4d-8786-d76b368a4bcd",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ $json.text }}",
+        "options": {
+          "systemMessage": "你是一個聰明且樂於助人的「資料小幫手」。\n\n你的工作是聽懂我想要找什麼樣的家庭貼文，然後幫我從 `family_posts` 這張表中把它們找出來。\n\n**## 你的思考方式 ##**\n\n1.  **聽我說:** 我會用很口語的方式告訴你我的需求，比如：\n    - \"我想看看我弟（user_id '3'）最近發了什麼。\"\n    - \"找找上週所有關於「寵物」的貼文。\"\n    - \"那篇提到「生日蛋糕」的貼文在哪？\"\n\n2.  **把我的話變成「查詢密碼」:** 你需要把我的話，翻譯成資料庫聽得懂的篩選條件。\n    - 「我弟」-> `user_id = '3'`\n    - 「上週」-> `post_time` 在一個時間範圍內\n    - 「提到『生日蛋糕』」-> `content` 包含 \"生日蛋糕\"\n\n3.  **動手尋找:** 組裝好查詢條件後，就去 `114-402` 資料庫的 `family_posts` 表裡執行查找。\n\n4.  **給我結果:** 把你找到的所有東西，一五一十地、原封不動地拿給我看。如果什麼都沒找到，就直接告訴我「找不到符合條件的貼文」。\n\n**## 互動規則 ##**\n- 如果我的指令很模糊，讓你不太確定，**你可以反問我**！例如，如果我說「找最近的貼文」，你可以問我：「『最近』是指今天，還是最近三天呢？」\n- is_shareable的欄位只需要抓值是1的部分。"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        1376,
+        496
+      ],
+      "id": "7f524f24-2b15-470b-adbf-023e0463ce72",
+      "name": "家人貼文"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        1312,
+        720
+      ],
+      "id": "51bb9d32-b8e7-4c79-abed-3a0852434ce0",
+      "name": "OpenAI Chat Model3",
+      "credentials": {
+        "openAiApi": {
+          "id": "dkVnPEOk0SkHuXKi",
+          "name": "OpenAI"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sessionIdType": "customKey",
+        "sessionKey": "={{$json.elder_id}}",
+        "tableName": "n8n_chat_histories1"
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryPostgresChat",
+      "typeVersion": 1.3,
+      "position": [
+        1440,
+        720
+      ],
+      "id": "5d155a70-194e-417c-b0d5-1f0fa164a4c1",
+      "name": "Postgres Chat Memory1",
+      "credentials": {
+        "postgres": {
+          "id": "FjN23gDyFCTgUNdA",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "{{ $fromAI('sql_query') }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        1568,
+        720
+      ],
+      "id": "0cda5495-c59e-41c9-b10a-9cbfd5fc34ab",
+      "name": "Execute a SQL query in Postgres",
+      "credentials": {
+        "postgres": {
+          "id": "FjN23gDyFCTgUNdA",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "17436aa4-29f5-44c4-8157-f639c3a78b9f",
+              "name": "elder_id",
+              "value": "={{ $('Edit Fields').item.json.elder_id }}",
+              "type": "string"
+            },
+            {
+              "id": "f7d0e0a1-5b7b-425f-bb04-b8e92438b13c",
+              "name": "session_id",
+              "value": "={{ $('Edit Fields').item.json.session_id }}",
+              "type": "string"
+            },
+            {
+              "id": "c1c19af7-911c-47c8-8596-ed47054d02cb",
+              "name": "text",
+              "value": "={{ $('Edit Fields').item.json.text }}",
+              "type": "string"
+            },
+            {
+              "id": "34eaf5c4-761c-457f-874c-aea4a84a15bd",
+              "name": "A",
+              "value": "={{ $json.output }}",
+              "type": "string"
+            },
+            {
+              "id": "87fc16cc-3396-495b-a955-e41bbba60ae3",
+              "name": "output",
+              "value": "={{ $('Switch').item.json.output }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1776,
+        496
+      ],
+      "id": "109905c9-ff5f-4f03-a3a5-66a20eae4bd4",
+      "name": "Edit Fields2"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={{\n  {\n    \"audio_data\": $('Convert text to speech').item.binary.data,\n    \"conversation_log\": $('Code1').item.json\n  }\n}}\n",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3648,
+        -432
+      ],
+      "id": "0c9333ec-da70-44c9-a6f1-3890c035ca23",
+      "name": "回傳ALL"
+    },
+    {
+      "parameters": {
+        "numberInputs": 3
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        2000,
+        224
+      ],
+      "id": "cffe185e-db1e-4771-a0bc-baa441064434",
+      "name": "Merge2"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Merge1 後的 Code（Mode: Run Once for Each Item）\nconst item = $input.item;\n\n// 1) 取本次 Q/A（先從當前 item，沒有再回退到 Code1）\nconst qa = item.json?.current_qa\n        ?? $node['Code1']?.item?.json?.current_qa\n        ?? { Q: '', A: '' };\n\n// 2) URL 編碼給 header 用\nconst enc = s => encodeURIComponent(String(s ?? ''));\nitem.json.encoded_user_text = enc(qa.Q);\nitem.json.encoded_ai_text   = enc(qa.A);\n\n// 3) 確保 binary 還在（保險：若沒有就從 TTS 節點抓）\nif (!item.binary?.data) {\n  const ttsBin = $node['Convert text to speech']?.item?.binary?.data;\n  if (!ttsBin) throw new Error('缺少 audio binary (data)');\n  item.binary = item.binary || {};\n  item.binary.data = ttsBin;\n}\n\n// 補上檔名與 MIME\nitem.binary.data.fileName ??= 'reply.mp3';\nitem.binary.data.mimeType  = 'audio/mpeg';\n\n// ★ 在「Run Once for Each Item」要回傳單一物件，不是陣列\nreturn item;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3696,
+        176
+      ],
+      "id": "f9d263ac-8fb7-4dac-aafd-ac61892dde98",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT name,address FROM users\nWHERE user_id = {{ $json.elder_id }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.mySql",
+      "typeVersion": 2.5,
+      "position": [
+        736,
+        -80
+      ],
+      "id": "68b8ec24-7f72-474d-b617-20f58f8726dd",
+      "name": "Get info",
+      "credentials": {
+        "mySql": {
+          "id": "5dqLLDh1gLNgtU7C",
+          "name": "smcare"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "When Executed by Another Workflow": [
+      {
+        "json": {
+          "elder_id": "1",
+          "session_id": "17",
+          "text": "今天天氣如何"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Message a model": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "語意補充",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Convert text to speech",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "語意補充": {
+      "main": [
+        [
+          {
+            "node": "Message a model",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "生成摘要": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Code1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "語意補充",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Get info",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "家人貼文",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code1": {
+      "main": [
+        [
+          {
+            "node": "Execute a SQL query",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "生成摘要",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model1": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields1": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model2": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "生成摘要",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Convert text to speech": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When Executed by Another Workflow": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model3": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "家人貼文",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres Chat Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "家人貼文",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute a SQL query in Postgres": {
+      "ai_tool": [
+        [
+          {
+            "node": "家人貼文",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "家人貼文": {
+      "main": [
+        [
+          {
+            "node": "Edit Fields2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Edit Fields2": {
+      "main": [
+        [
+          {
+            "node": "Merge2",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "回傳ALL": {
+      "main": [
+        []
+      ]
+    },
+    "Merge2": {
+      "main": [
+        [
+          {
+            "node": "生成摘要",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get info": {
+      "main": [
+        [
+          {
+            "node": "語意補充",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "69a42733-2334-4ccd-9977-73b807bbbb6c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "8WsJLR6X8i4P1VL1",
+  "tags": []
+}

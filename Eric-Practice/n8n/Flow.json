@@ -1,0 +1,358 @@
+{
+  "name": "分流器",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "elder",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -496,
+        -16
+      ],
+      "id": "93fb03ee-4a35-4251-a07b-cedc6a2f9355",
+      "name": "Webhook",
+      "webhookId": "2d397473-31e1-4fb5-b2cb-5c4e2be82e8c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// === 讀入（有些來源把資料放在 body） ===\nconst raw = items[0].json?.body ?? items[0].json;\n\n// 基本中繼資料（你要傳下去的欄位）\nconst meta = {};\nfor (const k of ['elder_id','contact_id','session_id','timestamp_ms','lang']) {\n  if (raw && raw[k] != null) meta[k] = raw[k];\n}\n\nconst outputs = [];\n\n// ------------ chat ------------\nif (typeof raw?.text === 'string' && raw.text.trim()) {\n  outputs.push({\n    json: { method: 'talk', ...meta, text: raw.text.trim() }\n  });\n}\n\n// ------------ detect（frames 版）------------\nfunction validFrame(f) {\n  if (!f || typeof f !== 'object') return false;\n  if (['pose','object'].includes(f.type)) return true;\n  if (Array.isArray(f.persons) || Array.isArray(f.detections)) return true;\n  return false;\n}\nfunction toFrames(b) {\n  if (!b) return [];\n  if (Array.isArray(b.frames)) return b.frames.filter(validFrame);\n  if (validFrame(b)) return [b];\n  // 也支援 {pose: {...}, object: {...}} 這種包法\n  const arr = [];\n  if (validFrame(b.pose))   arr.push(b.pose);\n  if (validFrame(b.object)) arr.push(b.object);\n  return arr;\n}\nconst frames = toFrames(raw);\nif (frames.length) {\n  outputs.push({\n    json: { method: 'detect', ...meta, frames }\n  });\n}\n\n// ------------ 都沒有命中 ------------\nif (!outputs.length) {\n  outputs.push({ json: { method: 'unknown', ...meta, raw } });\n}\n\nreturn outputs;\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -272,
+        -16
+      ],
+      "id": "ffca5dbf-15cd-433b-8c9d-4037bb328b8e",
+      "name": "Code"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "hs6NnGOZ4RZNqewk",
+          "mode": "list",
+          "cachedResultName": "骨架分析v4"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        400,
+        80
+      ],
+      "id": "43e52937-8509-465d-89b1-d6f62a59a041",
+      "name": "Execute Workflow1"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "8WsJLR6X8i4P1VL1",
+          "mode": "list",
+          "cachedResultName": "語音助手"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        400,
+        -112
+      ],
+      "id": "124cdcfa-29a1-48ba-8c9a-e9e6d9f8fc2e",
+      "name": "Execute Workflow"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.method }}",
+                    "rightValue": "talk",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "abfbe3cc-d360-4f64-a1b4-627c36910210"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2b3dfa72-5f40-4a75-a0ab-3b33fe22c0f5",
+                    "leftValue": "={{ $json.method }}",
+                    "rightValue": "detect",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        -48,
+        -16
+      ],
+      "id": "9481887e-3d92-4363-8a81-dad060445524",
+      "name": "分支"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"elder_id\": \"{{ $json.elder_id || '' }}\",\n  \"session_id\": \"{{ $json.session_id }}\",\n  \"text\": \"{{ $json.text || $json.body?.text || $json.text }}\"\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        176,
+        -112
+      ],
+      "id": "095b8541-4f41-4232-af21-2283d5896a2a",
+      "name": "語音"
+    },
+    {
+      "parameters": {
+        "mode": "raw",
+        "jsonOutput": "={\n  \"elder_id\": \"{{ $json.elder_id || $json.body?.elder_id || '' }}\",\n  \"session_id\": \"{{ $json.session_id || $json.body?.session_id || '' }}\",\n  \"timestamp_ms\": {{ $json.timestamp_ms ?? $json.body?.timestamp_ms ?? $json.frames?.[0]?.timestamp_ms ?? null }},\n  \"frames\": {{ $json.frames || $json.body?.frames || ( $json.pose || $json.object ? [].concat($json.pose ? [$json.pose] : [], $json.object ? [$json.object] : []) : [] ) }}\n}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        176,
+        80
+      ],
+      "id": "4c34e280-b9a8-4493-bfc8-aabae2573aac",
+      "name": "骨架"
+    },
+    {
+      "parameters": {
+        "respondWith": "binary",
+        "responseDataSource": "set",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "audio/mpeg"
+              },
+              {
+                "name": "User-Text",
+                "value": "={{ $json.encoded_user_text }}"
+              },
+              {
+                "name": "AI-Text",
+                "value": "={{ $json.encoded_ai_text }}"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        848,
+        -112
+      ],
+      "id": "ebe0fb67-c36f-4b59-8e74-93c2e8c8e465",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// 取得當前 item（子流程已回來）\nconst it = $input.item;\nconst j  = it.json || {};\n\n// 若子流程已帶 encoded_* 就直接用；否則從 current_qa 補\nconst enc = s => encodeURIComponent(String(s ?? ''));\nif (!j.encoded_user_text || !j.encoded_ai_text) {\n  const q = j.current_qa?.Q ?? j.conversation_log?.current_qa?.Q ?? '';\n  const a = j.current_qa?.A ?? j.conversation_log?.current_qa?.A ?? '';\n  if (!j.encoded_user_text) j.encoded_user_text = enc(q);\n  if (!j.encoded_ai_text)   j.encoded_ai_text   = enc(a);\n}\n\n// 確保 binary 還在（子流程通常放在 binary.data）\nif (!it.binary?.data) throw new Error('missing audio binary (data)');\n\n// （可選）補上檔名/MIME，避免上游沒設好\nit.binary.data.fileName ??= 'reply.mp3';\nit.binary.data.mimeType   = 'audio/mpeg';\n\nreturn { json: j, binary: it.binary };\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        624,
+        -112
+      ],
+      "id": "3739feb4-de53-4ddf-9b43-34610d59548b",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:5000/line/notify_line",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"elder_id\": , \"status\": \"\"}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        624,
+        80
+      ],
+      "id": "64788db3-ef92-496f-9b82-9c991c03b0c4",
+      "name": "Line notify"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Code",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code": {
+      "main": [
+        [
+          {
+            "node": "分支",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow1": {
+      "main": [
+        [
+          {
+            "node": "Line notify",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute Workflow": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "分支": {
+      "main": [
+        [
+          {
+            "node": "語音",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "骨架",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "語音": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "骨架": {
+      "main": [
+        [
+          {
+            "node": "Execute Workflow1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Asia/Taipei",
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "f1f74a1a-b05d-4b97-9d5e-6673ca693cb6",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "8kyUzIRhKszUSeaj",
+  "tags": []
+}

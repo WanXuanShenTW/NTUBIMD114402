@@ -1,0 +1,64 @@
+{
+  "name": "週通知",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        }
+      },
+      "name": "Tick every mins",
+      "type": "n8n-nodes-base.cron",
+      "position": [
+        -32,
+        16
+      ],
+      "typeVersion": 1,
+      "id": "7e19ad5f-c53a-49d6-b807-8f1dcf2f606e"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://24c47ae90cdf.ngrok-free.app/weekly-report/push-by-time",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        176,
+        16
+      ],
+      "id": "e4dec1b8-1a28-4231-a79e-fbe81d2dece5",
+      "name": "HTTP Request"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Tick every mins": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "e35fe359-ba82-4c21-89ac-f19a879732af",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "299d7eed2c0c6544a8036b71370705df78b5527b605de12dda8543cdb45ddf02"
+  },
+  "id": "AmRuKQyYo3fOSLsW",
+  "tags": []
+}
