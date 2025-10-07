@@ -96,6 +96,21 @@ class WSConnectionManager:
                     traceback.print_exc()
                     self.disconnect(user_id, ws)
 
+    async def send(self, user_id: str, message: dict):
+        """發送訊息給指定 user 的所有連線"""
+        import json
+        if user_id not in self.active_connections:
+            print(f"[WS][SEND] user={user_id} no active connections")
+            return
+
+        data = json.dumps(message, ensure_ascii=False)
+        conns = self.active_connections[user_id]
+        for ws in conns:
+            try:
+                await ws.send_text(data)
+            except Exception as e:
+                print(f"[WS][SEND][ERROR] user={user_id}: {e}")
+                
     # ---- debug helpers ----
     def get_user_connections(self, user_id: str) -> List[WebSocket]:
         return self.active_connections.get(user_id, [])

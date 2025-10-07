@@ -47,7 +47,7 @@ async def websocket_test(websocket: WebSocket):
         while True:
             # 3) 接收來自客戶端的訊息（預期多為文字/JSON）
             message = await websocket.receive_text()
-            print(f"Received from user {user_id}: {message}")
+            # print(f"Received from user {user_id}: {message}")
             
             now = time.time()
             total_msgs += 1

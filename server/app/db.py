@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from aiomysql.cursors import DictCursor
 import time, uuid, traceback
 
+from datetime import datetime
+
 load_dotenv()
 
 USE_POOL_TIMEOUT = os.getenv("USE_POOL_TIMEOUT", "false").lower() == "true"
@@ -169,7 +171,7 @@ class Database:
         # 根據MySQL max_connections=151，使用保守設定
         min_size = int(os.getenv("DB_POOL_MIN_SIZE", "2"))
         max_size = int(os.getenv("DB_POOL_MAX_SIZE", "8"))  # 保守設定，避免耗盡連線
-        
+        print("[DEBUG] Starting create_pool at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         cls._pool = await create_pool(
             host=os.getenv("DB_HOST"),
             port=int(os.getenv("DB_PORT", "3306")),

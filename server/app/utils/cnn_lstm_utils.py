@@ -17,25 +17,29 @@ class SpaceCNN(nn.Module):
         return self.fc(self.net(x).flatten(1))
 
 class TemporalHead(nn.Module):
-    """支援 mask 的 temporal 聚合：last/mean/attn（與新版 trainer 對齊）"""
     def __init__(self, in_dim, num_classes, mode="attn", dropout=0.0):
         super().__init__()
         self.mode = mode
-        self.drop = nn.Dropout(dropout) if dropout>0 else nn.Identity()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         if mode == "attn":
-            self.attn = nn.Linear(in_dim,1)
+            self.attn = nn.Linear(in_dim, 1)
         self.fc = nn.Linear(in_dim, num_classes)
-    def forward(self, seq_feats: torch.Tensor, mask: Optional[torch.Tensor]=None):
-        # seq_feats: (B,T,D), mask: (B,T) in {0,1}
-        if (mask is not None) and (self.mode in ("mean","attn")):
+
+    def forward(self, seq_feats, mask: Optional[torch.Tensor] = None):
+        # seq_feats: (B,T,D), mask: (B,T)
+        if (mask is not None) and (self.mode in ("mean", "attn")):
             if self.mode == "mean":
-                m = mask.unsqueeze(-1)  # (B,T,1)
+                m = mask.unsqueeze(-1)
                 den = m.sum(dim=1).clamp_min(1e-6)
                 g = (seq_feats * m).sum(dim=1) / den
-            else:  # attn + mask
-                a = self.attn(seq_feats).squeeze(-1)          # (B,T)
-                a = a.masked_fill((mask<=0), float("-inf"))
-                w = torch.softmax(a, dim=1).unsqueeze(-1)     # (B,T,1)
+            else:
+                a = self.attn(seq_feats).squeeze(-1)
+                zero_rows = (mask.sum(dim=1) == 0)
+                if zero_rows.any():
+                    mask = mask.clone()
+                    mask[zero_rows] = 1.0
+                a = a.masked_fill((mask <= 0), -1e4)
+                w = torch.softmax(a, dim=1).unsqueeze(-1)
                 g = (seq_feats * w).sum(dim=1)
         else:
             if self.mode == "mean":
@@ -48,7 +52,7 @@ class TemporalHead(nn.Module):
                 g = seq_feats[:, -1]
         g = self.drop(g)
         return self.fc(g)
-
+    
 class CNNLSTM(nn.Module):
     """
     CNN+LSTM（新增 motion_dim 與 mask 參數，向下相容）

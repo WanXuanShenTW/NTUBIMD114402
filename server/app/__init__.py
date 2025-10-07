@@ -22,10 +22,22 @@ from .routes.sit_event_route import sit_event_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """應用程式生命週期管理"""
+    print("[INIT] Starting lifespan...")
+
+    async def try_init_pool():
+        """以背景任務啟動資料庫連線池，避免阻塞 FastAPI 啟動"""
+        try:
+            print("[DEBUG] Starting create_pool background task")
+            await Database.init_pool()
+            print("[✅] Database pool initialized successfully")
+        except Exception as e:
+            print(f"[❌] Background DB init failed: {e}")
+
+    # 在背景啟動，不用 await
+    loop = asyncio.get_event_loop()
+    loop.create_task(try_init_pool())
+
     try:
-        # 啟動時初始化資料庫池
-        await Database.init_pool()
-        print("[✅] Database pool initialized successfully")
         yield
     except Exception as e:
         print(f"[❌] Startup error: {e}")
@@ -36,16 +48,15 @@ async def lifespan(app: FastAPI):
             if Database._pool:
                 print("[🔄] Closing database pool...")
                 Database._pool.close()
-                # 設置 5 秒超時，避免無限等待
                 await asyncio.wait_for(Database._pool.wait_closed(), timeout=5.0)
                 print("[✅] Database pool closed successfully")
         except asyncio.TimeoutError:
             print("[⚠️] Database pool close timeout - forcing shutdown")
-            # 超時就直接設為 None，讓程式繼續關閉
             Database._pool = None
         except Exception as e:
             print(f"[❌] Database pool close error: {e}")
             Database._pool = None
+
 
 def create_app():
     app = FastAPI(lifespan=lifespan)
@@ -56,7 +67,7 @@ def create_app():
     app.include_router(auth_router)
     app.include_router(contact_router)
     app.include_router(pose_router)
-    app.include_router(ws_test_router) 
+    app.include_router(ws_test_router)
     app.include_router(fall_event_router)
     app.include_router(line_router)
     app.include_router(debug_router)
