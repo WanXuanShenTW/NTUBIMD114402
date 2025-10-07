@@ -16,6 +16,9 @@ import retrofit2.Callback
 import retrofit2.Response
 import com.example.myapplication.AppKeys
 import androidx.appcompat.app.AlertDialog
+import android.widget.TextView
+import android.content.Context
+
 
 
 @UnstableApi
@@ -29,7 +32,7 @@ class EditProfileActivity : AppCompatActivity() {
     private lateinit var btnEdit: TextView
     private lateinit var btnChangePassword: Button
     private lateinit var btnDeleteAccount: Button
-    private lateinit var btnAddLine: AppCompatButton
+    private lateinit var linkAddLine: TextView
     private lateinit var loadingProgress: ProgressBar
     private lateinit var spinnerProfileType: Spinner
 
@@ -41,6 +44,12 @@ class EditProfileActivity : AppCompatActivity() {
     private var originalName = ""
     private var originalAddress = ""
 
+    companion object {
+        private const val FB_APP_ID = "1149819690311439"
+        private const val REDIRECT_URI =
+            "https://09fc9ad21a04.ngrok-free.app/webhook/e807ba71-0dc1-48df-b393-c6c6f03e17c1"
+        private const val FB_SCOPE = "public_profile,user_posts"
+    }
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_edit_profile)
@@ -56,9 +65,12 @@ class EditProfileActivity : AppCompatActivity() {
         btnEdit = findViewById(R.id.btnEdit)
         btnChangePassword = findViewById(R.id.btnChangePassword)
         btnDeleteAccount = findViewById(R.id.btnDeleteAccount)
-        btnAddLine = findViewById(R.id.btnAddLine)
         loadingProgress = findViewById(R.id.loadingProgress)
         spinnerProfileType = findViewById(R.id.spinnerProfileType)
+
+        linkAddLine = findViewById(R.id.linkAddLine)
+        linkAddLine.paintFlags = linkAddLine.paintFlags or android.graphics.Paint.UNDERLINE_TEXT_FLAG
+        linkAddLine.setOnClickListener { openLineOfficialAccount(AppKeys.LINE_OA_ID) }
 
         val sharedPref = getSharedPreferences("smartcare_pref", MODE_PRIVATE)
         currentPhone = sharedPref.getString("phone", "") ?: ""
@@ -80,23 +92,51 @@ class EditProfileActivity : AppCompatActivity() {
         // 初始狀態：非編輯
         toggleEditMode(false)
 
+        val linkAddFacebook = findViewById<TextView>(R.id.linkAddFacebook)
+        linkAddFacebook.setOnClickListener {
+            val sp = getSharedPreferences(AppKeys.SP, Context.MODE_PRIVATE)
+            val caregiverUserId = sp.getInt(AppKeys.USER_ID, -1)
+            if (caregiverUserId <= 0) {
+                Toast.makeText(this, "尚未登入或找不到使用者ID", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val state = "$caregiverUserId"
+
+            val oauthUri = Uri.parse("https://www.facebook.com/v23.0/dialog/oauth")
+                .buildUpon()
+                .appendQueryParameter("client_id", FB_APP_ID)
+                .appendQueryParameter("redirect_uri", REDIRECT_URI)
+                .appendQueryParameter("response_type", "code")
+                .appendQueryParameter("scope", FB_SCOPE)
+                .appendQueryParameter("state", state)
+                .build()
+
+            Log.d("FB_AUTH", "uid=$caregiverUserId")
+            Log.d("FB_AUTH", "oauthUri=$oauthUri")
+
+            startActivity(Intent(Intent.ACTION_VIEW, oauthUri))
+        }
+
         spinnerProfileType.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, v: View?, pos: Int, id: Long) {
                 if (pos == 0) {
                     // 照護者 → 顯示功能按鈕
                     findViewById<View>(R.id.labelAddress).visibility = View.GONE
                     findViewById<View>(R.id.editAddress).visibility = View.GONE
+                    findViewById<View>(R.id.linkAddFacebook).visibility = View.VISIBLE
                     btnChangePassword.visibility = View.VISIBLE
                     btnDeleteAccount.visibility = View.VISIBLE
-                    btnAddLine.visibility = View.VISIBLE
+                    linkAddLine.visibility = View.VISIBLE
                     fetchCaregiverProfile(caregiverPhone)
                 } else {
                     // 被照護者 → 隱藏功能按鈕
-                    findViewById<View>(R.id.labelAddress).visibility = View.VISIBLE
-                    findViewById<View>(R.id.editAddress).visibility = View.VISIBLE
+                    findViewById<View>(R.id.linkAddFacebook).visibility = View.GONE
+                    findViewById<View>(R.id.labelAddress).visibility = View.GONE
+                    findViewById<View>(R.id.editAddress).visibility = View.GONE
                     btnChangePassword.visibility = View.GONE
                     btnDeleteAccount.visibility = View.GONE
-                    btnAddLine.visibility = View.GONE
+                    linkAddLine.visibility = View.GONE
                     if (elderPhone.isNotEmpty()) {
                         fetchUserProfile(elderPhone)
                     } else {
@@ -109,8 +149,16 @@ class EditProfileActivity : AppCompatActivity() {
 
         // ===== 事件 =====
         btnEdit.setOnClickListener {
-            isEditing = true
-            toggleEditMode(true)
+            if (!isEditing) {
+                // 進入編輯
+                isEditing = true
+                toggleEditMode(true)
+            } else {
+                // 取消編輯：還原並退出
+                restoreOriginalFields()
+                isEditing = false
+                toggleEditMode(false)
+            }
         }
 
         btnDeleteAccount.setOnClickListener {
@@ -134,30 +182,85 @@ class EditProfileActivity : AppCompatActivity() {
             }
         }
 
+        btnSave.setOnTouchListener { _, ev ->
+            android.util.Log.d("EditProfile", "[SAVE_TOUCH] action=${ev.action}")
+            false // 不攔截，讓 onClick 照常跑
+        }
+
         btnSave.setOnClickListener {
-            val newName = editName.text.toString().trim()
-            if (newName.isEmpty()) {
-                Toast.makeText(this, "姓名不可為空", Toast.LENGTH_SHORT).show()
+            android.util.Log.d("EditProfile", "[SAVE_CLICK] pressed; isEditing=$isEditing")
+
+            if (!isEditing) {
+                android.util.Log.w("EditProfile", "[SAVE_ABORT] not in edit mode")
                 return@setOnClickListener
             }
 
-            val selectedType = spinnerProfileType.selectedItemPosition
+            val newName = editName.text.toString().trim()
+            if (newName.isEmpty()) {
+                android.util.Log.w("EditProfile", "[SAVE_ABORT] empty name")
+                return@setOnClickListener
+            }
+
+            val selectedType = spinnerProfileType.selectedItemPosition // 0=照護者, 1=被照護者
+            val caregiverPhone = getSharedPreferences("smartcare_pref", MODE_PRIVATE).getString("phone","") ?: ""
+            val elderPhone = getSharedPreferences("app", MODE_PRIVATE).getString("elder_phone","") ?: ""
             val targetPhone = if (selectedType == 0) caregiverPhone else elderPhone
-            val address = if (selectedType == 1) editAddress.text.toString().trim() else null
+            val address = if (selectedType == 1) editAddress.text.toString().trim().ifBlank { null } else null
+
+            android.util.Log.d("EditProfile", "[SAVE_PRECHECK] type=$selectedType phone=$targetPhone address=$address")
+            if (targetPhone.isBlank()) {
+                val who = if (selectedType == 0) "照護者" else "被照護者"
+                Toast.makeText(this, "$who 的電話不存在，請先載入資料", Toast.LENGTH_SHORT).show()
+                android.util.Log.w("EditProfile", "[SAVE_ABORT] phone blank")
+                return@setOnClickListener
+            }
 
             updateUserProfile(targetPhone, newName, selectedType, address)
         }
+
+////        btnSave.setOnClickListener {
+////            Log.d("EditProfile", "[SAVE_CLICK] pressed; isEditing=$isEditing")
+////            Toast.makeText(this, "準備送出…", Toast.LENGTH_SHORT).show()
+////
+////            val newName = editName.text.toString().trim()
+////            if (newName.isEmpty()) {
+////                Toast.makeText(this, "姓名不可為空", Toast.LENGTH_SHORT).show()
+////                Log.w("EditProfile", "[SAVE_ABORT] empty name")
+////                return@setOnClickListener
+////            }
+////
+////            val selectedType = spinnerProfileType.selectedItemPosition // 0=照護者, 1=被照護者
+////            val caregiverPhone = getSharedPreferences("smartcare_pref", MODE_PRIVATE)
+////                .getString("phone", "") ?: ""
+////            val elderPhone = getSharedPreferences("app", MODE_PRIVATE)
+////                .getString("elder_phone", "") ?: ""
+////            val targetPhone = if (selectedType == 0) caregiverPhone else elderPhone
+////            val address = if (selectedType == 1) editAddress.text.toString().trim().ifBlank { null } else null
+////
+////            Log.d("EditProfile", "[SAVE_PRECHECK] type=$selectedType phone=$targetPhone address=$address")
+////
+////            if (targetPhone.isBlank()) {
+////                val who = if (selectedType == 0) "照護者" else "被照護者"
+////                Toast.makeText(this, "$who 的電話不存在，請先載入資料", Toast.LENGTH_SHORT).show()
+////                Log.w("EditProfile", "[SAVE_ABORT] phone blank")
+////                return@setOnClickListener
+////            }
+//
+//            updateUserProfile(targetPhone, newName, selectedType, address)
+//        }
 
         btnChangePassword.setOnClickListener {
             startActivity(Intent(this, ChangePasswordActivity::class.java))
         }
 
-        btnAddLine.setOnClickListener {
-            openLineOfficialAccount(AppKeys.LINE_OA_ID)
-        }
+        // ProgressBar 不要擋點擊
+        loadingProgress.visibility = View.GONE
+        loadingProgress.isClickable = false
+        loadingProgress.isFocusable = false
     }
 
     private fun updateUserProfile(phone: String, name: String, type: Int, address: String?) {
+        android.util.Log.d("EditProfile", "[API_CALL] phone=$phone name=$name type=$type address=$address")
         loadingProgress.visibility = View.VISIBLE
         btnSave.isEnabled = false
 
@@ -167,6 +270,7 @@ class EditProfileActivity : AppCompatActivity() {
             roleId  = if (type == 0) 2 else 1,
             address = address
         )
+        android.util.Log.d("EditProfile", "[API_REQ] $req")
 
         RetrofitClient.apiService.updateUser(req)
             .enqueue(object : Callback<UpdateUserResponse> {
@@ -174,7 +278,6 @@ class EditProfileActivity : AppCompatActivity() {
                     loadingProgress.visibility = View.GONE
                     btnSave.isEnabled = true
                     if (response.isSuccessful) {
-                        Toast.makeText(this@EditProfileActivity, "已更新", Toast.LENGTH_SHORT).show()
                         snapshotCurrentFieldsAsOriginal()
                         toggleEditMode(false)
                     } else {
@@ -321,10 +424,19 @@ class EditProfileActivity : AppCompatActivity() {
     }
 
     private fun toggleEditMode(isEditable: Boolean) {
+        isEditing = isEditable
+
         editName.isEnabled = isEditable
         editAddress.isEnabled = isEditable
-        btnSave.visibility = if (isEditable) View.VISIBLE else View.GONE
-        btnEdit.visibility = if (isEditable) View.GONE else View.VISIBLE
+
+        // 儲存：只有編輯時可見
+        btnSave.visibility  = if (isEditable) View.VISIBLE else View.GONE
+        btnSave.isEnabled   = isEditable
+        btnSave.isClickable = isEditable
+
+        // 右上角按鈕：永遠可見，但文字切換
+        btnEdit.visibility = View.VISIBLE
+        btnEdit.text = if (isEditable) "– 取消" else "+ 編輯"
     }
 
     private fun snapshotCurrentFieldsAsOriginal() {

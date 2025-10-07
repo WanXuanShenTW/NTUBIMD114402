@@ -81,7 +81,7 @@ class MainActivity : AppCompatActivity() {
 
     // ==== 新增：推論與傳送的時間戳與結果快取 ====
     // 推論節奏（毫秒）
-    private val POSE_INFER_MS = 200L
+    private val POSE_INFER_MS = 100L
     private val DETECT_INFER_MS = 1000L
 
     private var lastPoseInferAt = 0L
@@ -131,7 +131,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var ws: WsManager
     private var frameId: Long = 0
     // 把你的 WS 位址換成實際值（支援 ws:// 或 wss://）
-    private val WS_URL = "wss://6e8e59bcc446.ngrok-free.app/ws/pose?user_id=3"
+    private val WS_URL = "wss://c85191513766.ngrok-free.app/ws/pose?user_id=1"
 
     private lateinit var switchSendWs: SwitchCompat
     @Volatile private var sendWsEnabled = false
@@ -146,7 +146,8 @@ class MainActivity : AppCompatActivity() {
     private var lastDetectSendAt = 0L
     private val POSE_SEND_FPS = 5.0
     private val DETECT_SEND_FPS = 2.5
-
+    private val SEND_MODE = "split"
+    private var lastAnySendAt = 0L
 
     // 開關：執行哪種偵測
     @Volatile private var objectDetectEnabled = true
@@ -163,6 +164,16 @@ class MainActivity : AppCompatActivity() {
     private var sttLoopEnabled = false
     private var sttLastEventTs = 0L
     private val sttHandler = Handler(Looper.getMainLooper())
+
+    // === STT / Session 控制 ===
+    private var currentSessionId: Int = 0
+    private var sessionIdleDeadlineMs: Long = 0L
+    private val SESSION_GAP_MS = 300_000L  // 10秒沒說話就換新 session
+
+    private val sessionIdleReset = Runnable {
+        currentSessionId = 0
+        sessionIdleDeadlineMs = 0L
+    }
 
     private lateinit var voiceStatus: TextView
     private lateinit var inferenceStatus: TextView
@@ -349,17 +360,27 @@ class MainActivity : AppCompatActivity() {
             if (isChecked) {
                 lastPoseSendAt = 0L
                 lastDetectSendAt = SystemClock.elapsedRealtime()
-                ws.connect(
-                    onState = { ok, err -> if (!ok) Log.w(TAG, "WS connect failed: $err") },
-                    onMessage = { msg -> handleServerMessage(msg) }
-                )
-                startSenderLoop()
+
+                fun connectOnce() {
+                    ws.connect(
+                        onState = { ok, err ->
+                            if (!ok) {
+                                Log.w(TAG, "WS connect failed: $err")
+                                // 若使用者仍要求「開」→ 延遲重連
+                                if (sendWsEnabled) uiHandler.postDelayed({ connectOnce() }, 1500)
+                            } else {
+                                Log.i(TAG, "WS connected")
+                            }
+                        },
+                        onMessage = { msg -> handleServerMessage(msg) }
+                    )
+                }
+
+                connectOnce()
+                startSenderLoop()  // 讓 ping 在背景也持續送
             } else {
                 stopSenderLoop()
                 ws.close()
-            }
-            Thread.setDefaultUncaughtExceptionHandler { _, e ->
-                Log.e(TAG, "FATAL (default handler)", e)
             }
         }
     }
@@ -540,7 +561,31 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // MainActivity 內
+    /** 如果超過 SESSION_GAP_MS 沒說話，就產生新 session，否則沿用舊的 */
+    private fun ensureSessionId(): Int {
+        val now = System.currentTimeMillis()
+        if (currentSessionId == 0 || now >= sessionIdleDeadlineMs) {
+            currentSessionId = SessionId.next(this@MainActivity)
+        }
+        bumpSessionIdle(now)  // 每次使用都延長有效時間
+        return currentSessionId
+    }
+
+    /** 只要偵測到有人在說話（partial / final / begin），就延長 session 的壽命 */
+    private fun bumpSessionIdle(now: Long = System.currentTimeMillis()) {
+        sessionIdleDeadlineMs = now + SESSION_GAP_MS
+        sttHandler.removeCallbacks(sessionIdleReset)
+        sttHandler.postDelayed(sessionIdleReset, SESSION_GAP_MS)
+    }
+
+    private fun cxcywhToXyxy(cx: Float, cy: Float, w: Float, h: Float): FloatArray {
+        val x1 = cx - w / 2f
+        val y1 = cy - h / 2f
+        val x2 = cx + w / 2f
+        val y2 = cy + h / 2f
+        return floatArrayOf(x1, y1, x2, y2)
+    }
+
     fun handleTtsResponse(bodyString: String) {
         val trimmed = bodyString.trim()
 
@@ -764,6 +809,7 @@ class MainActivity : AppCompatActivity() {
                 sttLastEventTs = System.currentTimeMillis()
                 noMatchStreak = 0
                 touchLastElder()
+                bumpSessionIdle()
             }
 
             override fun onRmsChanged(rmsdB: Float) {
@@ -798,6 +844,8 @@ class MainActivity : AppCompatActivity() {
                     lastPartialWrittenAt = now
                 }
                 noMatchStreak = 0
+
+                bumpSessionIdle()
             }
 
             override fun onResults(results: Bundle?) {
@@ -812,7 +860,7 @@ class MainActivity : AppCompatActivity() {
                     sttLastPartial = ""
                     broadcastStt(text, false)
                     appendTranscript(text, "final")
-                    val sessionId = SessionId.next(this@MainActivity)
+                    val sessionId = ensureSessionId()
                     val elderId = getSharedPreferences("app", Context.MODE_PRIVATE).getInt("elder_id", 1)
 
                     Log.i(TAG_STT_FINAL, "sid=$sessionId elder=$elderId text=$text")
@@ -826,6 +874,8 @@ class MainActivity : AppCompatActivity() {
                     sendBroadcast(userMsg)
 
                     N8nSender.sendElderVoiceAndSpeak(this@MainActivity, text, sessionId)
+
+                    bumpSessionIdle()
                 }
 
                 isSttRunning = false
@@ -1497,6 +1547,20 @@ class MainActivity : AppCompatActivity() {
         return if (off == bytesToRead) out else out.copyOf(off)
     }
 
+    private fun sendPing(now: Long = SystemClock.elapsedRealtime()) {
+        try {
+            val ping = JSONObject().apply {
+                put("type", "ping")
+                put("ts_ms", System.currentTimeMillis())
+            }.toString()
+            ws.send(ping)
+            lastAnySendAt = now
+            Log.d(TAG, "WS ping sent")
+        } catch (t: Throwable) {
+            Log.e(TAG, "WS ping failed", t)
+        }
+    }
+
     // ===== 音訊工具 =====
     private fun calcRmsDb(pcm: ByteArray): Float {
         var sumSq = 0.0
@@ -2090,27 +2154,28 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
 
-        // === 暫停影像擷取（保險）===
+        // 影像推論暫停即可，不影響 WS
         allowProcess = false
         lastProcessTimeMs = 0L
 
-        // === 暫停語音相關 ===
+        // 語音暫停（這段與連線無關）
         sttEmitAllowed = false
         sttGateDeadline = 0L
-
         runCatching { stt?.stopListening() }
         runCatching { stt?.cancel() }
         if (sttLoopEnabled) stopSttLoop()
-
         stopBackgroundVoiceMonitor()
 
-        // === 關閉 WebSocket，並停自動重連 ===
-        // 1) 真正關連線（WsManager.close() 會設 manualClose=true / wantReconnect=false）
-        try { ws.close(1000, "paused") } catch (_: Exception) {}
-        // 2) 更新內部旗標與 UI（避免回到前景又自動連）
-        sendWsEnabled = false
-        // 切 UI 狀態到「關」；這行會觸發你的 listener 走到 ws.close()，但我們已先 close 所以 OK
-        if (switchSendWs.isChecked) switchSendWs.isChecked = false
+        // ❗️關鍵：如果目前「正在偵測」（sendWsEnabled=true），不要動 WS；保留 sender loop 以便送 ping。
+        // 只有在沒有偵測時才把 WS 關掉。
+        if (!sendWsEnabled) {
+            stopSenderLoop()
+            try { ws.close(1000, "paused") } catch (_: Exception) {}
+        }
+        // 不要動 switchSendWs 的勾選狀態，也不要把 sendWsEnabled 改成 false
+        currentSessionId = 0
+        sessionIdleDeadlineMs = 0L
+        sttHandler.removeCallbacks(sessionIdleReset)
     }
 
     override fun onDestroy() {
@@ -2311,6 +2376,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun processFrame(bitmap: Bitmap) {
+        lastFrameW = bitmap.width
+        lastFrameH = bitmap.height
         var objMs = -1L
         var poseMs = -1L
         val now = SystemClock.elapsedRealtime()
@@ -2368,59 +2435,98 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 try {
                     if (!sendWsEnabled) return
+
                     val now = SystemClock.elapsedRealtime()
-                    val poseInterval = 200L     // 5 fps
-                    val detectInterval = 1000L  // 1 fps
+                    val poseInterval = 100L     // Pose 約 10Hz（實際依條件 5~10Hz）
+                    val detectInterval = 1000L  // Detect 1Hz
 
                     val wantPose = poseDetectEnabled
                     val wantDetect = objectDetectEnabled
 
-                    // 每 200ms 送一包 Pose；每第 5 包（約每 1s）再夾 Detect
+                    // 100ms 一拍：優先送 Pose，每第 10 包（約每 1s）夾一次 Detect
                     if (wantPose && (now - lastPoseSendAt >= poseInterval)) {
                         poseBurstCounter++
 
                         val includePose = true
                         val includeDetect = wantDetect &&
-                                (poseBurstCounter % 5 == 0) &&         // 第 5、10、15... 包
+                                (poseBurstCounter % 10 == 0) &&
                                 (now - lastDetectSendAt >= detectInterval)
 
                         val w = if (lastFrameW > 0) lastFrameW else 640
                         val h = if (lastFrameH > 0) lastFrameH else 480
 
                         if (includePose || includeDetect) {
-                            val frameJson = buildFrameJson(
-                                fid = frameId,
-                                width = w,
-                                height = h,
-                                obj = if (includeDetect) lastObjResult else null,
-                                pose = if (includePose)   lastPoseResult else null,
-                                includeDetect = includeDetect,
-                                includePose   = includePose
-                            ).toString()
-                            try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
-                            lastPoseSendAt = now
-                            if (includeDetect) lastDetectSendAt = now
+                            val obj = if (includeDetect) lastObjResult else null
+                            val pose = if (includePose)   lastPoseResult else null
+
+                            if (hasPayload(obj, pose, includeDetect, includePose)) {
+                                if (SEND_MODE == "frame") {
+                                    val frameJson = buildFrameJson(
+                                        fid = frameId, width = w, height = h,
+                                        obj = obj, pose = pose,
+                                        includeDetect = includeDetect, includePose = includePose
+                                    ).toString()
+                                    try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
+                                    lastAnySendAt = now
+                                } else {
+                                    // split：分開送，對齊後端測試
+                                    if (includePose && (pose?.poses?.isNotEmpty() == true)) {
+                                        val poseJson = buildPoseJson(
+                                            frameId,
+                                            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
+                                            pose
+                                        ).toString()
+                                        try { ws.send(poseJson) } catch (t: Throwable) { Log.e(TAG, "WS send pose error", t) }
+                                        lastAnySendAt = now
+                                    }
+                                    if (includeDetect && (obj?.outputBox?.isNotEmpty() == true)) {
+                                        val objJson = buildObjectJson(
+                                            frameId,
+                                            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
+                                            obj
+                                        ).toString()
+                                        try { ws.send(objJson) } catch (t: Throwable) { Log.e(TAG, "WS send object error", t) }
+                                        lastAnySendAt = now
+                                    }
+                                }
+
+                                lastPoseSendAt = now
+                                if (includeDetect) lastDetectSendAt = now
+                            }
                         }
-                    } else if (!wantPose && wantDetect && (now - lastDetectSendAt >= detectInterval)) {
-                        // 只開 Detect 的備援路徑：每 1s 單獨送 Detect
+                    }
+                    // 備援：只開 Detect 時，每 1s 單獨送一次
+                    else if (!wantPose && wantDetect && (now - lastDetectSendAt >= detectInterval)) {
                         val w = if (lastFrameW > 0) lastFrameW else 640
                         val h = if (lastFrameH > 0) lastFrameH else 480
-                        val frameJson = buildFrameJson(
-                            fid = frameId, width = w, height = h,
-                            obj = lastObjResult, pose = null,
-                            includeDetect = true, includePose = false
-                        ).toString()
-                        try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
-                        lastDetectSendAt = now
+
+                        val obj = lastObjResult
+                        if (hasPayload(obj, null, includeDetect = true, includePose = false)) {
+                            val frameJson = buildFrameJson(
+                                fid = frameId, width = w, height = h,
+                                obj = obj, pose = null,
+                                includeDetect = true, includePose = false
+                            ).toString()
+                            try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
+                            lastDetectSendAt = now
+                            lastAnySendAt = now          // ★ 別忘了更新「最近一次傳輸」
+                        }
                     }
+
+                    // ★ 保活：5 秒內沒有任何傳輸就送一個 ping
+                    if (SystemClock.elapsedRealtime() - lastAnySendAt >= 5000L) {
+                        sendPing()
+                    }
+
                 } catch (t: Throwable) {
                     Log.e(TAG, "sender loop crashed", t)
                 } finally {
-                    senderHandler?.postDelayed(this, 200L) // 200ms 一拍
+                    // 100ms 一拍（排程下一次）
+                    senderHandler?.postDelayed(this, 100L)
                 }
             }
         }
-        senderHandler?.postDelayed(senderRunnable!!, 200L)
+        senderHandler?.postDelayed(senderRunnable!!, 100L)
     }
 
     private fun stopSenderLoop() {
@@ -2432,39 +2538,79 @@ class MainActivity : AppCompatActivity() {
         senderRunnable = null
     }
 
+    // REPLACE THIS WHOLE FUNCTION
     private fun handleServerMessage(msg: String) {
         try {
             val j = JSONObject(msg)
             if (j.optString("type") != "inference") return
 
-            val multi = j.optJSONObject("multi")
+            val stage = j.optString("stage", "")   // "binary" 或 "multi"（可能空字串）
             val bin   = j.optJSONObject("binary")
+            val multi = j.optJSONObject("multi")
 
-            val multiPred = multi?.optString("pred").orEmpty()
-            val multiIdx  = multi?.optInt("pred_idx", -1) ?: -1
-            val multiProbs = multi?.optJSONArray("probs")
-            val multiPct = if (multiIdx >= 0 && multiProbs != null && multiIdx < multiProbs.length())
-                (multiProbs.optDouble(multiIdx, 0.0) * 100.0).toInt() else -1
+            // ---- 解析 binary ----
+            var fallText: String? = null
+            var isFallFinal = false
+            if (bin != null) {
+                val binPred   = bin.optString("pred", "")                 // "fall" / "non_fall"
+                val binProbs  = bin.optJSONArray("probs")
+                val probFall  = binProbs?.optDouble(1, Double.NaN) ?: Double.NaN // index 1 = fall
+                val binThr    = bin.optDouble("thr", 0.65)
 
-            val binPred = bin?.optString("pred").orEmpty()             // "fall" 或 "non_fall"
-            val binProbs = bin?.optJSONArray("probs")
-            val binFallProb = binProbs?.optDouble(1, Double.NaN) ?: Double.NaN // probs[1] = fall 機率
-            val binThr = bin?.optDouble("thr", 0.65) ?: 0.65
+                val passThr = !probFall.isNaN() && probFall >= binThr
+                isFallFinal = (binPred == "fall") && passThr
 
-            val fallAlert = pushFall((binPred == "fall") && !binFallProb.isNaN() && binFallProb >= binThr)
-
-            runOnUiThread {
-                inferenceStatus.text = if (fallAlert) {
-                    "⚠️ 跌倒 ${(binFallProb * 100).toInt()}%"
+                if (!probFall.isNaN()) {
+                    fallText = "跌倒 ${(probFall * 100).toInt()}%"
                 } else {
-                    if (multiPct >= 0) "姿態：$multiPred ${multiPct}%"
+                    fallText = if (binPred.isNotBlank()) "跌倒判定：$binPred" else null
+                }
+            }
+
+            // ---- 解析 multi ----
+            var postureText: String? = null
+            if (multi != null) {
+                val multiPred  = multi.optString("pred", "")
+                val probsArr   = multi.optJSONArray("probs")
+                val predIdx    = multi.optInt("pred_idx", -1)
+                val pct = if (predIdx >= 0 && probsArr != null && predIdx < probsArr.length()) {
+                    (probsArr.optDouble(predIdx, 0.0) * 100.0).toInt()
+                } else -1
+                postureText = if (multiPred.isNotBlank()) {
+                    if (pct >= 0) "姿態：$multiPred ${pct}%"
                     else "姿態：$multiPred"
+                } else null
+            }
+
+            // ---- UI 顯示邏輯 ----
+            val showFall = pushFall(isFallFinal) // 連續3次 true 才報警
+            runOnUiThread {
+                inferenceStatus.text = when {
+                    showFall && fallText != null -> "⚠️ $fallText"
+                    stage == "binary" && fallText != null -> fallText                     // 只回二元
+                    stage == "multi"  && postureText != null -> postureText               // multi 主體
+                    postureText != null -> postureText
+                    fallText != null -> fallText
+                    else -> "推論：—"
                 }
             }
         } catch (_: Exception) {
-            // 非 JSON 就忽略或簡短顯示
-            runOnUiThread { /* inferenceStatus.text = "推論：" */ }
+            // 靜靜忽略非 JSON 或解析失敗，避免斷線
+            runOnUiThread {
+                // inferenceStatus.text = "推論：—"
+            }
         }
+    }
+
+    private fun hasPayload(
+        obj: ObjectResult?,
+        pose: PoseResult?,
+        includeDetect: Boolean,
+        includePose: Boolean
+    ): Boolean {
+        val hasDet  = includeDetect && (obj?.outputBox?.isNotEmpty() == true)
+        val hasPose = includePose   && (pose?.poses?.isNotEmpty() == true)
+        return hasDet || hasPose
     }
 
     private val fallQueue: ArrayDeque<Boolean> = ArrayDeque(3)
@@ -2474,7 +2620,7 @@ class MainActivity : AppCompatActivity() {
         return fallQueue.all { it }
     }
 
-    // 取代或並存於 buildObjectJson / buildPoseJson 旁邊
+    // REPLACE THIS WHOLE FUNCTION
     private fun buildFrameJson(
         fid: Long,
         width: Int,
@@ -2484,121 +2630,119 @@ class MainActivity : AppCompatActivity() {
         includeDetect: Boolean = true,
         includePose: Boolean = true
     ): JSONObject {
-        val root = JSONObject()
-        root.put("type", "frame")
-        root.put("frame_id", fid)
-        root.put("timestamp_ms", System.currentTimeMillis())
-        root.put("image_size", JSONObject().apply {
-            put("width", width)
-            put("height", height)
-        })
-
-        // detect
-        if (includeDetect) {
-            val detectArr = JSONArray()
-            obj?.outputBox?.forEach { b ->
-                val clsId = b[5].toInt()
-                val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
-                detectArr.put(JSONObject().apply {
-                    put("cls_id", clsId)
-                    put("cls_name", name)
-                    put("score", b[4].toDouble())
-                    put("bbox", JSONObject().apply {
-                        put("cx", b[0].toDouble()); put("cy", b[1].toDouble())
-                        put("w",  b[2].toDouble()); put("h",  b[3].toDouble())
-                    })
-                })
-            }
-            root.put("detect", detectArr)
-        }
-
-        // pose
-        if (includePose) {
-            val poseArr = JSONArray()
-            pose?.poses?.forEach { p ->
-                val person = JSONObject().apply {
-                    put("score", p.score.toDouble())
-                    put("bbox", JSONObject().apply {
-                        put("cx", p.box[0].toDouble()); put("cy", p.box[1].toDouble())
-                        put("w",  p.box[2].toDouble()); put("h",  p.box[3].toDouble())
-                    })
-                    val kps = JSONArray()
-                    for (kp in p.keypoints) {
-                        kps.put(JSONObject().apply {
-                            put("x", kp[0].toDouble())
-                            put("y", kp[1].toDouble())
-                            put("confidence", kp[2].toDouble())
-                        })
-                    }
-                    put("keypoints", kps)
-                }
-                poseArr.put(person)
-            }
-            root.put("pose", poseArr)
-        }
-        return root
-    }
-
-    // ★ 新增：建立物件偵測 JSON（與單張輸出對齊：使用 classes 名稱）
-    private fun buildObjectJson(fid: Long, bmp: Bitmap, res: ObjectResult?): JSONObject {
-        val root = JSONObject()
-        root.put("type", "object")
-        root.put("frame_id", fid)
-        root.put("timestamp_ms", System.currentTimeMillis())
-        root.put("image_size", JSONObject().apply {
-            put("width", bmp.width); put("height", bmp.height)
-        })
-
-        val arr = JSONArray()
-        res?.outputBox?.forEach { b ->
-            val clsId = b[5].toInt()
-            val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
-            arr.put(JSONObject().apply {
-                put("cls_id", clsId)
-                put("cls_name", name)
-                put("score", b[4].toDouble())
-                put("bbox", JSONObject().apply {
-                    put("cx", b[0].toDouble()); put("cy", b[1].toDouble())
-                    put("w",  b[2].toDouble()); put("h",  b[3].toDouble())
-                })
-            })
-        }
-        root.put("detect", arr)
-        return root
-    }
-
-    // ★ 新增：建立骨架偵測 JSON
-    private fun buildPoseJson(fid: Long, bmp: Bitmap, res: PoseResult?): JSONObject {
-        val root = JSONObject()
-        root.put("type", "pose")
-        root.put("frame_id", fid)
-        root.put("timestamp_ms", System.currentTimeMillis())
-        root.put("image_size", JSONObject().apply {
-            put("width", bmp.width); put("height", bmp.height)
-        })
-
         val persons = JSONArray()
-        res?.poses?.forEach { p ->
-            val person = JSONObject().apply {
-                put("score", p.score.toDouble())
-                put("bbox", JSONObject().apply {
-                    put("cx", p.box[0].toDouble()); put("cy", p.box[1].toDouble())
-                    put("w",  p.box[2].toDouble()); put("h",  p.box[3].toDouble())
-                })
-
+        if (includePose) {
+            pose?.poses?.forEach { p ->
+                val xyxy = cxcywhToXyxy(p.box[0], p.box[1], p.box[2], p.box[3])
                 val kps = JSONArray()
                 for (kp in p.keypoints) {
                     kps.put(JSONObject().apply {
                         put("x", kp[0].toDouble())
                         put("y", kp[1].toDouble())
-                        put("confidence", kp[2].toDouble())  // ← 改這裡
+                        put("conf", kp[2].toDouble())
                     })
                 }
-                put("keypoints", kps)
+                persons.put(JSONObject().apply {
+                    put("score", p.score.toDouble())
+                    put("bbox", JSONArray().apply {
+                        put(xyxy[0].toDouble()); put(xyxy[1].toDouble())
+                        put(xyxy[2].toDouble()); put(xyxy[3].toDouble())
+                    })
+                    put("keypoints", kps)
+                })
             }
-            persons.put(person)
         }
-        root.put("pose", persons)
-        return root
+
+        val dets = JSONArray()
+        if (includeDetect) {
+            obj?.outputBox?.forEach { b ->
+                val clsId = b[5].toInt()
+                val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
+                val xyxy = cxcywhToXyxy(b[0], b[1], b[2], b[3])
+                val x1 = xyxy[0].toDouble(); val y1 = xyxy[1].toDouble()
+                val x2 = xyxy[2].toDouble(); val y2 = xyxy[3].toDouble()
+                dets.put(JSONObject().apply {
+                    put("class_name", name)
+                    put("confidence", b[4].toDouble())
+                    put("bbox", JSONArray().apply { put(x1); put(y1); put(x2); put(y2) })
+                    put("x1", x1); put("y1", y1); put("x2", x2); put("y2", y2)
+                })
+            }
+        }
+
+        return JSONObject().apply {
+            put("type", "frame")
+            put("frame_id", fid)
+            put("timestamp_ms", System.currentTimeMillis())
+            put("image_size", JSONObject().apply {
+                put("width", width); put("height", height)
+            })
+            put("persons", persons)
+            put("detections", dets)
+        }
+    }
+
+    private fun buildObjectJson(fid: Long, bmp: Bitmap, res: ObjectResult?): JSONObject {
+        val dets = JSONArray()
+        res?.outputBox?.forEach { b ->
+            // b = [cx, cy, w, h, score, clsId]
+            val clsId = b[5].toInt()
+            val name = if (clsId in 0 until classes.size) classes[clsId] else clsId.toString()
+            val xyxy = cxcywhToXyxy(b[0], b[1], b[2], b[3])
+            val x1 = xyxy[0].toDouble(); val y1 = xyxy[1].toDouble()
+            val x2 = xyxy[2].toDouble(); val y2 = xyxy[3].toDouble()
+
+            dets.put(JSONObject().apply {
+                put("class_name", name)
+                put("confidence", b[4].toDouble())
+                put("bbox", JSONArray().apply { put(x1); put(y1); put(x2); put(y2) })
+                // 冗餘欄位（後端測試腳本也會帶）
+                put("x1", x1); put("y1", y1); put("x2", x2); put("y2", y2)
+            })
+        }
+
+        return JSONObject().apply {
+            put("type", "object")
+            put("frame_id", fid)
+            put("timestamp_ms", System.currentTimeMillis())
+            put("image_size", JSONObject().apply {
+                put("width", bmp.width); put("height", bmp.height)
+            })
+            put("detections", dets)
+        }
+    }
+
+    // REPLACE THIS WHOLE FUNCTION
+    private fun buildPoseJson(fid: Long, bmp: Bitmap, res: PoseResult?): JSONObject {
+        val persons = JSONArray()
+        res?.poses?.forEach { p ->
+            val xyxy = cxcywhToXyxy(p.box[0], p.box[1], p.box[2], p.box[3])
+            val kps = JSONArray()
+            for (kp in p.keypoints) {
+                kps.put(JSONObject().apply {
+                    put("x", kp[0].toDouble())
+                    put("y", kp[1].toDouble())
+                    put("conf", kp[2].toDouble()) // 後端測試腳本用 conf（不是 confidence）
+                })
+            }
+            persons.put(JSONObject().apply {
+                put("score", p.score.toDouble())
+                put("bbox", JSONArray().apply {
+                    put(xyxy[0].toDouble()); put(xyxy[1].toDouble())
+                    put(xyxy[2].toDouble()); put(xyxy[3].toDouble())
+                })
+                put("keypoints", kps)
+            })
+        }
+
+        return JSONObject().apply {
+            put("type", "pose")
+            put("frame_id", fid)
+            put("timestamp_ms", System.currentTimeMillis())
+            put("image_size", JSONObject().apply {
+                put("width", bmp.width); put("height", bmp.height)
+            })
+            put("persons", persons)
+        }
     }
 }
