@@ -12,28 +12,36 @@ from ..service.fall_event_service import add_fall_event
 from ..utils.stream_infer_manager import stream_infer_manager
 
 pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
-
+LOCATION = "客廳"
+POSE_BEFORE_FALL = "站立"
 # -------------------------------
 # Handler callback functions
 # -------------------------------
 
 async def on_fall_start(user_id: str, start_time: str, result: dict, clip: dict):
+    print("[FALL_START]", user_id, start_time)
     elder_id = int(user_id)
     body = {
         "elder_id": elder_id,
         "start": clip.get("start"),
         "end": clip.get("end"),
     }
-
-    url = "https://b5badda9e413.ngrok-free.app/webhook/elder"
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=body, timeout=5) as response:
-            print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
-            try:
-                response_data = await response.json()
-                print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
-            except Exception as e:
-                print("[WEBHOOK RESPONSE][ERROR]", str(e))
+    await add_fall_event(
+        user_id=elder_id,
+        detected_time=start_time,
+        location=LOCATION,
+        pose_before_fall=POSE_BEFORE_FALL
+    )
+    print(f"[FALL EVENT] elder_id={user_id} recorded to DB.")
+    # url = "https://5af5869ce9b3.ngrok-free.app//webhook/elder"
+    # async with aiohttp.ClientSession() as session:
+    #     async with session.post(url, json=body, timeout=5) as response:
+    #         print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
+    #         try:
+    #             response_data = await response.json()
+    #             print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
+    #         except Exception as e:
+    #             print("[WEBHOOK RESPONSE][ERROR]", str(e))
 
 async def on_fall_recover(
     user_id: str,
@@ -46,6 +54,14 @@ async def on_fall_recover(
     **kwargs,
 ):
     print("[FALL_RECOVER]", user_id, start_time, end_time, peak_score, "reason=", reason)
+    # add_fall_event(
+    #     user_id=int(user_id),
+    #     detected_time=start_time,
+    #     end=end_time,
+    #     location=LOCATION,
+    #     pose_before_fall=POSE_BEFORE_FALL
+    # )
+    # print(f"[FALL EVENT] elder_id={user_id} recorded to DB.")
     return
 
 async def on_state_event_start(user_id: str, event_name: str, start_time: str, peak_score: float,

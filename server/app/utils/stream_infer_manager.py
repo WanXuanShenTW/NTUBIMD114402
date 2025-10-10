@@ -1,36 +1,32 @@
 # app/utils/stream_infer_manager.py
 # -*- coding: utf-8 -*-
 """
-Stream Inference Manager（WS → 前處理 → 二階段 CNN+LSTM → 事件/回傳）
-- 與你提供的 loader 完整對齊（RelationMap / Motion(9) / Mask(T,) / Kalman）
-- 二階段：
-  1) Binary (WINDOW=10, STRIDE=5)：fall vs non_fall ；採用 binary loader 的參數與門檻
-  2) Multi  (WINDOW=20, STRIDE=5)：sit/lie/walk；僅當 binary 非跌倒時才執行
-- 事件 hooks：on_fall_start / on_fall_recover / on_state_event_start / on_state_event_recover
-- 支援 force_recover(user_id)：斷線或錯誤時清除 user buffer 與狀態
+Stream Inference Manager — WS → 聚合(frame_id) → 前處理 → 二階段 CNN+LSTM → 事件/回傳
+重點：
+- 先把 WS 拆包的 pose/object 以 frame_id 聚合成一個完整 frame（含 bbox、kps、detections、image_size）
+- 與 loader 對齊的 RelationMap / Motion / Mask；自動對齊 in_channels（骨架線 + 物件通道數）
+- 二階段：Binary(10x5) → Multi(10x5)
+- 帶遲滯 + 連續命中 的跌倒開始/恢復狀態機
+- ✅ 針對同一 user 的推論採用 asyncio.Lock 串行化，避免並行造成重複 start 或 recover hits 被洗掉
 """
 
 import os
 import asyncio
-from collections import defaultdict, deque
 from typing import Dict, Any, List, Tuple, Optional
+from collections import defaultdict, deque
 from datetime import datetime
-from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-# === 重要：引用你提供的兩個 loader（請確認路徑在 app/utils/ 下）===
-# 若你的檔案實際放置於其他資料夾，請相應修改 import
+# 依照專案結構（utils 目錄）引入兩個 loader
 from ..utils import binary_cnn_lstm_loader as bl
 from ..utils import multi_cnn_lstm_loader as ml
 
 from ..utils.ws_connection_manager import ws_manager
-from .kalman_filter import KalmanFilter
 
 
-# 可選：專案內若有 now_str 輔助
-def _now_str():
+def _now_str() -> str:
     try:
         from ..utils.response_util import now_str
         return now_str()
@@ -38,275 +34,267 @@ def _now_str():
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
-# ========== 可調整設定（亦可用環境變數覆寫） ==========
+# ====== 模型路徑與視窗設定（可用環境變數覆寫） ======
 BIN_MODEL_PATH     = os.getenv("SC_BIN_MODEL_PATH",     "models/binary/best.pt")
 BIN_CLASSES_PATH   = os.getenv("SC_BIN_CLASSES_PATH",   "models/binary/classes.json")
-
 MULTI_MODEL_PATH   = os.getenv("SC_MULTI_MODEL_PATH",   "models/multi/best.pt")
 MULTI_CLASSES_PATH = os.getenv("SC_MULTI_CLASSES_PATH", "models/multi/classes.json")
 
-# 允許覆寫 multi 的「視窗長度/步幅」與 binary 分開管理
-BIN_WINDOW         = getattr(bl, "WINDOW", 10)
-BIN_STRIDE         = getattr(bl, "STRIDE", 5)
+BIN_WINDOW         = int(getattr(bl, "WINDOW", 10))
+BIN_STRIDE         = int(getattr(bl, "STRIDE", 5))
+MULTI_WINDOW       = int(getattr(ml, "WINDOW", 10))   # 二階段都用 10
+MULTI_STRIDE       = int(getattr(ml, "STRIDE", 5))
 
-MULTI_WINDOW       = getattr(ml, "WINDOW", 10)
-MULTI_STRIDE       = getattr(ml, "STRIDE", 5)
-
-# 回傳/事件的 fall 決策門檻（優先採 binary loader 內設定）
-if hasattr(bl, "DECISION_THR"):
-    FALL_DECISION_THR = float(getattr(bl, "DECISION_THR"))
-else:
-    FALL_DECISION_THR = 0.65  # 後備值
+# ====== 事件觸發/恢復參數（可用環境變數覆寫） ======
+FALL_START_THR     = float(os.getenv("SC_FALL_START_THR", getattr(bl, "DECISION_THR", 0.60)))
+FALL_RECOVER_THR   = float(os.getenv("SC_FALL_RECOVER_THR", 0.45))
+FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "2"))
+FALL_RECOVER_HITS  = int(os.getenv("SC_FALL_RECOVER_HITS", "2"))
 
 
-# ========== 工具函式 ==========
 def _torch_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _calc_in_channels(include_bone: bool, num_obj: int, num_edges: int) -> int:
-    """
-    C = 1(bbox_mask) + 1(dist) + 17(kps) + Edges(可0) + num_obj + 2(coord)
-    """
-    e = num_edges if include_bone else 0
+    """C = 1(bbox_mask) + 1(dist) + 17(kps) + Edges + num_obj + 2(coord)"""
+    e = (num_edges if include_bone else 0)
     return 1 + 1 + 17 + e + num_obj + 2
 
-@dataclass
-class RelationMapConfig:
-    H: int = 64
-    W: int = 64
-    sigma_kp: float = 2.0
-    kp_conf_th: float = 0.4
-    include_bone_lines: bool = True
-    object_classes: list = None
-    edges: list = None  # list of (i,j) joint index for bone lines
-
-    def __post_init__(self):
-        if self.object_classes is None:
-            self.object_classes = []
-        if self.edges is None:
-            self.edges = []
-
-
-def _gaussian_heatmap(h, w, cx, cy, sigma=2.0):
-    """產生中心在 (cx,cy) 的高斯熱圖（座標已是像素值）。"""
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-    g = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2))
-    return g.astype(np.float32)
-
-
-def rasterize_frame(bbox, kps, dets, img_w, img_h, cfg: RelationMapConfig):
-    """
-    產出單幀 RelationMap：C = 1(bbox) + 1(dist佔位) + 17(kps) + |edges| + len(object_classes) + 2(coord)
-    - bbox: (x1,y1,x2,y2) 或 (None,..)
-    - kps: list[dict{x,y,conf/score}]（取前17點）
-    - dets: 物件清單（這裡通常是 []，保留通道對齊）
-    """
-    H, W = int(cfg.H), int(cfg.W)
-    channels = []
-
-    # 1) bbox mask
-    bbox_mask = np.zeros((H, W), dtype=np.float32)
-    if bbox and all(v is not None for v in bbox):
-        x1, y1, x2, y2 = bbox
-        # 轉到縮放座標
-        sx1 = int(max(0, min(W - 1, round((x1 / max(img_w, 1.0)) * W))))
-        sy1 = int(max(0, min(H - 1, round((y1 / max(img_h, 1.0)) * H))))
-        sx2 = int(max(0, min(W - 1, round((x2 / max(img_w, 1.0)) * W))))
-        sy2 = int(max(0, min(H - 1, round((y2 / max(img_h, 1.0)) * H))))
-        if sx2 > sx1 and sy2 > sy1:
-            bbox_mask[sy1:sy2, sx1:sx2] = 1.0
-    channels.append(bbox_mask)
-
-    # 2) dist 佔位通道（如果你原本有距離場，這裡可再升級；先給 0）
-    channels.append(np.zeros((H, W), dtype=np.float32))
-
-    # 3) 17 個關鍵點熱圖
-    kp_maps = []
-    for i in range(17):
-        if i < len(kps):
-            x = float(kps[i].get("x", 0.0))
-            y = float(kps[i].get("y", 0.0))
-            c = float(kps[i].get("conf", kps[i].get("score", 1.0)))
-        else:
-            x, y, c = 0.0, 0.0, 0.0
-        if c >= cfg.kp_conf_th:
-            sx = (x / max(img_w, 1.0)) * W
-            sy = (y / max(img_h, 1.0)) * H
-            hm = _gaussian_heatmap(H, W, sx, sy, sigma=cfg.sigma_kp)
-        else:
-            hm = np.zeros((H, W), dtype=np.float32)
-        kp_maps.append(hm)
-    channels.extend(kp_maps)
-
-    # 4) 骨架線（若有 edges 且啟用）
-    if cfg.include_bone_lines and cfg.edges:
-        for (i, j) in cfg.edges:
-            if i < len(kps) and j < len(kps):
-                xi, yi, ci = kps[i].get("x", 0.0), kps[i].get("y", 0.0), float(kps[i].get("conf", kps[i].get("score", 1.0)))
-                xj, yj, cj = kps[j].get("x", 0.0), kps[j].get("y", 0.0), float(kps[j].get("conf", kps[j].get("score", 1.0)))
-                if ci >= cfg.kp_conf_th and cj >= cfg.kp_conf_th:
-                    # 以簡易畫線方式：在兩端蓋高斯，足夠提供空間線索
-                    sx_i, sy_i = (xi / max(img_w, 1.0)) * W, (yi / max(img_h, 1.0)) * H
-                    sx_j, sy_j = (xj / max(img_w, 1.0)) * W, (yj / max(img_h, 1.0)) * H
-                    ch = _gaussian_heatmap(H, W, sx_i, sy_i, sigma=cfg.sigma_kp) \
-                       + _gaussian_heatmap(H, W, sx_j, sy_j, sigma=cfg.sigma_kp)
-                else:
-                    ch = np.zeros((H, W), dtype=np.float32)
-            else:
-                ch = np.zeros((H, W), dtype=np.float32)
-            channels.append(ch)
-
-    # 5) 物件通道（這裡 dets 大多是空；保留長度對齊）
-    for _ in (cfg.object_classes or []):
-        channels.append(np.zeros((H, W), dtype=np.float32))
-
-    # 6) 2 個座標通道
-    yy, xx = np.meshgrid(np.linspace(0, 1, H, dtype=np.float32),
-                         np.linspace(0, 1, W, dtype=np.float32),
-                         indexing='ij')
-    channels.append(xx)  # X-grid
-    channels.append(yy)  # Y-grid
-
-    return np.stack(channels, axis=0).astype(np.float32)  # (C,H,W)
-
-
-def compute_motion_feats_with_mask_from_parsed_local(parsed_window, motion_dim=9, kp_conf_th=0.4):
-    """
-    輸出：
-      motion_feats: (T, motion_dim) 這裡用簡化版運動統計特徵（平均/方差/最大速度…），對齊通道數即可
-      valid_mask  : (T,)           有至少一個關鍵點達門檻就視為有效
-    """
-    T = len(parsed_window)
-    M = np.zeros((T, motion_dim), dtype=np.float32)
-    mask = np.zeros((T,), dtype=np.float32)
-
-    # 先抽出 norm 座標序列
-    coords = []
-    for (bbox, kps, dets, img_w, img_h) in parsed_window:
-        pts = []
-        valid = False
-        for i in range(17):
-            if i < len(kps):
-                x = float(kps[i].get("x", 0.0)) / max(img_w, 1.0)
-                y = float(kps[i].get("y", 0.0)) / max(img_h, 1.0)
-                c = float(kps[i].get("conf", kps[i].get("score", 0.0)))
-                pts.append((x, y, c))
-                if c >= kp_conf_th:
-                    valid = True
-            else:
-                pts.append((0.0, 0.0, 0.0))
-        coords.append(pts)
-        mask[len(coords) - 1] = 1.0 if valid else 0.0
-
-    # 計算每一幀的運動統計（與上一幀的差）
-    for t in range(1, T):
-        dxs, dys, spds = [], [], []
-        for i in range(17):
-            x0, y0, c0 = coords[t - 1][i]
-            x1, y1, c1 = coords[t][i]
-            dx, dy = (x1 - x0), (y1 - y0)
-            dxs.append(dx); dys.append(dy)
-            spds.append((dx * dx + dy * dy) ** 0.5)
-        dxs = np.array(dxs, dtype=np.float32)
-        dys = np.array(dys, dtype=np.float32)
-        spds = np.array(spds, dtype=np.float32)
-
-        feats = [
-            float(np.mean(np.abs(dxs))),
-            float(np.mean(np.abs(dys))),
-            float(np.mean(spds)),
-            float(np.std(dxs)),
-            float(np.std(dys)),
-            float(np.std(spds)),
-            float(np.max(spds)),
-            float(np.median(spds)),
-            float(np.percentile(spds, 75)),
-        ]
-        M[t, :len(feats)] = np.asarray(feats, dtype=np.float32)
-
-    # 第一幀沒有前幀可比，保留 0 即可；mask 已在上面計算
-    return M, mask
 
 def _safe_softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    # 參考 multi loader 的穩定寫法
     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
     logits = logits - logits.max(dim=dim, keepdim=True).values
     return torch.softmax(logits, dim=dim)
 
 
-def _extract_basic_frame(rec: Dict[str, Any]) -> Tuple[Optional[dict], List[dict], float, float]:
+def _extract_basic_frame(rec: Dict[str, Any]) -> Tuple[Optional[list], List[dict], float, float]:
     """
-    支援兩種格式：
-    A) 扁平： {bbox, kps|keypoints, img_w|image_w, img_h|image_h}
-    B) 行動端： {persons:[{bbox, keypoints[{x,y,conf|confidence}], ...}], image_size{width,height}}
+    將一幀資料轉成 (bbox_xyxy, kps[{x,y,conf}], img_w, img_h)，容忍多種來源：
+    - 支援合包：type=="frame" 且 root 有 persons[0], detections, image_size
+    - 支援拆包後合併：我們上層 ingest 已先聚合為扁平欄位：bbox, kps, detections, img_w/img_h
+    - 備援：root 即有 bbox/keypoints 的情況
     """
-    # 解析影像尺寸
-    img_w = float(
-        rec.get("img_w", rec.get("image_w", rec.get("image_size", {}).get("width", 640.0))) or 640.0
-    )
-    img_h = float(
-        rec.get("img_h", rec.get("image_h", rec.get("image_size", {}).get("height", 480.0))) or 480.0
-    )
+    # image size
+    if "img_w" in rec and "img_h" in rec:
+        img_w = float(rec.get("img_w") or 640.0)
+        img_h = float(rec.get("img_h") or 480.0)
+    elif isinstance(rec.get("image_size"), dict):
+        img_w = float(rec["image_size"].get("width", 640.0))
+        img_h = float(rec["image_size"].get("height", 480.0))
+    else:
+        img_w = float(rec.get("image_w", rec.get("width", rec.get("w", 640.0))))
+        img_h = float(rec.get("image_h", rec.get("height", rec.get("h", 480.0))))
 
-    # 如果帶有 persons 就取第一個
-    persons = rec.get("persons")
-    if isinstance(persons, list) and persons:
-        p0 = persons[0]
-        bbox = p0.get("bbox")
-        raw_kps = p0.get("keypoints") or p0.get("kps") or []
-        kps = [
-            {"x": float(pt.get("x", 0.0)),
-             "y": float(pt.get("y", 0.0)),
-             "conf": float(pt.get("conf", pt.get("confidence", 1.0)))}
-            for pt in raw_kps[:17] if isinstance(pt, dict)
-        ]
-        return bbox, kps, img_w, img_h
-
-    # 否則走扁平
+    # bbox
     bbox = rec.get("bbox")
-    raw_kps = rec.get("kps") or rec.get("keypoints") or []
-    kps = [
-        {"x": float(pt.get("x", 0.0)),
-         "y": float(pt.get("y", 0.0)),
-         "conf": float(pt.get("conf", pt.get("confidence", 1.0)))}
-        for pt in raw_kps[:17] if isinstance(pt, dict)
-    ]
-    return bbox, kps, img_w, img_h
+    if bbox is None and isinstance(rec.get("persons"), list) and rec["persons"]:
+        bbox = rec["persons"][0].get("bbox")
+    if isinstance(bbox, dict):
+        if all(k in bbox for k in ("x","y","w","h")):
+            x,y,w,h = float(bbox["x"]), float(bbox["y"]), float(bbox["w"]), float(bbox["h"])
+            bbox = [x, y, x+w, y+h]
+        elif all(k in bbox for k in ("cx","cy","w","h")):
+            cx,cy,w,h = float(bbox["cx"]), float(bbox["cy"]), float(bbox["w"]), float(bbox["h"])
+            bbox = [cx-w/2, cy-h/2, cx+w/2, cy+h/2]
+        elif all(k in bbox for k in ("x1","y1","x2","y2")):
+            bbox = [float(bbox["x1"]), float(bbox["y1"]), float(bbox["x2"]), float(bbox["y2"])]
+        else:
+            bbox = None
+    elif isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        bbox = [float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])]
+    else:
+        bbox = None
+
+    # keypoints
+    kps = rec.get("kps")
+    if kps is None and isinstance(rec.get("persons"), list) and rec["persons"]:
+        kps = rec["persons"][0].get("keypoints")
+    if isinstance(kps, list) and kps and isinstance(kps[0], (int, float)):
+        # flat 51
+        flat = kps
+        if len(flat) >= 51:
+            pts = []
+            for i in range(17):
+                x = float(flat[3*i+0]); y = float(flat[3*i+1]); c = float(flat[3*i+2])
+                pts.append({"x": x, "y": y, "conf": c})
+            kps = pts
+        else:
+            kps = []
+    out_kps: List[dict] = []
+    if isinstance(kps, list):
+        for p in kps[:17]:
+            if isinstance(p, dict):
+                x = float(p.get("x", p.get("X", 0.0)))
+                y = float(p.get("y", p.get("Y", 0.0)))
+                c = float(p.get("conf", p.get("confidence", p.get("score", 1.0))))
+                out_kps.append({"x": x, "y": y, "conf": c})
+            elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                x = float(p[0]); y = float(p[1]); c = float(p[2]) if len(p) > 2 else 1.0
+                out_kps.append({"x": x, "y": y, "conf": c})
+
+    return bbox, out_kps, img_w, img_h
+
+
+# ====== 簡易前處理（本檔內實作，避免依賴 loader 內部工具） ======
+class RelationMapConfig:
+    def __init__(self, H: int, W: int, sigma_kp: float = 2.0, kp_conf_th: float = 0.2,
+                 include_bone_lines: bool = False, object_classes: Optional[list] = None):
+        self.H = int(H); self.W = int(W)
+        self.sigma_kp = float(sigma_kp)
+        self.kp_conf_th = float(kp_conf_th)
+        self.include_bone_lines = bool(include_bone_lines)
+        self.object_classes = list(object_classes or [])
+
+def _gauss2d(h, w, cx, cy, sigma):
+    yy, xx = np.mgrid[0:h, 0:w]
+    return np.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * sigma * sigma))
+
+def _rasterize_frame_simple(bbox, kps: list, dets: list, img_w: float, img_h: float, cfg: RelationMapConfig,
+                            num_edges: int, want_in_ch: int) -> np.ndarray:
+    H, W = cfg.H, cfg.W
+    chans = []
+
+    # ch0: bbox mask
+    m = np.zeros((H, W), dtype=np.float32)
+    if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+        x1, y1, x2, y2 = bbox[:4]
+        xs = int(max(0, min(W-1, round(x1 / max(1.0, img_w) * W))))
+        xe = int(max(0, min(W-1, round(x2 / max(1.0, img_w) * W))))
+        ys = int(max(0, min(H-1, round(y1 / max(1.0, img_h) * H))))
+        ye = int(max(0, min(H-1, round(y2 / max(1.0, img_h) * H))))
+        if xe > xs and ye > ys:
+            m[ys:ye, xs:xe] = 1.0
+    chans.append(m)
+
+    # ch1: distance-to-centroid
+    if kps:
+        xs = [p["x"] for p in kps if p.get("conf", 0.0) >= cfg.kp_conf_th]
+        ys = [p["y"] for p in kps if p.get("conf", 0.0) >= cfg.kp_conf_th]
+        if xs and ys:
+            cx = float(sum(xs)/len(xs)); cy = float(sum(ys)/len(ys))
+            cxg = cx / max(1.0, img_w) * W
+            cyg = cy / max(1.0, img_h) * H
+            dmap = _gauss2d(H, W, cxg, cyg, sigma=max(1.0, cfg.sigma_kp*1.5))
+            dmap = dmap / (dmap.max() + 1e-6)
+        else:
+            dmap = np.zeros((H, W), dtype=np.float32)
+    else:
+        dmap = np.zeros((H, W), dtype=np.float32)
+    chans.append(dmap.astype(np.float32))
+
+    # 17 x keypoint heatmaps
+    for i in range(17):
+        if i < len(kps) and kps[i].get("conf", 0.0) >= cfg.kp_conf_th:
+            x = kps[i]["x"] / max(1.0, img_w) * W
+            y = kps[i]["y"] / max(1.0, img_h) * H
+            hm = _gauss2d(H, W, x, y, sigma=cfg.sigma_kp)
+            hm = hm / (hm.max() + 1e-6)
+        else:
+            hm = np.zeros((H, W), dtype=np.float32)
+        chans.append(hm.astype(np.float32))
+
+    # edges channels（僅保型，填 0）
+    for _ in range(int(num_edges)):
+        chans.append(np.zeros((H, W), dtype=np.float32))
+
+    # object channels（僅保型，填 0）
+    for _ in range(len(getattr(cfg, "object_classes", []) or [])):
+        chans.append(np.zeros((H, W), dtype=np.float32))
+
+    # 2 x coord grids
+    yy, xx = np.mgrid[0:H, 0:W]
+    chans.append((xx / max(1.0, W-1)).astype(np.float32))
+    chans.append((yy / max(1.0, H-1)).astype(np.float32))
+
+    x = np.stack(chans, axis=0)  # (C,H,W)
+    # 若通道少於想要的 in_ch，後面補 0；若多於，裁切（保證形狀對齊權重）
+    if x.shape[0] < want_in_ch:
+        pad = np.zeros((want_in_ch - x.shape[0], H, W), dtype=np.float32)
+        x = np.concatenate([x, pad], axis=0)
+    elif x.shape[0] > want_in_ch:
+        x = x[:want_in_ch]
+
+    return x
+
+def _compute_motion_and_mask_simple(parsed_window: List[Tuple[dict, list, list, float, float]],
+                                    motion_dim: int, kp_conf_th: float = 0.2) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    回傳：
+      motion_feats: (T, motion_dim)
+      valid_mask:  (T,)  只要該幀有任一 kp conf>=th 則為 1，否則 0
+    簡化 motion：以 keypoints centroid 的速度/加速度為主，並 zero-pad 到 motion_dim。
+    """
+    T = len(parsed_window)
+    feats = np.zeros((T, max(1, motion_dim)), dtype=np.float32)
+    mask = np.zeros((T,), dtype=np.float32)
+
+    cents = []
+    for t, (_bbox, kps, _dets, img_w, img_h) in enumerate(parsed_window):
+        xs = [p["x"] for p in (kps or []) if p.get("conf", 0.0) >= kp_conf_th]
+        ys = [p["y"] for p in (kps or []) if p.get("conf", 0.0) >= kp_conf_th]
+        if xs and ys:
+            cx = float(sum(xs)/len(xs)) / max(1.0, img_w)
+            cy = float(sum(ys)/len(ys)) / max(1.0, img_h)
+            cents.append((cx, cy))
+            mask[t] = 1.0
+        else:
+            cents.append((None, None))
+
+    prev = None
+    vprev = None
+    for t, (cx, cy) in enumerate(cents):
+        vx = vy = ax = ay = spd = asp = 0.0
+        if cx is not None and prev is not None:
+            vx = cx - prev[0]
+            vy = cy - prev[1]
+            spd = (vx*vx + vy*vy) ** 0.5
+        if cx is not None and vprev is not None:
+            ax = vx - vprev[0]
+            ay = vy - vprev[1]
+            asp = (ax*ax + ay*ay) ** 0.5
+
+        # 取 6 維特徵：cx, cy, vx, vy, ax, ay，再加 spd, asp（共 8），不足補 0
+        vec = [cx or 0.0, cy or 0.0, vx, vy, ax, ay, spd, asp]
+        vec = (vec + [0.0]*motion_dim)[:motion_dim]
+        feats[t] = np.array(vec, dtype=np.float32)
+
+        vprev = (vx, vy) if cx is not None else None
+        prev  = (cx, cy) if cx is not None else prev
+
+    return feats, mask
+
 
 class _StageModels:
     """
-    打包 stage 需要的：常數、前處理函式、模型與類別
-    - stage='binary' 使用 bl 模組
-    - stage='multi'  使用 ml 模組
+    打包單一 stage（binary / multi）所需的設定與模型
     """
     def __init__(self, stage: str, device: torch.device):
         assert stage in ("binary", "multi")
         self.stage = stage
-        self.m = bl if stage == "binary" else ml  # 對應的 loader 模組
+        self.m = bl if stage == "binary" else ml
         self.device = device
 
-        # 前處理設定
+        # 前處理 & 模型結構設定
         self.H = int(getattr(self.m, "H", 64))
         self.W = int(getattr(self.m, "W", 64))
         self.INCLUDE_BONE = bool(getattr(self.m, "INCLUDE_BONE_LINES", True))
         self.OBJECT_CLASSES = list(getattr(self.m, "OBJECT_CLASSES", []))
         self.NUM_EDGES = len(getattr(self.m, "COCO_EDGES", [])) if self.INCLUDE_BONE else 0
-
-        # 建立 nn 模型（用本模組的邊數）
-        in_ch = _calc_in_channels(self.INCLUDE_BONE, len(self.OBJECT_CLASSES), self.NUM_EDGES)
         self.USE_MOTION = bool(getattr(self.m, "_USE_MOTION", True))
         self.MOTION_DIM = int(getattr(self.m, "_MOTION_DIM", 9))
 
-        # 建立 nn 模型
+        # 先以目前設定建一次（稍後 load_weights 會依 checkpoint in_ch 自動調整）
+        in_ch = _calc_in_channels(self.INCLUDE_BONE, len(self.OBJECT_CLASSES), self.NUM_EDGES)
         lstm_h = int(getattr(self.m, "LSTM_HIDDEN", 256))
         bidir = bool(getattr(self.m, "BIDIRECTIONAL", False))
         pool = getattr(self.m, "TEMPORAL_POOL", "attn")
         dropout = float(getattr(self.m, "DROPOUT", 0.3))
         CNNLSTM = getattr(self.m, "CNNLSTM")
+
         self.model = CNNLSTM(
             in_ch=in_ch,
-            num_classes=1,  # 先放 1，等載入權重後再替換 head 輸出維度
+            num_classes=1,
             cnn_out=256,
             lstm_h=lstm_h,
             lstm_layers=2,
@@ -320,10 +308,7 @@ class _StageModels:
 
     def load_weights(self, model_path: str, classes_path: Optional[str] = None):
         """
-        與 loader 一致的權重/類別讀取，並「自動對齊輸入通道數」：
-          - 讀取 checkpoint 第一層卷積權重的輸入通道 expected_in
-          - 根據 expected_in 反推：是否要開骨架線、需要幾個物件通道
-          - 依對齊後的設定重建模型，再載入 state_dict
+        讀取 checkpoint，並根據第一層 conv 權重的輸入通道數自動對齊
         """
         sd = torch.load(model_path, map_location=self.device)
         state = None
@@ -337,7 +322,7 @@ class _StageModels:
         else:
             raise RuntimeError(f"[{self.stage}] Unsupported checkpoint format: {type(sd)}")
 
-        # 類別名稱
+        # 類別
         if class_names is None:
             if classes_path and os.path.isfile(classes_path):
                 import json
@@ -352,17 +337,15 @@ class _StageModels:
         if not class_names:
             raise RuntimeError(f"[{self.stage}] class_names not found for {model_path}")
 
-        # === 讀出 checkpoint 期望的輸入通道數 expected_in ===
-        #   通常鍵名會長這樣：'cnn.net.0.weight'
+        # checkpoint 的第一層輸入通道數
         first_key = None
         for k in state.keys():
             if k.endswith("cnn.net.0.weight"):
                 first_key = k
                 break
         if first_key is None:
-            # 後備方案：找第一個 4D 權重
             for k in state.keys():
-                if state[k].ndim == 4:
+                if getattr(state[k], "ndim", 0) == 4:
                     first_key = k
                     break
         if first_key is None:
@@ -370,36 +353,33 @@ class _StageModels:
 
         expected_in = int(state[first_key].shape[1])
 
-        # === 目前設定下的通道數（用本模組的邊數）===
+        # 目前設定的 in_ch
         curr_in = _calc_in_channels(self.INCLUDE_BONE, len(self.OBJECT_CLASSES), self.NUM_EDGES)
 
-        # === 若不一致，嘗試反推 include_bone 與物件通道數，對齊 expected_in ===
+        # 若不一致，嘗試反推 include_bone 與物件通道數以對齊 expected_in
         if curr_in != expected_in:
-            # 嘗試 include_bone=True/False 兩種情況
             base_obj_names = list(getattr(self.m, "OBJECT_CLASSES", []))
             for include_bone_try in (True, False):
                 edges_try = len(getattr(self.m, "COCO_EDGES", [])) if include_bone_try else 0
-                # 固定通道（不含物件）：1(bbox)+1(dist)+17(kp)+edges_try+2(coord)
-                base_fixed = 1 + 1 + 17 + edges_try + 2
+                base_fixed = 1 + 1 + 17 + edges_try + 2  # 除了物件通道以外
                 num_obj_try = expected_in - base_fixed
-                if 0 <= num_obj_try <= 64:  # 給個合理上限以避免怪值
+                if 0 <= num_obj_try <= 64:
                     self.INCLUDE_BONE = include_bone_try
                     self.NUM_EDGES = edges_try
                     if len(base_obj_names) >= num_obj_try:
                         self.OBJECT_CLASSES = base_obj_names[:num_obj_try]
                     else:
-                        # 不足就補名（不影響語義，只是為了通道數對齊）
                         extra = [f"obj{i}" for i in range(len(base_obj_names), num_obj_try)]
                         self.OBJECT_CLASSES = base_obj_names + extra
-                    break  # 命中後結束嘗試
+                    break
 
-        # === 對齊後，用正確的 in_ch 重建模型，並載入權重 ===
+        # 依對齊後的通道數重建模型
         in_ch = _calc_in_channels(self.INCLUDE_BONE, len(self.OBJECT_CLASSES), self.NUM_EDGES)
         lstm_h = int(getattr(self.m, "LSTM_HIDDEN", 256))
-        bidir  = bool(getattr(self.m, "BIDIRECTIONAL", False))
-        pool   = getattr(self.m, "TEMPORAL_POOL", "attn")
-        dropout= float(getattr(self.m, "DROPOUT", 0.3))
-        CNNLSTM= getattr(self.m, "CNNLSTM")
+        bidir = bool(getattr(self.m, "BIDIRECTIONAL", False))
+        pool = getattr(self.m, "TEMPORAL_POOL", "attn")
+        dropout = float(getattr(self.m, "DROPOUT", 0.3))
+        CNNLSTM = getattr(self.m, "CNNLSTM")
 
         self.model = CNNLSTM(
             in_ch=in_ch,
@@ -413,7 +393,6 @@ class _StageModels:
             motion_dim=(self.MOTION_DIM if self.USE_MOTION else 0),
         ).to(self.device)
 
-        # 真的載入
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
         self.class_names = list(class_names)
@@ -421,45 +400,37 @@ class _StageModels:
     @torch.no_grad()
     def infer(self, parsed_window: List[Tuple[dict, list, list, float, float]]) -> Dict[str, Any]:
         """
-        對一個「已切好的視窗」做推論。
+        對一個視窗做推論（使用本檔內的簡易前處理）。
         parsed_window: list of (bbox, kps, dets, img_w, img_h)，長度 = WINDOW
-        回傳：
-          { "class_names": [], "probs": [...], "pred_idx": int, "pred": str }
         """
-        # Motion + Mask（改用本檔的前處理；保持維度對齊）
-        if self.USE_MOTION:
-            motion_feats, valid_mask = compute_motion_feats_with_mask_from_parsed_local(
-                parsed_window,
-                motion_dim=self.MOTION_DIM,
-                kp_conf_th=float(getattr(self.m, "KP_CONF_TH", 0.4)),
-            )
-        else:
-            T = len(parsed_window)
-            motion_feats = np.zeros((T, self.MOTION_DIM), dtype=np.float32)
-            valid_mask = np.ones((T,), dtype=np.float32)
+        # Motion + Mask（若 motion_dim=0 則輸出 None）
+        motion_feats, valid_mask = _compute_motion_and_mask_simple(
+            parsed_window,
+            motion_dim=(self.MOTION_DIM if self.USE_MOTION else 0),
+            kp_conf_th=float(getattr(self.m, "KP_CONF_TH", 0.2))  # 放寬一點降低 0 熱圖機率
+        )
 
-        # RelationMap 轉張量
+        # RelationMap 轉張量（以簡易版 rasterize，並確保通道數 == in_ch）
+        want_in_ch = _calc_in_channels(self.INCLUDE_BONE, len(self.OBJECT_CLASSES), self.NUM_EDGES)
         cfg = RelationMapConfig(
             H=self.H, W=self.W,
             sigma_kp=float(getattr(self.m, "SIGMA_KP", 2.0)),
-            kp_conf_th=float(getattr(self.m, "KP_CONF_TH", 0.4)),
+            kp_conf_th=float(getattr(self.m, "KP_CONF_TH", 0.2)),
             include_bone_lines=self.INCLUDE_BONE,
             object_classes=self.OBJECT_CLASSES,
-            edges=list(getattr(self.m, "COCO_EDGES", [])) if self.INCLUDE_BONE else [],
         )
         frames = [
-            rasterize_frame(bbox, kps, dets, img_w, img_h, cfg)
+            _rasterize_frame_simple(bbox, kps, dets, img_w, img_h, cfg, self.NUM_EDGES, want_in_ch)
             for (bbox, kps, dets, img_w, img_h) in parsed_window
         ]
 
         x = torch.from_numpy(np.stack(frames)).unsqueeze(0).float().to(self.device)  # (1,T,C,H,W)
         M = (
             torch.from_numpy(motion_feats).unsqueeze(0).float().to(self.device)
-            if self.USE_MOTION else None
+            if (self.USE_MOTION and self.MOTION_DIM > 0) else None
         )
         mask = torch.from_numpy(valid_mask).unsqueeze(0).float().to(self.device)
 
-        # 數值安全（NaN/Inf→0）
         x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         if M is not None:
             M = torch.nan_to_num(M, nan=0.0, posinf=0.0, neginf=0.0)
@@ -479,94 +450,48 @@ class _StageModels:
 class StreamInferManager:
     """
     伺服器端推論中樞：
-      - ingest(user_id, data): 收幀 → 緩衝 → 觸發推論
+      - ingest(user_id, data): 收幀 → 聚合 → 緩衝 → 觸發推論
       - set_handlers(...)    : 注入事件 hooks
       - force_recover(...)   : 中斷/關閉時清理狀態
     """
     def __init__(self):
         self.device = _torch_device()
-        # 每個 user 的原始幀緩衝（保留到 40 幀，足夠 20 視窗滑動）
-        self.buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max(40, MULTI_WINDOW)))
+
+        # 每個 user 的原始幀緩衝（至少保留 10 幀）
+        self.buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max(40, MULTI_WINDOW+20)))
+
         # 事件處理器（由 pose_routes.py 設定）
         self.handlers: Dict[str, Any] = {}
+
         # 二階段模型
         self.bin_stage = _StageModels("binary", device=self.device)
         self.mul_stage = _StageModels("multi",  device=self.device)
         self._load_models()
 
-        # fall 狀態
-        self.state_bin_pred: Dict[str, str] = defaultdict(lambda: "non_fall")
-        self.kf_bin = KalmanFilter()
-        self.kf_multi = KalmanFilter()
+        # 跌倒狀態機（連續命中 + 遲滯）
+        self._in_fall        = defaultdict(lambda: False)  # 是否目前處於 fall 事件中
+        self._start_hits     = defaultdict(int)            # 連續達 START_THR 次數
+        self._recover_hits   = defaultdict(int)            # 連續低於 RECOVER_THR 次數
+        self._fall_start_ts  = {}                          # 事件開始時間字串
+        self._fall_peak      = defaultdict(float)          # 事件期間最高分
 
-        # ✅ 新增：frame 分組與環狀排序用
-        import os
-        self.WRAP_SIZE = int(os.getenv("SC_WRAP_SIZE", "60"))  # 可用環境變數改
-        # 用來暫存同一 frame_id 的 pose/object（完成才進 buffer）
-        self._partials: Dict[str, Dict[int, Dict[str, Any]]] = defaultdict(dict)
-        # 以「完成的 frame」為單位的遞增序列（unwrap 後的線性 id）
-        self._last_completed_raw: Dict[str, Optional[int]] = defaultdict(lambda: None)
-        self._last_completed_lin: Dict[str, int] = defaultdict(int)
-        # 注意：self.buffers 照舊，存的是「完成 frame 的原始 JSON（含 pose+object 已合併）」。
+        # 每個使用者的推論鎖，避免同一 user 併發執行 _run_two_stage 造成競態
+        self._locks = defaultdict(asyncio.Lock)
+
+        # 去重：記住上次 multi 視窗的末幀 frame_id，避免同窗重算
+        self._last_multi_tail_frame_id = defaultdict(lambda: None)
+
+        # 保留最近一次二元分類（若其他邏輯需要）
+        self.state_bin_pred: Dict[str, str] = defaultdict(lambda: "non_fall")
+
+        # ★ 新增：拆包聚合暫存（user_id -> frame_id -> partial dict）
+        self._pending: Dict[str, Dict[Any, Dict[str, Any]]] = defaultdict(dict)
 
     def _load_models(self):
-        # 載入 binary
         self.bin_stage.load_weights(BIN_MODEL_PATH, BIN_CLASSES_PATH)
-        # 載入 multi
         self.mul_stage.load_weights(MULTI_MODEL_PATH, MULTI_CLASSES_PATH)
         print(f"[STREAM] Loaded models. binary={len(self.bin_stage.class_names)} classes, "
               f"multi={len(self.mul_stage.class_names)} classes, device={self.device}")
-
-    def _kf_smooth(self, window_kps: list, which: str = "bin") -> list:
-        """
-        使用 KalmanFilter（34 維向量：17*2）對一段 window 的骨架序列做平滑。
-        回傳格式：list[T][17]{x,y,conf}
-        """
-        kf = self.kf_bin if which == "bin" else self.kf_multi
-        # 每段 window 進來前，外層會先把 state/covariance 清空
-        smoothed = []
-        for kps in window_kps:
-            flat = []
-            for i in range(17):
-                if i < len(kps):
-                    x = float(kps[i].get("x", 0.0))
-                    y = float(kps[i].get("y", 0.0))
-                else:
-                    x, y = 0.0, 0.0
-                flat.extend([x, y])
-
-            state = kf.predict_and_update(flat)  # 34 維向量
-
-            pts = []
-            for i in range(17):
-                x = float(state[2 * i])
-                y = float(state[2 * i + 1])
-                c = 1.0 if i >= len(kps) else float(kps[i].get("conf", kps[i].get("score", 1.0)))
-                pts.append({"x": x, "y": y, "conf": c})
-            smoothed.append(pts)
-        return smoothed
-
-    def _unwrap_frame_id(self, user_id: str, fid: int) -> int:
-        """
-        將環狀 frame_id（1..WRAP_SIZE）展平成線性遞增 id。
-        規則：以「上一次完成的 raw fid」為錨，取往前的最小正位移。
-        例如 WRAP=60，錨=59：fid=60→+1；fid=1→+2；fid=2→+3；...
-        """
-        wrap = max(1, int(self.WRAP_SIZE))
-        prev_raw = self._last_completed_raw[user_id]
-        prev_lin = self._last_completed_lin[user_id]
-        if prev_raw is None:
-            # 第一個完成的 frame，設錨
-            self._last_completed_raw[user_id] = fid
-            self._last_completed_lin[user_id] = 0
-            return 0
-        # 0..wrap-1 的前進位移
-        delta = (fid - prev_raw) % wrap
-        new_lin = prev_lin + delta
-        # 更新錨
-        self._last_completed_raw[user_id] = fid
-        self._last_completed_lin[user_id] = new_lin
-        return new_lin
 
     def set_handlers(
         self,
@@ -575,226 +500,242 @@ class StreamInferManager:
         on_state_event_start=None,
         on_state_event_recover=None,
     ):
-        if on_fall_start:         self.handlers["on_fall_start"] = on_fall_start
-        if on_fall_recover:       self.handlers["on_fall_recover"] = on_fall_recover
-        if on_state_event_start:  self.handlers["on_state_event_start"] = on_state_event_start
-        if on_state_event_recover:self.handlers["on_state_event_recover"] = on_state_event_recover
+        if on_fall_start:          self.handlers["on_fall_start"] = on_fall_start
+        if on_fall_recover:        self.handlers["on_fall_recover"] = on_fall_recover
+        if on_state_event_start:   self.handlers["on_state_event_start"] = on_state_event_start
+        if on_state_event_recover: self.handlers["on_state_event_recover"] = on_state_event_recover
+
+    def _merge_packet(self, user_id: str, packet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        把 pose/object/frame 三種格式合併成單一幀：
+        - 當 type="pose"：寫入 persons[0] 的 bbox、keypoints；記錄 image_size；不直接入 buffer，等待 object 或直接以 pose 入 buffer（policy: 看到 pose 即入 buffer）
+        - 當 type="object"：寫入 detections；若該 frame 已入 buffer 則忽略，否則等待 pose
+        - 當 type="frame"：直接入 buffer
+        回傳：若可入 buffer 就回傳合併後的單幀 dict；否則 None
+        """
+        t = packet.get("type")
+        fid = packet.get("frame_id")
+        ts  = packet.get("timestamp_ms") or packet.get("ts_ms")
+
+        if t == "frame":
+            # 已經是合包
+            persons = packet.get("persons") or []
+            first = persons[0] if persons else {}
+            bbox = first.get("bbox")
+            kps  = first.get("keypoints") or first.get("kps") or []
+            img_size = packet.get("image_size") or {}
+            dets = packet.get("detections") or []
+            return {
+                "type": "frame",
+                "frame_id": fid,
+                "ts_ms": ts,
+                "bbox": bbox,
+                "kps": kps,
+                "detections": dets,
+                "img_w": (img_size.get("width")  or packet.get("img_w") or 640),
+                "img_h": (img_size.get("height") or packet.get("img_h") or 480),
+            }
+
+        # 拆包：用 pending 先收
+        pend = self._pending[user_id].setdefault(fid, {"frame_id": fid, "ts_ms": ts})
+        if isinstance(packet.get("image_size"), dict):
+            pend["img_w"] = packet["image_size"].get("width", pend.get("img_w", 640))
+            pend["img_h"] = packet["image_size"].get("height", pend.get("img_h", 480))
+
+        if t == "pose":
+            persons = packet.get("persons") or []
+            first = persons[0] if persons else {}
+            if "bbox" in first:
+                pend["bbox"] = first["bbox"]
+            if "keypoints" in first or "kps" in first:
+                pend["kps"] = first.get("keypoints") or first.get("kps") or []
+            # policy：有 pose 即可入 buffer（沒有物件也可推論）
+            ready = ("kps" in pend)  # bbox 可無
+            return pend.copy() if ready else None
+
+        if t == "object":
+            dets = packet.get("detections") or []
+            pend["detections"] = dets
+            # 只有 object 不入 buffer，等 pose
+            return None
+
+        # 其他未知格式，嘗試直接解析
+        if "kps" in packet or "keypoints" in packet or "persons" in packet:
+            # 嘗試從 packet 抽出需要欄位
+            persons = packet.get("persons") or []
+            first = persons[0] if persons else {}
+            bbox = packet.get("bbox", first.get("bbox") if first else None)
+            kps  = packet.get("kps",  first.get("keypoints") if first else None)
+            return {
+                "type": packet.get("type"),
+                "frame_id": fid, "ts_ms": ts,
+                "bbox": bbox, "kps": kps,
+                "img_w": packet.get("img_w", 640), "img_h": packet.get("img_h", 480),
+                "detections": packet.get("detections", []),
+            }
+        return None
 
     async def ingest(self, user_id: str, data: Dict[str, Any]):
         """
-        接收一幀骨架 JSON（由 ws_message_dispatcher 呼叫）
-        典型資料：
-          {
-            "frame_id": 42,
-            "ts_ms": 1759508034919,
-            "bbox": [x1,y1,x2,y2] 或 {x,y,w,h} 或 None,
-            "kps": [{"x":..,"y":..,"conf":..}, ...],
-            "img_w": 640, "img_h": 480  # 選填
-          }
+        接收 WS 一筆（可能是 pose、object、或 frame 合包）。
+        這裡會先聚合，再把「可用幀」放進 buffer。
         """
-        # 解析 frame_id 與訊息型別
-        fid = int(data.get("frame_id", data.get("fid", -1)))
-        msg_type = str(data.get("type", "")).lower()
+        merged = self._merge_packet(user_id, data)
+        if merged is None:
+            return  # 等待另一半
 
-        # 1) 一包就含 pose（persons）且可能也含物件（detections）的情況：直接當完成幀
-        has_persons = isinstance(data.get("persons"), list) and len(data["persons"]) > 0
-        has_dets    = isinstance(data.get("detections"), list)
+        # 確保只有在有 kps 時才入 buffer（避免全 0）
+        _, kps, _, _ = _extract_basic_frame(merged)
+        if not kps:
+            return
 
-        if has_persons:
-            # 直接視為完成幀：用現有 _extract_basic_frame 取 bbox/kps，dets 暫時不進 relation map（占位）
-            buf = self.buffers[user_id]
-            # 以 unwrap 後的線性 id 表示時間順序
-            lin = self._unwrap_frame_id(user_id, fid)
-            # 同步保留原始資料，以便未來要用 dets
-            buf.append({"_lin": lin, **data})
-
-        else:
-            # 2) 分開傳（pose/object）：先分組
-            partials = self._partials[user_id]
-            slot = partials.get(fid)
-            if slot is None:
-                slot = {}
-                partials[fid] = slot
-            if msg_type == "pose":
-                slot["pose"] = data
-            elif msg_type == "object":
-                slot["object"] = data
-            else:
-                # 沒標 type，但帶 persons 就當 pose；帶 detections 就當 object
-                if isinstance(data.get("persons"), list):
-                    slot["pose"] = data
-                elif isinstance(data.get("detections"), list):
-                    slot["object"] = data
-
-            # 湊齊了就變成完成幀
-            if "pose" in slot and "object" in slot:
-                buf = self.buffers[user_id]
-                lin = self._unwrap_frame_id(user_id, fid)
-                # 合併為一包（保留 persons/detections 給未來使用）
-                merged = {
-                    "type": "frame",
-                    "frame_id": fid,
-                    "timestamp_ms": slot["pose"].get("timestamp_ms") or slot["object"].get("timestamp_ms"),
-                    "image_size": slot["pose"].get("image_size") or slot["object"].get("image_size"),
-                    "persons": slot["pose"].get("persons", []),
-                    "detections": slot["object"].get("detections", []),
-                    "_lin": lin,
-                }
-                buf.append(merged)
-                # 用完就刪
-                try:
-                    del partials[fid]
-                except Exception:
-                    pass
-
-        # 3) 視窗觸發（以「完成幀數量」來判斷）
+        # 入 buffer（避免重複 frame_id）
         buf = self.buffers[user_id]
+        if len(buf) == 0 or (buf[-1].get("frame_id") != merged.get("frame_id")):
+            buf.append(merged)
+
         n = len(buf)
         if (n >= BIN_WINDOW) and ((n % BIN_STRIDE) == 0):
             try:
-                # 取最後 BIN_WINDOW 個完成幀 → 交給 _run_two_stage
                 clip10 = list(buf)[-BIN_WINDOW:]
                 await self._run_two_stage(user_id, clip10)
             except Exception as e:
                 print(f"[STREAM][ERROR] user={user_id} run_two_stage: {e}")
 
+        # 清理已處理的 pending
+        fid = merged.get("frame_id")
+        self._pending[user_id].pop(fid, None)
 
     async def _run_two_stage(self, user_id: str, clip_bin: List[Dict[str, Any]]):
-        """
-        - 先對 10 幀做 binary 推論
-        - 若非跌倒，檢查是否有 20 幀，則再跑 multi 並一起回傳
-        - 若為跌倒且分數過門檻 → 觸發 on_fall_start
-        """
-        # 準備 binary parsed（共用無物件通道：dets=[]；若你有物件，也可改成傳入）
-        parsed_bin = []
-        for rec in clip_bin:
-            bbox, kps, img_w, img_h = _extract_basic_frame(rec)
-            parsed_bin.append((bbox, kps, [], img_w, img_h))
+        async with self._locks[user_id]:
+            parsed_bin = []
+            for rec in clip_bin:
+                bbox, kps, img_w, img_h = _extract_basic_frame(rec)
+                parsed_bin.append((bbox, kps, [], img_w, img_h))
 
-        # Kalman（與 loader 對齊：採用 bl 的 KF）
-        # ✅ 每段 window 開始前重置 Binary KF，避免跨片段汙染
-        # Kalman（改用本檔 KF；每段進來先重置狀態，避免跨片段汙染）
-        if getattr(bl, "ENABLE_KALMAN", True):
-            print("Initializing Kalman filter state.")
-            self.kf_bin.state = None
-            self.kf_bin.covariance = None
-            window_kps = [k for (_, k, _, _, _) in parsed_bin]
-            smoothed = self._kf_smooth(window_kps, which="bin")
-            parsed_bin = [(bbox, smoothed[i], dets, w, h) for i, (bbox, _, dets, w, h) in enumerate(parsed_bin)]
+            # Binary 推論
+            bin_out = self.bin_stage.infer(parsed_bin)
+            bin_pred = bin_out["pred"]
+            bin_probs = bin_out["probs"]
+            class_names_bin = self.bin_stage.class_names
+            fall_idx = class_names_bin.index("fall") if "fall" in class_names_bin else 1
+            fall_score = float(bin_probs[fall_idx])
 
-        # Binary 推論
-        bin_out = self.bin_stage.infer(parsed_bin)
-        bin_pred = bin_out["pred"]
-        bin_probs = bin_out["probs"]
-        class_names_bin = self.bin_stage.class_names
-
-        # 估算 fall 機率 （優先找 "fall" 類別，沒有就取索引 1）
-        if "fall" in class_names_bin:
-            fall_idx = class_names_bin.index("fall")
-        else:
-            # 二元多半為 [non_fall, fall]
-            fall_idx = 1 if len(class_names_bin) >= 2 else 0
-        fall_score = float(bin_probs[fall_idx])
-
-        result_dict: Dict[str, Any] = {
-            "type": "inference",
-            "stage": "binary",
-            "binary": {
-                "class_names": class_names_bin,
-                "probs": bin_probs,
-                "pred_idx": bin_out["pred_idx"],
-                "pred": bin_pred,
-                "thr": FALL_DECISION_THR,
+            result_dict = {
+                "type": "inference",
+                "stage": "binary",
+                "binary": {
+                    "class_names": class_names_bin,
+                    "probs": bin_out["probs"],
+                    "pred_idx": bin_out["pred_idx"],
+                    "pred": bin_out["pred"],
+                    "thr": FALL_START_THR,
+                }
             }
-        }
 
-        # 若為非跌倒 → 嘗試 multi（需要 20 幀）
-        # 注意：這裡「不延後」等 20 幀，而是**如果當下 buffer 足夠**就一起回傳
-        if bin_pred != "fall":
-            buf = self.buffers[user_id]
-            if len(buf) >= MULTI_WINDOW and ((len(buf) % MULTI_STRIDE) == 0):
-                clip20 = list(buf)[-MULTI_WINDOW:]
-                parsed_mul = []
-                for rec in clip20:
-                    bbox, kps, img_w, img_h = _extract_basic_frame(rec)
-                    parsed_mul.append((bbox, kps, [], img_w, img_h))
+            # Multi 推論（若不是跌倒則進行多類別推論）
+            if bin_pred != "fall":
+                tail_id = clip_bin[-1].get("frame_id", None)
+                if tail_id is None or tail_id != self._last_multi_tail_frame_id[user_id]:
+                    parsed_mul = []
+                    for rec in clip_bin:
+                        bbox, kps, img_w, img_h = _extract_basic_frame(rec)
+                        parsed_mul.append((bbox, kps, [], img_w, img_h))
+                    mul_out = self.mul_stage.infer(parsed_mul)
+                    result_dict["stage"] = "multi"
+                    result_dict["multi"] = {
+                        "class_names": self.mul_stage.class_names,
+                        "probs": mul_out["probs"],
+                        "pred_idx": mul_out["pred_idx"],
+                        "pred": mul_out["pred"],
+                    }
+                    self._last_multi_tail_frame_id[user_id] = tail_id
 
-                # Kalman：用 bl 的 KF（與離線相容；若要改成 ml 的也可）
-                # ✅ 每段 window 開始前重置 Multi KF，避免跨片段汙染
-                # Kalman（改用內建 KF 實作）
-                if getattr(ml, "ENABLE_KALMAN", True):
-                    self.kf_multi.state = None
-                    self.kf_multi.covariance = None
-                    window_kps = [k for (_, k, _, _, _) in parsed_mul]
-                    half_len = getattr(ml, "HALF_LEN_OVERRIDE", None) or max(1, MULTI_WINDOW // 2)
+            print(f"user={user_id},predict={result_dict}")
+            await ws_manager.send(user_id, result_dict)
 
-                    # ✅ 用我們在類別內新增的 _kf_smooth（which="multi" 會走 self.kf_multi）
-                    smoothed = self._kf_smooth(
-                        window_kps,
-                        which="multi",
-                    )
-                    parsed_mul = [(bbox, smoothed[i], dets, w, h) for i, (bbox, _, dets, w, h) in enumerate(parsed_mul)]
+            # 更新狀態機
+            in_fall = self._in_fall[user_id]
+            start_hits = self._start_hits[user_id]
+            recover_hits = self._recover_hits[user_id]
+            peak_score = self._fall_peak[user_id]
 
-                dbg_cfg = RelationMapConfig(H=self.mul_stage.H, W=self.mul_stage.W,
-                            sigma_kp=float(getattr(ml, "SIGMA_KP", 2.0)),
-                            kp_conf_th=float(getattr(ml, "KP_CONF_TH", 0.4)),
-                            include_bone_lines=self.mul_stage.INCLUDE_BONE,
-                            object_classes=self.mul_stage.OBJECT_CLASSES,
-                            edges=list(getattr(ml, "COCO_EDGES", [])) if self.mul_stage.INCLUDE_BONE else [])
-                x_frames = [rasterize_frame(b, k, d, w, h, dbg_cfg) for (b, k, d, w, h) in parsed_mul]
-                print(f"[DEBUG][MULTI] x_sum={float(np.stack(x_frames).sum()):.3f}, T={len(x_frames)}")
-                
-                mul_out = self.mul_stage.infer(parsed_mul)
-                result_dict["stage"] = "multi"
-                result_dict["multi"] = {
-                    "class_names": self.mul_stage.class_names,
-                    "probs": mul_out["probs"],
-                    "pred_idx": mul_out["pred_idx"],
-                    "pred": mul_out["pred"],
-                }
+            if in_fall and fall_score > peak_score:
+                peak_score = fall_score
+                self._fall_peak[user_id] = peak_score
 
-        # 發送 WS 結果
-        await ws_manager.send(user_id, result_dict)
+            # 處理 fall_start 事件
+            if not in_fall:
+                if bin_pred == "fall" and fall_score >= FALL_START_THR:
+                    start_hits += 1
+                else:
+                    start_hits = 0
+                self._start_hits[user_id] = start_hits
 
-        buf = self.buffers[user_id]
-        for _ in range(BIN_STRIDE):
-            if buf:
-                buf.popleft()
-        
-        # 事件：跌倒開始（過門檻才觸發）
-        if (bin_pred == "fall") and (fall_score >= FALL_DECISION_THR):
-            if self.handlers.get("on_fall_start"):
-                clip_meta = {
-                    "start": clip_bin[0],
-                    "end": clip_bin[-1],
-                    "win": {"window": BIN_WINDOW, "stride": BIN_STRIDE},
-                }
-                try:
-                    await self.handlers["on_fall_start"](
-                        user_id=user_id,
-                        start_time=_now_str(),
-                        result=result_dict,
-                        clip=clip_meta,
-                    )
-                except Exception as e:
-                    print(f"[STREAM][HOOK][on_fall_start][ERROR] user={user_id} {e}")
+                if start_hits >= FALL_START_HITS:
+                    self._in_fall[user_id] = True
+                    self._recover_hits[user_id] = 0
+                    self._fall_peak[user_id] = fall_score
+                    start_time = _now_str()
+                    self._fall_start_ts[user_id] = start_time
 
-        # TODO（選配）：可在這裡做簡單「狀態機」：從 fall→non_fall 時觸發 on_fall_recover
-        self.state_bin_pred[user_id] = bin_pred
+                    clip_meta = {"start": clip_bin[0], "end": clip_bin[-1], "win": {"window": BIN_WINDOW, "stride": BIN_STRIDE}}
+                    if self.handlers.get("on_fall_start"):
+                        try:
+                            await self.handlers["on_fall_start"](
+                                user_id=user_id, start_time=start_time, result=result_dict, clip=clip_meta
+                            )
+                        except Exception as e:
+                            print(f"[STREAM][HOOK][on_fall_start][ERROR] user={user_id} {e}")
+
+            # 處理 fall_recover 事件
+            else:
+                if fall_score <= FALL_RECOVER_THR:
+                    recover_hits += 1
+                else:
+                    recover_hits = 0
+                self._recover_hits[user_id] = recover_hits
+
+                if recover_hits >= FALL_RECOVER_HITS:
+                    self._in_fall[user_id] = False
+                    self._start_hits[user_id] = 0
+                    self._recover_hits[user_id] = 0
+
+                    start_time = self._fall_start_ts.get(user_id)
+                    end_time = _now_str()
+                    peak = self._fall_peak[user_id]
+
+                    if self.handlers.get("on_fall_recover"):
+                        try:
+                            await self.handlers["on_fall_recover"](
+                                user_id=user_id,
+                                start_time=start_time,
+                                end_time=end_time,
+                                peak_score=float(peak) if peak is not None else None,
+                                result=result_dict,
+                                score=float(fall_score),
+                                reason="below_recover_threshold",
+                            )
+                        except Exception as e:
+                            print(f"[STREAM][HOOK][on_fall_recover][ERROR] user={user_id} {e}")
+
+                    self._fall_start_ts.pop(user_id, None)
+                    self._fall_peak[user_id] = 0.0
+
+            self.state_bin_pred[user_id] = bin_out["pred"]
 
     async def force_recover(self, user_id: str, reason: str = "manual"):
         """
         斷線或出錯時呼叫，清除該 user 狀態（以及必要時觸發 recover 事件）
         """
         try:
-            # 若當前記錄為 fall，可在此觸發 recover
-            if self.state_bin_pred.get(user_id) == "fall":
+            if self._in_fall.get(user_id, False):
                 if self.handlers.get("on_fall_recover"):
                     await self.handlers["on_fall_recover"](
                         user_id=user_id,
-                        start_time=None,
+                        start_time=self._fall_start_ts.get(user_id),
                         end_time=_now_str(),
-                        peak_score=None,
+                        peak_score=float(self._fall_peak.get(user_id, 0.0)),
                         result=None,
                         score=None,
                         reason=reason,
@@ -802,7 +743,12 @@ class StreamInferManager:
         except Exception as e:
             print(f"[STREAM][HOOK][on_fall_recover][ERROR] user={user_id} {e}")
 
-        # 清除狀態
+        self._in_fall[user_id] = False
+        self._start_hits[user_id] = 0
+        self._recover_hits[user_id] = 0
+        self._fall_start_ts.pop(user_id, None)
+        self._fall_peak[user_id] = 0.0
+
         if user_id in self.buffers:
             try:
                 del self.buffers[user_id]

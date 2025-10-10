@@ -42,7 +42,6 @@ class KalmanFilter:
             # 如果是第一次更新，直接初始化狀態
             self.state = np.array(measurement).flatten()
             self.covariance = np.eye(34)
-            print("Initializing Kalman filter state.")
             return self.state
 
         try:
