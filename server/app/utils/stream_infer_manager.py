@@ -482,9 +482,6 @@ class StreamInferManager:
         # 每個使用者的推論鎖，避免同一 user 併發執行 _run_two_stage 造成競態
         self._locks = defaultdict(asyncio.Lock)
 
-        # 去重：記住上次 multi 視窗的末幀 frame_id，避免同窗重算
-        self._last_multi_tail_frame_id = defaultdict(lambda: None)
-
         # 保留最近一次二元分類（若其他邏輯需要）
         self.state_bin_pred: Dict[str, str] = defaultdict(lambda: "non_fall")
 
@@ -497,6 +494,11 @@ class StreamInferManager:
         self._action_peak          = defaultdict(float)          # 目前動作期間最高分
         self._cand_action          = defaultdict(lambda: None)   # 切換候選動作
         self._cand_hits            = defaultdict(int)            # 候選動作連續命中次數
+
+        # 用 frame_seq 控 multi 去重＆觸發頻率
+        self._last_multi_tail_seq = defaultdict(lambda: None)
+        self._last_infer_tail_seq = defaultdict(lambda: None)
+        self._next_infer_tail_seq = defaultdict(lambda: None)
 
     def _load_models(self):
         self.bin_stage.load_weights(BIN_MODEL_PATH, BIN_CLASSES_PATH)
@@ -600,22 +602,42 @@ class StreamInferManager:
         if not kps:
             return
 
-        # 入 buffer（避免重複 frame_id）
+        # === 行動端已改為單調遞增：frame_seq 直接等於 frame_id ===
+        fid_raw = merged.get("frame_id")
+        try:
+            frame_seq = int(fid_raw) if fid_raw is not None else None
+        except Exception:
+            frame_seq = None
+        merged["frame_seq"] = frame_seq
+
+        # === 用 frame_seq 入 buffer（避免回捲造成的誤判重複）===
         buf = self.buffers[user_id]
-        if len(buf) == 0 or (buf[-1].get("frame_id") != merged.get("frame_id")):
+        if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
             buf.append(merged)
 
-        n = len(buf)
-        if (n >= BIN_WINDOW) and ((n % BIN_STRIDE) == 0):
+        # === 用 frame_seq 控制觸發頻率：尾序號每差滿 BIN_STRIDE（預設 5）就推一次 ===
+        tail_seq = buf[-1].get("frame_seq")
+        next_seq = self._next_infer_tail_seq[user_id]
+
+        # 初始化：第一次看到尾序號時，先把目標設在「當前尾序號」
+        if next_seq is None and tail_seq is not None:
+            self._next_infer_tail_seq[user_id] = int(tail_seq)
+            next_seq = self._next_infer_tail_seq[user_id]
+
+        if (len(buf) >= BIN_WINDOW) and (tail_seq is not None) and (next_seq is not None) and (int(tail_seq) >= int(next_seq)):
             try:
                 clip10 = list(buf)[-BIN_WINDOW:]
                 await self._run_two_stage(user_id, clip10)
+                # ★ 精準每 BIN_STRIDE 幀：下一次觸發要等到「這次尾序號 + BIN_STRIDE」
+                self._next_infer_tail_seq[user_id] = int(tail_seq) + BIN_STRIDE
             except Exception as e:
                 print(f"[STREAM][ERROR] user={user_id} run_two_stage: {e}")
 
-        # 清理已處理的 pending
+
+        # 清理已處理的 pending（保守）
         fid = merged.get("frame_id")
-        self._pending[user_id].pop(fid, None)
+        if fid is not None:
+            self._pending[user_id].pop(fid, None)
 
     async def _run_two_stage(self, user_id: str, clip_bin: List[Dict[str, Any]]):
         async with self._locks[user_id]:
@@ -646,8 +668,8 @@ class StreamInferManager:
 
             # Multi 推論（若不是跌倒則進行多類別推論）
             if bin_pred != "fall":
-                tail_id = clip_bin[-1].get("frame_id", None)
-                if tail_id is None or tail_id != self._last_multi_tail_frame_id[user_id]:
+                tail_seq = clip_bin[-1].get("frame_seq", None)
+                if tail_seq is None or tail_seq != self._last_multi_tail_seq[user_id]:
                     parsed_mul = []
                     for rec in clip_bin:
                         bbox, kps, img_w, img_h = _extract_basic_frame(rec)
@@ -662,7 +684,7 @@ class StreamInferManager:
                     }
                     # ★ 自動補 event_name（動作名稱）
                     result_dict["event_name"] = mul_out["pred"]
-                    self._last_multi_tail_frame_id[user_id] = tail_id
+                    self._last_multi_tail_seq[user_id] = tail_seq
 
                     # ===== 多動作狀態機（以 walk 測試，支援擴充）=====
                     try:
@@ -771,9 +793,14 @@ class StreamInferManager:
                         print(f"[STREAM][STATE_ACTION][ERROR] user={user_id} err={_e}")
 
 
-            head_id = clip_bin[0].get("frame_id") if clip_bin else None
-            tail_id = clip_bin[-1].get("frame_id") if clip_bin else None
-            print(f"user={user_id},frames={head_id}-{tail_id},predict={result_dict}")
+            # 取本次視窗的頭尾 frame_id 與單調序號 frame_seq（由 ingest() 填好）
+            head_id  = clip_bin[0].get("frame_id")  if clip_bin else None
+            tail_id  = clip_bin[-1].get("frame_id") if clip_bin else None
+            head_seq = clip_bin[0].get("frame_seq") if clip_bin else None
+            tail_seq = clip_bin[-1].get("frame_seq") if clip_bin else None
+
+            print(f"user={user_id},frames={head_id}-{tail_id},frames_seq={head_seq}-{tail_seq},predict={result_dict}")
+
             await ws_manager.send(user_id, result_dict)
 
             # 更新狀態機
@@ -911,6 +938,13 @@ class StreamInferManager:
                 del self.buffers[user_id]
             except Exception:
                 pass
+            
+        # 讓下一段從新節點重新對齊 STRIDE（保留）
+        self._last_infer_tail_seq[user_id] = None
+        self._last_multi_tail_seq[user_id] = None
+        self._next_infer_tail_seq[user_id] = None
+        self._pending[user_id].clear()
+
         self.state_bin_pred[user_id] = "non_fall"
         print(f"[STREAM] force_recover user={user_id} reason={reason}")
 
