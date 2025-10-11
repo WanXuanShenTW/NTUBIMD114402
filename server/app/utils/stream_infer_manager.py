@@ -51,6 +51,10 @@ FALL_RECOVER_THR   = float(os.getenv("SC_FALL_RECOVER_THR", 0.45))
 FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "2"))
 FALL_RECOVER_HITS  = int(os.getenv("SC_FALL_RECOVER_HITS", "2"))
 
+# ====== 多動作（multi）事件的門檻（針對 walk 測試，可擴充）======
+ACTION_START_THR   = float(os.getenv("SC_ACTION_START_THR", "0.60"))
+ACTION_START_HITS  = int(os.getenv("SC_ACTION_START_HITS", "2"))
+ENABLED_ACTIONS    = [s.strip() for s in os.getenv("SC_ENABLED_ACTIONS", "walk").split(",") if s.strip()]
 
 def _torch_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -486,6 +490,13 @@ class StreamInferManager:
 
         # ★ 新增：拆包聚合暫存（user_id -> frame_id -> partial dict）
         self._pending: Dict[str, Dict[Any, Dict[str, Any]]] = defaultdict(dict)
+        
+        # ===== 多動作狀態機（目前先針對 walk，通用寫法可擴充）=====
+        self._curr_action          = defaultdict(lambda: None)   # 目前穩定中的動作（event）
+        self._action_start_time    = {}                          # 動作開始時間
+        self._action_peak          = defaultdict(float)          # 目前動作期間最高分
+        self._cand_action          = defaultdict(lambda: None)   # 切換候選動作
+        self._cand_hits            = defaultdict(int)            # 候選動作連續命中次數
 
     def _load_models(self):
         self.bin_stage.load_weights(BIN_MODEL_PATH, BIN_CLASSES_PATH)
@@ -649,9 +660,120 @@ class StreamInferManager:
                         "pred_idx": mul_out["pred_idx"],
                         "pred": mul_out["pred"],
                     }
+                    # ★ 自動補 event_name（動作名稱）
+                    result_dict["event_name"] = mul_out["pred"]
                     self._last_multi_tail_frame_id[user_id] = tail_id
 
-            print(f"user={user_id},predict={result_dict}")
+                    # ===== 多動作狀態機（以 walk 測試，支援擴充）=====
+                    try:
+                        act_pred = mul_out["pred"]
+                        act_probs = mul_out["probs"]
+                        act_idx = int(mul_out["pred_idx"])
+                        act_prob = float(act_probs[act_idx])
+
+                        if act_pred in ENABLED_ACTIONS:
+                            curr = self._curr_action[user_id]
+                            cand = self._cand_action[user_id]
+                            hits = self._cand_hits[user_id]
+
+                            if curr is None:
+                                # 尚未有穩定中的動作：累積候選
+                                if act_prob >= ACTION_START_THR:
+                                    if cand == act_pred:
+                                        hits += 1
+                                    else:
+                                        cand = act_pred
+                                        hits = 1
+                                else:
+                                    cand = None
+                                    hits = 0
+
+                                # 啟動新動作
+                                if hits >= ACTION_START_HITS:
+                                    start_time = _now_str()
+                                    self._curr_action[user_id]       = cand
+                                    self._action_start_time[user_id] = start_time
+                                    self._action_peak[user_id]       = act_prob
+                                    self._cand_action[user_id]       = None
+                                    self._cand_hits[user_id]         = 0
+                                    if self.handlers.get("on_state_event_start"):
+                                        await self.handlers["on_state_event_start"](
+                                            user_id=user_id,
+                                            event_name=cand,
+                                            start_time=start_time,
+                                            peak_score=float(act_prob),
+                                            prev_action_name="none",
+                                            curr_action_name=cand,
+                                            payload=result_dict,
+                                        )
+                                else:
+                                    self._cand_action[user_id] = cand
+                                    self._cand_hits[user_id]   = hits
+
+                            else:
+                                # 目前已有動作 curr
+                                if act_pred == curr:
+                                    # 同一動作持續：更新峰值，清空候選
+                                    if act_prob > self._action_peak[user_id]:
+                                        self._action_peak[user_id] = act_prob
+                                    self._cand_action[user_id] = None
+                                    self._cand_hits[user_id]   = 0
+                                else:
+                                    # 嘗試切換：只有新動作達門檻且連續命中，才讓舊動作 recover & 新動作 start
+                                    if act_prob >= ACTION_START_THR:
+                                        if cand == act_pred:
+                                            hits += 1
+                                        else:
+                                            cand = act_pred
+                                            hits = 1
+                                    else:
+                                        cand = None
+                                        hits = 0
+
+                                    if hits >= ACTION_START_HITS:
+                                        # 先 recover 舊動作
+                                        prev = curr
+                                        prev_start = self._action_start_time.get(user_id)
+                                        prev_peak  = float(self._action_peak.get(user_id, 0.0))
+                                        end_time   = _now_str()
+                                        if self.handlers.get("on_state_event_recover"):
+                                            await self.handlers["on_state_event_recover"](
+                                                user_id=user_id,
+                                                event_name=prev,
+                                                start_time=prev_start,
+                                                end_time=end_time,
+                                                peak_score=prev_peak,
+                                                prev_action_name=prev,
+                                                curr_action_name=cand,
+                                                payload=result_dict,
+                                            )
+                                        # 再 start 新動作
+                                        self._curr_action[user_id]       = cand
+                                        self._action_start_time[user_id] = end_time
+                                        self._action_peak[user_id]       = act_prob
+                                        self._cand_action[user_id]       = None
+                                        self._cand_hits[user_id]         = 0
+                                        if self.handlers.get("on_state_event_start"):
+                                            await self.handlers["on_state_event_start"](
+                                                user_id=user_id,
+                                                event_name=cand,
+                                                start_time=end_time,
+                                                peak_score=float(act_prob),
+                                                prev_action_name=prev,
+                                                curr_action_name=cand,
+                                                payload=result_dict,
+                                            )
+                                    else:
+                                        self._cand_action[user_id] = cand
+                                        self._cand_hits[user_id]   = hits
+                    except Exception as _e:
+                        # 不干擾主流程：動作狀態機的錯誤只記 log
+                        print(f"[STREAM][STATE_ACTION][ERROR] user={user_id} err={_e}")
+
+
+            head_id = clip_bin[0].get("frame_id") if clip_bin else None
+            tail_id = clip_bin[-1].get("frame_id") if clip_bin else None
+            print(f"user={user_id},frames={head_id}-{tail_id},predict={result_dict}")
             await ws_manager.send(user_id, result_dict)
 
             # 更新狀態機
@@ -687,6 +809,32 @@ class StreamInferManager:
                             )
                         except Exception as e:
                             print(f"[STREAM][HOOK][on_fall_start][ERROR] user={user_id} {e}")
+
+                    # ★ 新增：若此時有正在進行的動作（如 walk），先把它 recover，curr 指向 fall
+                    try:
+                        curr_act = self._curr_action.get(user_id)
+                        if curr_act:
+                            prev_start = self._action_start_time.get(user_id)
+                            prev_peak  = float(self._action_peak.get(user_id, 0.0))
+                            if self.handlers.get("on_state_event_recover"):
+                                await self.handlers["on_state_event_recover"](
+                                    user_id=user_id,
+                                    event_name=curr_act,
+                                    start_time=prev_start,
+                                    end_time=start_time,
+                                    peak_score=prev_peak,
+                                    prev_action_name=curr_act,
+                                    curr_action_name="fall",
+                                    payload=result_dict,
+                                )
+                            # 清掉動作狀態
+                            self._curr_action[user_id] = None
+                            self._action_start_time.pop(user_id, None)
+                            self._action_peak[user_id] = 0.0
+                            self._cand_action[user_id] = None
+                            self._cand_hits[user_id]   = 0
+                    except Exception as _e:
+                        print(f"[STREAM][STATE_ACTION][ERROR] user={user_id} err={_e}")
 
             # 處理 fall_recover 事件
             else:
@@ -728,26 +876,35 @@ class StreamInferManager:
         """
         斷線或出錯時呼叫，清除該 user 狀態（以及必要時觸發 recover 事件）
         """
+        # ★ 新增：若有正在進行的動作，也補一個 recover
         try:
-            if self._in_fall.get(user_id, False):
-                if self.handlers.get("on_fall_recover"):
-                    await self.handlers["on_fall_recover"](
-                        user_id=user_id,
-                        start_time=self._fall_start_ts.get(user_id),
-                        end_time=_now_str(),
-                        peak_score=float(self._fall_peak.get(user_id, 0.0)),
-                        result=None,
-                        score=None,
-                        reason=reason,
-                    )
+            curr_act = self._curr_action.get(user_id)
+            if curr_act and self.handlers.get("on_state_event_recover"):
+                await self.handlers["on_state_event_recover"](
+                    user_id=user_id,
+                    event_name=curr_act,
+                    start_time=self._action_start_time.get(user_id),
+                    end_time=_now_str(),
+                    peak_score=float(self._action_peak.get(user_id, 0.0)),
+                    prev_action_name=curr_act,
+                    curr_action_name="none",
+                    payload=None,
+                )
         except Exception as e:
-            print(f"[STREAM][HOOK][on_fall_recover][ERROR] user={user_id} {e}")
+            print(f"[STREAM][HOOK][on_state_event_recover][ERROR] user={user_id} {e}")
 
+        # 清空 fall 與動作狀態
         self._in_fall[user_id] = False
         self._start_hits[user_id] = 0
         self._recover_hits[user_id] = 0
         self._fall_start_ts.pop(user_id, None)
         self._fall_peak[user_id] = 0.0
+
+        self._curr_action[user_id] = None
+        self._action_start_time.pop(user_id, None)
+        self._action_peak[user_id] = 0.0
+        self._cand_action[user_id] = None
+        self._cand_hits[user_id]   = 0
 
         if user_id in self.buffers:
             try:

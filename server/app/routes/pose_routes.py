@@ -66,8 +66,8 @@ async def on_fall_recover(
 
 async def on_state_event_start(user_id: str, event_name: str, start_time: str, peak_score: float,
                                prev_action_name: str, curr_action_name: str, payload: dict):
-    print("[STATE_START]", user_id, event_name, start_time, peak_score,
-          "prev=", prev_action_name, "curr=", curr_action_name)
+    print(f"[STATE_START] user={user_id} event={event_name} at {start_time} "
+          f"peak={peak_score:.3f} prev={prev_action_name} -> curr={curr_action_name}")
 
 async def on_state_event_recover(user_id: str, event_name: str, start_time: str, end_time: str,
                                  peak_score: float, prev_action_name: str, curr_action_name: str, payload: dict):
