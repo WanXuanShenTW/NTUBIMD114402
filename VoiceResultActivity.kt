@@ -18,6 +18,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.example.myapplication.core.Events
 
 class VoiceResultActivity : AppCompatActivity() {
 
@@ -32,9 +33,9 @@ class VoiceResultActivity : AppCompatActivity() {
     // 只顯示 partial 在 tvTyping，final 交給 ACTION_USER_UTTER
     private val sttReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != MainActivity.ACTION_STT_UPDATE) return
-            val text = intent.getStringExtra(MainActivity.EXTRA_STT_TEXT).orEmpty()
-            val isPartial = intent.getBooleanExtra(MainActivity.EXTRA_STT_IS_PARTIAL, false)
+            if (intent?.action != Events.ACTION_STT_UPDATE) return
+            val text = intent.getStringExtra(Events.EXTRA_STT_TEXT).orEmpty()
+            val isPartial = intent.getBooleanExtra(Events.EXTRA_STT_IS_PARTIAL, false)
             if (text.isBlank() || !isPartial) {
                 // 若空白或不是 partial，就隱藏「聽寫中」
                 tvTyping.text = ""
@@ -62,7 +63,7 @@ class VoiceResultActivity : AppCompatActivity() {
             if (intent == null) return
             val action = intent.action ?: return
 
-            val elderIdFromIntent = intent.getIntExtra(MainActivity.EXTRA_ELDER_ID, -1)
+            val elderIdFromIntent = intent.getIntExtra(Events.EXTRA_ELDER_ID, -1)
             val currentElderId = getSharedPreferences("app", Context.MODE_PRIVATE)
                 .getInt("elder_id", 1)
             if (elderIdFromIntent > 0 && elderIdFromIntent != currentElderId) {
@@ -71,17 +72,17 @@ class VoiceResultActivity : AppCompatActivity() {
 
             val ts = System.currentTimeMillis()
             val sessionId = run {
-                val sidInt = intent.getIntExtra(MainActivity.EXTRA_SESSION_ID, Int.MIN_VALUE)
+                val sidInt = intent.getIntExtra(Events.EXTRA_SESSION_ID, Int.MIN_VALUE)
                 if (sidInt != Int.MIN_VALUE) sidInt.toString()
-                else intent.getStringExtra(MainActivity.EXTRA_SESSION_ID).orEmpty()
+                else intent.getStringExtra(Events.EXTRA_SESSION_ID).orEmpty()
             }
 
             when (action) {
                 // ✅ 長輩 final：讀 STT 用的 key，不要再用 EXTRA_AI_TEXT
-                MainActivity.ACTION_USER_UTTER -> {
+                Events.ACTION_USER_UTTER -> {
                     val text =
-                        intent.getStringExtra(MainActivity.EXTRA_STT_TEXT)
-                            ?: intent.getStringExtra(MainActivity.EXTRA_AI_TEXT)
+                        intent.getStringExtra(Events.EXTRA_STT_TEXT)
+                            ?: intent.getStringExtra(Events.EXTRA_AI_TEXT)
                             ?: ""
 
                     // 收到 final 時，隱藏「聽寫中」
@@ -94,8 +95,8 @@ class VoiceResultActivity : AppCompatActivity() {
                     }
                 }
 
-                MainActivity.ACTION_AI_REPLY -> {
-                    val text = intent.getStringExtra(MainActivity.EXTRA_AI_TEXT).orEmpty()
+                Events.ACTION_AI_REPLY -> {
+                    val text = intent.getStringExtra(Events.EXTRA_AI_TEXT).orEmpty()
                     // 即使只有播語音也記一條（文字空就顯示「（AI 曾播放語音回覆）」）
                     val displayText = text.ifBlank { "（AI 曾播放語音回覆）" }
                     addMessage(ChatMessage(ts, Sender.AI, displayText, sessionId))
@@ -161,14 +162,14 @@ class VoiceResultActivity : AppCompatActivity() {
         ContextCompat.registerReceiver(
             this,
             sttReceiver,
-            IntentFilter(MainActivity.ACTION_STT_UPDATE),
+            IntentFilter(Events.ACTION_STT_UPDATE),
             null, null,
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
         val chatFilter = IntentFilter().apply {
-            addAction(MainActivity.ACTION_USER_UTTER)
-            addAction(MainActivity.ACTION_AI_REPLY)
+            addAction(Events.ACTION_USER_UTTER)
+            addAction(Events.ACTION_AI_REPLY)
         }
         ContextCompat.registerReceiver(
             this,

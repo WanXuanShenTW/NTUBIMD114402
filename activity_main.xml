@@ -9,6 +9,7 @@
     android:theme="@style/ThemeOverlay.CameraDetect.NoPurple">
 
     <!-- 鏡頭畫面 + 繪圖覆蓋層 -->
+    <!-- cameraFrame：把邊距都設 0，並且 bottom 已貼齊 parent -->
     <FrameLayout
         android:id="@+id/cameraFrame"
         android:layout_width="0dp"
@@ -16,210 +17,217 @@
         app:layout_constraintTop_toTopOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintBottom_toTopOf="@+id/fpsRow"
-        android:layout_marginStart="16dp"
-        android:layout_marginEnd="16dp"
-        android:layout_marginTop="16dp">
+        app:layout_constraintBottom_toBottomOf="parent"
+        android:clipToPadding="true"
+        android:layout_marginStart="0dp"
+        android:layout_marginEnd="0dp"
+        android:layout_marginTop="0dp"
+        android:layout_marginBottom="0dp">
 
         <androidx.camera.view.PreviewView
             android:id="@+id/previewView"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:keepScreenOn="true"
-            app:scaleType="fitCenter" />
+            app:scaleType="fillCenter" />
 
         <View
-            android:id="@+id/overlayView"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
+        android:id="@+id/overlayView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@android:color/transparent"
+        android:clickable="false"
+        android:focusable="false" />
+
+    <TextView
+        android:id="@+id/statusText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="8dp"
+        android:layout_marginTop="4dp"
+        android:paddingStart="8dp"
+        android:paddingTop="4dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="8dp"
+        android:text="狀態：待機中"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp" />
+
+    <TextView
+        android:id="@+id/inferenceStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="19dp"
+        android:layout_marginEnd="50dp"
+        android:paddingStart="8dp"
+        android:paddingEnd="8dp"
+        android:paddingBottom="4dp"
+        android:text="推論結果"
+        android:textColor="#FFFFFF"
+        android:textSize="14sp"
+        android:elevation="12dp" />
+
+    <FrameLayout
+        android:id="@+id/voiceOverlay"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|end"
+        android:layout_marginEnd="50dp"
+        android:layout_marginBottom="8dp"
+        android:elevation="8dp">
+
+        <ImageButton
+            android:id="@+id/saveVoiceButton"
+            android:layout_width="44dp"
+            android:layout_height="44dp"
+            android:layout_marginBottom="-8dp"
+            android:padding="8dp"
             android:background="@android:color/transparent"
-            android:clickable="false"
-            android:focusable="false" />
-
-        <TextView
-            android:id="@+id/statusText"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="bottom|start"
-            android:layout_marginStart="5dp"
-            android:layout_marginTop="4dp"
-            android:paddingStart="8dp"
-            android:paddingTop="4dp"
-            android:paddingEnd="8dp"
-            android:paddingBottom="8dp"
-            android:text="狀態：待機中"
-            android:textColor="#FFFFFF"
-            android:textSize="15sp" />
-
-        <TextView
-            android:id="@+id/inferenceStatus"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="top|end"
-            android:layout_marginTop="8dp"
-            android:layout_marginStart="30dp"
-            android:paddingStart="8dp"
-            android:paddingEnd="8dp"
-            android:paddingBottom="4dp"
-            android:text="推論結果"
-            android:textColor="#FFFFFF"
-            android:textSize="14sp"
-            android:elevation="12dp" />
-
-        <FrameLayout
-            android:id="@+id/voiceOverlay"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_gravity="bottom|end"
-            android:layout_marginEnd="4dp"
-            android:layout_marginBottom="8dp"
-            android:elevation="8dp">
-
-            <ImageButton
-                android:id="@+id/saveVoiceButton"
-                android:layout_width="44dp"
-                android:layout_height="44dp"
-                android:layout_marginBottom="-12dp"
-                android:padding="8dp"
-                android:background="@android:color/transparent"
-                android:src="@drawable/ic_mic_white"
-                android:scaleType="centerInside"
-                app:tint="#FFFFFF"
-                android:contentDescription="錄製聲音 / 啟動語音"/>
-        </FrameLayout>
+            android:src="@drawable/ic_mic_white"
+            android:scaleType="centerInside"
+            app:tint="#FFFFFF"
+            android:contentDescription="錄製聲音 / 啟動語音"/>
     </FrameLayout>
+</FrameLayout>
 
-    <!-- FPS 控制列 -->
-    <LinearLayout
-        android:id="@+id/fpsRow"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center_vertical"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp"
-        android:layout_marginTop="12dp"
-        app:layout_constraintTop_toBottomOf="@id/cameraFrame"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+    <!-- FPS 控制列（隱藏） -->
+<LinearLayout
+android:id="@+id/fpsRow"
+android:layout_width="0dp"
+android:layout_height="wrap_content"
+android:orientation="horizontal"
+android:gravity="center_vertical"
+android:paddingStart="16dp"
+android:paddingEnd="16dp"
+android:layout_marginTop="12dp"
+app:layout_constraintTop_toBottomOf="@id/cameraFrame"
+app:layout_constraintStart_toStartOf="parent"
+app:layout_constraintEnd_toEndOf="parent"
+android:visibility="gone">
 
-        <TextView
-            android:id="@+id/tvFpsLabel"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="擷取幀率"
-            android:textSize="16sp" />
+<TextView
+    android:id="@+id/tvFpsLabel"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:text="擷取幀率"
+    android:textSize="16sp" />
 
-        <SeekBar
-            android:id="@+id/seekFps"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="12dp"
-            android:layout_marginEnd="12dp"
-            android:layout_weight="1"
-            android:max="30"
-            android:progress="10" />
+<SeekBar
+    android:id="@+id/seekFps"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:layout_marginStart="12dp"
+    android:layout_marginEnd="12dp"
+    android:layout_weight="1"
+    android:max="30"
+    android:progress="10" />
 
-        <TextView
-            android:id="@+id/tvFpsValue"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="10 fps"
-            android:textStyle="bold"
-            android:textSize="16sp" />
-    </LinearLayout>
+<TextView
+    android:id="@+id/tvFpsValue"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:text="10 fps"
+    android:textStyle="bold"
+    android:textSize="16sp" />
+</LinearLayout>
 
-    <!-- 開始/停止 + 顯示框 開關 -->
-    <LinearLayout
-        android:id="@+id/controlsRow"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp"
-        android:layout_marginTop="8dp"
-        app:layout_constraintTop_toBottomOf="@id/fpsRow"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent">
+    <!-- 開始/停止 + 顯示框 開關（隱藏） -->
+<LinearLayout
+    android:id="@+id/controlsRow"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center"
+    android:paddingStart="16dp"
+    android:paddingEnd="16dp"
+    android:layout_marginTop="8dp"
+    app:layout_constraintTop_toBottomOf="@id/fpsRow"
+    app:layout_constraintStart_toStartOf="parent"
+    app:layout_constraintEnd_toEndOf="parent"
+    android:visibility="gone">
 
-        <Button
-            android:id="@+id/btnStartInfer"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="開始持續推論" />
+<Button
+    android:id="@+id/btnStartInfer"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:layout_weight="1"
+    android:text="開始持續推論" />
 
-        <Space
-            android:layout_width="12dp"
-            android:layout_height="wrap_content" />
+<Space
+    android:layout_width="12dp"
+    android:layout_height="wrap_content" />
 
-        <Button
-            android:id="@+id/btnStopInfer"
-            android:layout_width="0dp"
-            android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="停止持續推論" />
+<Button
+    android:id="@+id/btnStopInfer"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:layout_weight="1"
+    android:text="停止持續推論" />
 
-        <androidx.appcompat.widget.SwitchCompat
-            android:id="@+id/switchRenderBoxes"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginStart="12dp"
-            android:text="顯示框"
-            android:checked="true" />
-    </LinearLayout>
+<androidx.appcompat.widget.SwitchCompat
+    android:id="@+id/switchRenderBoxes"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:layout_marginStart="12dp"
+    android:text="顯示框"
+    android:checked="true" />
+</LinearLayout>
 
-    <LinearLayout
-        android:id="@+id/detectSwitchRow"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:gravity="center"
-        android:paddingStart="16dp"
-        android:paddingEnd="16dp"
-        android:layout_marginTop="6dp"
-        app:layout_constraintTop_toBottomOf="@id/controlsRow"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintBottom_toTopOf="@+id/btnBackToImage">
+    <!-- 偵測開關列（隱藏） -->
+<LinearLayout
+    android:id="@+id/detectSwitchRow"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:orientation="horizontal"
+    android:gravity="center"
+    android:paddingStart="16dp"
+    android:paddingEnd="16dp"
+    android:layout_marginTop="6dp"
+    app:layout_constraintTop_toBottomOf="@id/controlsRow"
+    app:layout_constraintStart_toStartOf="parent"
+    app:layout_constraintEnd_toEndOf="parent"
+    app:layout_constraintBottom_toTopOf="@+id/btnBackToImage"
+    android:visibility="gone">
 
-        <androidx.appcompat.widget.SwitchCompat
-            android:id="@+id/switchObjectDetect"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="物件偵測"
-            android:checked="true" />
+<androidx.appcompat.widget.SwitchCompat
+    android:id="@+id/switchObjectDetect"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:text="物件偵測"
+    android:checked="true" />
 
-        <Space android:layout_width="24dp" android:layout_height="wrap_content" />
+<Space android:layout_width="24dp" android:layout_height="wrap_content" />
 
-        <androidx.appcompat.widget.SwitchCompat
-            android:id="@+id/switchPoseDetect"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="骨架偵測"
-            android:checked="false" />
+<androidx.appcompat.widget.SwitchCompat
+    android:id="@+id/switchPoseDetect"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:text="骨架偵測"
+    android:checked="false" />
 
-        <Space android:layout_width="24dp" android:layout_height="wrap_content" />
+<Space android:layout_width="24dp" android:layout_height="wrap_content" />
 
-        <!-- 是否傳送 WS -->
-        <androidx.appcompat.widget.SwitchCompat
-            android:id="@+id/switchSendWs"
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="傳送WS"
-            android:checked="false" />
-    </LinearLayout>
+<!-- 是否傳送 WS -->
+<androidx.appcompat.widget.SwitchCompat
+    android:id="@+id/switchSendWs"
+    android:layout_width="wrap_content"
+    android:layout_height="wrap_content"
+    android:text="傳送WS"
+    android:checked="false" />
+</LinearLayout>
 
-    <!-- 回主頁 -->
-    <Button
-        android:id="@+id/btnBackToImage"
-        android:layout_width="0dp"
-        android:layout_height="wrap_content"
-        android:text="返回主頁面"
-        android:layout_margin="16dp"
-        app:layout_constraintStart_toStartOf="parent"
-        app:layout_constraintEnd_toEndOf="parent"
-        app:layout_constraintBottom_toBottomOf="parent"/>
+    <!-- 回主頁（隱藏） -->
+<Button
+    android:id="@+id/btnBackToImage"
+    android:layout_width="0dp"
+    android:layout_height="wrap_content"
+    android:text="返回主頁面"
+    android:layout_margin="16dp"
+    app:layout_constraintStart_toStartOf="parent"
+    app:layout_constraintEnd_toEndOf="parent"
+    app:layout_constraintBottom_toBottomOf="parent"
+    android:visibility="gone"/>
 
-</androidx.constraintlayout.widget.ConstraintLayout>
+    </androidx.constraintlayout.widget.ConstraintLayout>

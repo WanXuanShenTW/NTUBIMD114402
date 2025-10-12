@@ -1,54 +1,53 @@
 package com.example.myapplication
 
+import android.Manifest
+import android.content.*
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.os.Build
-import android.os.Bundle
-import android.os.SystemClock
+import android.graphics.Paint
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaPlayer
+import android.media.MediaRecorder
+import android.os.*
+import android.speech.RecognitionListener
+import android.speech.RecognitionService
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.util.Base64
 import android.util.Log
+import android.view.Gravity
+import android.view.Surface
 import android.view.View
 import android.widget.*
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.appcompat.widget.SwitchCompat
-import androidx.camera.core.*
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.updateLayoutParams
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.*
 import java.nio.ByteBuffer
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.min
-import org.json.JSONArray
-import org.json.JSONObject
-import android.view.Surface
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaPlayer
-import android.media.MediaRecorder
-import android.speech.SpeechRecognizer
-import android.speech.RecognizerIntent
-import android.speech.RecognitionListener
-import android.os.Handler
-import android.os.Looper
-import android.content.Intent
-import android.content.ComponentName
-import android.speech.RecognitionService
-import android.media.AudioManager
-import java.io.*
-import androidx.appcompat.app.AlertDialog
-import android.content.Context
-import android.Manifest
 import kotlin.concurrent.thread
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.graphics.Paint
-import android.view.Gravity
-import androidx.core.view.updateLayoutParams
-import android.widget.FrameLayout
+import kotlin.math.min
 import kotlin.math.roundToInt
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import com.example.myapplication.bridge.VoiceBridge
 import android.content.IntentFilter
-import android.util.Base64
+import com.example.myapplication.core.Events
 
 
 class MainActivity : AppCompatActivity() {
@@ -96,6 +95,9 @@ class MainActivity : AppCompatActivity() {
     private var senderRunnable: Runnable? = null
     private var senderThread: android.os.HandlerThread? = null
 
+    private val elderId: String by lazy { loadElderId() }            // 這支機器正在偵測的長者 ID
+    private val targetCaregiverUserId: String by lazy { loadCareId() } // 要把文字推送給哪位照護者的 user_id
+
     @Volatile private var lastFrameW: Int = 0
     @Volatile private var lastFrameH: Int = 0
 
@@ -129,9 +131,10 @@ class MainActivity : AppCompatActivity() {
     private val poseDetector = PoseDetector()
 
     private lateinit var ws: WsManager
-    private var frameId: Long = 0
+    private val frameSeq = java.util.concurrent.atomic.AtomicLong(0L)
     // 把你的 WS 位址換成實際值（支援 ws:// 或 wss://）
-    private val WS_URL = "wss://c85191513766.ngrok-free.app/ws/pose?user_id=1"
+    private val WS_URL = "wss://cd9d32eacfea.ngrok-free.app/ws/pose?user_id=1"
+    private fun nextFrameId(): Long = frameSeq.incrementAndGet()
 
     private lateinit var switchSendWs: SwitchCompat
     @Volatile private var sendWsEnabled = false
@@ -152,6 +155,8 @@ class MainActivity : AppCompatActivity() {
     // 開關：執行哪種偵測
     @Volatile private var objectDetectEnabled = true
     @Volatile private var poseDetectEnabled = false
+    private var preview: Preview? = null
+    private var orientationListener: android.view.OrientationEventListener? = null
 
     // === 語音 / STT ===
     private lateinit var headerOverlay: View
@@ -168,7 +173,7 @@ class MainActivity : AppCompatActivity() {
     // === STT / Session 控制 ===
     private var currentSessionId: Int = 0
     private var sessionIdleDeadlineMs: Long = 0L
-    private val SESSION_GAP_MS = 300_000L  // 10秒沒說話就換新 session
+    private val SESSION_GAP_MS = 300_000L
 
     private val sessionIdleReset = Runnable {
         currentSessionId = 0
@@ -221,9 +226,9 @@ class MainActivity : AppCompatActivity() {
     private var ttsPlayer: MediaPlayer? = null
 
 
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Events.init(applicationContext)
         setContentView(R.layout.activity_main)
 
         // 綁定 View
@@ -238,6 +243,11 @@ class MainActivity : AppCompatActivity() {
         switchObjectDetect = findViewById(R.id.switchObjectDetect)
         switchPoseDetect   = findViewById(R.id.switchPoseDetect)
         switchSendWs       = findViewById(R.id.switchSendWs)
+
+        switchPoseDetect.isChecked = true
+        switchObjectDetect.isChecked = true
+        poseDetectEnabled   = true
+        objectDetectEnabled = true
 
         classes = readClasses()
         recordVoiceButton = findViewById(R.id.saveVoiceButton)
@@ -254,47 +264,24 @@ class MainActivity : AppCompatActivity() {
         objSession  = ortEnv.createSession(readRawModel(R.raw.yolov8n), ai.onnxruntime.OrtSession.SessionOptions())
         poseSession = ortEnv.createSession(readRawModel(R.raw.yolov8n_pose), ai.onnxruntime.OrtSession.SessionOptions())
 
-        // 語音按鈕
-        recordVoiceButton.setOnClickListener {
-            if (hasRegisteredElder()) {
-                Toast.makeText(this, "已註冊：長按可重置", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
-            }
-            if (!isVoiceRecording) {
-                isVoiceRecording = true
-                setRegisteringUI(true)
-                recordAndShowDialog {
-                    isVoiceRecording = false
-                    updateStatus("錄音完成，請確認聲音樣本")
-                    setRegisteringUI(false)
-                }
-            }
-        }
-
-        setRegisteredUI(hasRegisteredElder())
-
-        // 權限：相機（單獨處理）
         if (hasCameraPermission()) {
             startCamera()
         } else {
             ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.CAMERA),
-                CAMERA_PERMISSION_CODE
+                this, arrayOf(Manifest.permission.CAMERA), CAMERA_PERMISSION_CODE
             )
         }
 
-        // 權限：麥克風（單獨處理）
         if (hasAudioPermission()) {
             initStt()
             startSttIfPermitted()
         } else {
             ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                MIC_PERMISSION_CODE
+                this, arrayOf(Manifest.permission.RECORD_AUDIO), MIC_PERMISSION_CODE
             )
         }
+
+        setRegisteredUI(hasRegisteredElder())
 
         // FPS SeekBar（1~30，預設10）
         seekFps.max = 30
@@ -366,10 +353,11 @@ class MainActivity : AppCompatActivity() {
                         onState = { ok, err ->
                             if (!ok) {
                                 Log.w(TAG, "WS connect failed: $err")
-                                // 若使用者仍要求「開」→ 延遲重連
                                 if (sendWsEnabled) uiHandler.postDelayed({ connectOnce() }, 1500)
                             } else {
-                                Log.i(TAG, "WS connected")
+                                // 連線成功 → 重置序列（下一幀送出會是 1）
+                                frameSeq.set(0L)
+                                Log.i(TAG, "WS connected (frame_id will start from 1 on next send)")
                             }
                         },
                         onMessage = { msg -> handleServerMessage(msg) }
@@ -421,6 +409,7 @@ class MainActivity : AppCompatActivity() {
 
                 if (camOk) {
                     startCamera()
+                    startDetectionIfReady()
                 } else {
                     Toast.makeText(this, "未授權相機，無法開啟預覽", Toast.LENGTH_SHORT).show()
                     finish()
@@ -459,16 +448,20 @@ class MainActivity : AppCompatActivity() {
             try {
                 cameraProvider = cameraProviderFuture.get()
 
-                val preview = Preview.Builder().build().also {
-                    it.setSurfaceProvider(previewView.surfaceProvider)
-                }
+                val rotation = safeRotation()
+
+                preview = Preview.Builder()
+                    .setTargetRotation(rotation)
+                    .build().also {
+                        it.setSurfaceProvider(previewView.surfaceProvider)
+                    }
 
                 val selector = CameraSelector.DEFAULT_BACK_CAMERA
 
                 imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .setTargetRotation(safeRotation())
+                    .setTargetRotation(rotation)
                     .build().apply {
                         setAnalyzer(cameraExecutor) { imageProxy -> analyzeFrame(imageProxy) }
                     }
@@ -559,6 +552,44 @@ class MainActivity : AppCompatActivity() {
             onAiSpeakingDone()
             onError?.invoke(e)
         }
+    }
+
+    private fun loadElderId(): String {
+        val sp = getSharedPreferences("app", MODE_PRIVATE)
+        val id = sp.getInt("elder_id", 1)   // 你的 app 之前就有用 SP 存 user_id/elder_id
+        return id.toString()
+    }
+
+    /** 從 SharedPreferences 讀要接收的照護者 user_id，沒有就用 3（測試用） */
+    private fun loadCareId(): String {
+        val sp = getSharedPreferences("app", MODE_PRIVATE)
+        val id = sp.getInt("caregiver_user_id", 3)
+        return id.toString()
+    }
+
+    private fun onSttReady(text: String) {
+        lifecycleScope.launch {
+            VoiceBridge.publishStt(elderId, targetCaregiverUserId, text)
+        }
+    }
+
+    private fun startDetectionIfReady() {
+        // 有相機權限才啟動
+        if (!hasCameraPermission()) return
+        // 已在跑就別重複
+        if (allowProcess) return
+
+        lastPoseSendAt = 0L
+        lastDetectSendAt = 0L
+        allowProcess = true
+        lastProcessTimeMs = 0L
+
+        // 若 WS 尚未連線，勾選開關會自動連線 + 啟動 sender loop
+        if (!sendWsEnabled) {
+            switchSendWs.post { switchSendWs.isChecked = true }
+        }
+        // 想要提示可以保留，或拿掉
+        Toast.makeText(this, "自動開始以 $targetFps fps 擷取幀", Toast.LENGTH_SHORT).show()
     }
 
     /** 如果超過 SESSION_GAP_MS 沒說話，就產生新 session，否則沿用舊的 */
@@ -692,15 +723,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-
     private fun broadcastStt(text: String, partial: Boolean) {
         if (text.isBlank()) return
-        val intent = Intent(ACTION_STT_UPDATE).apply {
-            setPackage(packageName)
-            putExtra(EXTRA_STT_TEXT, text)
-            putExtra(EXTRA_STT_IS_PARTIAL, partial)
-        }
-        sendBroadcast(intent)
+        Events.sttUpdate(text = text, isPartial = partial)
     }
 
     // ===== UI & 狀態 =====
@@ -860,18 +885,16 @@ class MainActivity : AppCompatActivity() {
                     sttLastPartial = ""
                     broadcastStt(text, false)
                     appendTranscript(text, "final")
+
+                    // ✅ 這行是關鍵：把最終文字丟到 caregiver（透過 Supabase Realtime）
+                    onSttReady(text)   // ←←← 新增這行
+
                     val sessionId = ensureSessionId()
                     val elderId = getSharedPreferences("app", Context.MODE_PRIVATE).getInt("elder_id", 1)
 
                     Log.i(TAG_STT_FINAL, "sid=$sessionId elder=$elderId text=$text")
 
-                    val userMsg = Intent(ACTION_USER_UTTER).apply {
-                        setPackage(packageName)
-                        putExtra(EXTRA_ELDER_ID, elderId)
-                        putExtra(EXTRA_SESSION_ID, sessionId)
-                        putExtra(EXTRA_AI_TEXT, text)
-                    }
-                    sendBroadcast(userMsg)
+                    Events.userUtter(elderId = elderId, sessionId = sessionId, text = text)
 
                     N8nSender.sendElderVoiceAndSpeak(this@MainActivity, text, sessionId)
 
@@ -1533,6 +1556,12 @@ class MainActivity : AppCompatActivity() {
         return r
     }
 
+    private fun updateUseCaseRotation() {
+        val r = safeRotation()
+        preview?.targetRotation = r
+        imageAnalysis?.targetRotation = r
+    }
+
     private fun recordPcmFromMonitor(durationMs: Long, sampleRate: Int): ByteArray {
         val r = ensureMonitorRecorder(sampleRate) ?: return ByteArray(0)
         val bytesToRead = ((sampleRate * durationMs) / 1000L * 2L).toInt()
@@ -1758,8 +1787,8 @@ class MainActivity : AppCompatActivity() {
         if (!hasAudioPermission()) {
             ActivityCompat.requestPermissions(
                 this,
-                arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA),
-                CAMERA_PERMISSION_CODE
+                arrayOf(Manifest.permission.RECORD_AUDIO),
+                MIC_PERMISSION_CODE
             )
             Toast.makeText(this, "請先允許麥克風權限再進行錄音", Toast.LENGTH_SHORT).show()
             return
@@ -2084,81 +2113,126 @@ class MainActivity : AppCompatActivity() {
         if (isVoiceRecording) return
 
         if (registered) {
+            // 已註冊：打勾圖示、點一下提示、長按刪除
             recordVoiceButton.setImageResource(R.drawable.ic_mic_registered)
-            recordVoiceButton.setBackgroundResource(android.R.color.transparent)
-            recordVoiceButton.background = null
             recordVoiceButton.isEnabled = true
+            recordVoiceButton.background = null
 
+            recordVoiceButton.setOnClickListener {
+                Toast.makeText(this, "已註冊：長按按鈕可刪除後再重錄", Toast.LENGTH_SHORT).show()
+            }
             recordVoiceButton.isLongClickable = true
             recordVoiceButton.setOnLongClickListener {
                 AlertDialog.Builder(this)
                     .setTitle("重置長輩聲音")
-                    .setMessage("確定要清除已註冊的聲紋嗎？")
-                    .setPositiveButton("清除") { _, _ -> resetRegistration() }
+                    .setMessage("確定要清除已註冊的聲紋嗎？清除後才能重新錄音。")
+                    .setPositiveButton("清除") { _, _ ->
+                        resetRegistration()
+                    }
                     .setNegativeButton("取消", null)
                     .show()
                 true
             }
 
-            if (sttLoopEnabled) {
-                updateStatus("辨識中…")
-            } else {
+            if (sttLoopEnabled) updateStatus("辨識中…")
+            else {
                 updateStatus("已註冊，待機中")
                 if (!monitorShouldRun) startBackgroundVoiceMonitor()
             }
+
         } else {
+            // 未註冊：麥克風圖示、點一下即可開始註冊；長按不綁
             recordVoiceButton.setImageResource(R.drawable.ic_mic_white)
-            recordVoiceButton.setBackgroundResource(android.R.color.transparent)
             recordVoiceButton.isEnabled = true
+            recordVoiceButton.background = null
+
+            recordVoiceButton.setOnLongClickListener(null)
+            recordVoiceButton.setOnClickListener {
+                if (!isVoiceRecording) {
+                    isVoiceRecording = true
+                    setRegisteringUI(true)
+                    recordAndShowDialog {
+                        isVoiceRecording = false
+                        updateStatus("錄音完成，請確認聲音樣本")
+                        setRegisteringUI(false)
+                    }
+                }
+            }
+
             updateStatus("請先註冊聲音")
             stopBackgroundVoiceMonitor()
-
-            recordVoiceButton.isLongClickable = false
-            recordVoiceButton.setOnLongClickListener(null)
         }
     }
 
-    // 一鍵重置：清除已註冊聲紋與狀態
     private fun resetRegistration() {
-        try {
-            val f1 = File(getExternalFilesDir(null), "elder_embedding.vec")
-            if (f1.exists()) f1.delete()
-        } catch (e: Exception) {
-            Log.e("CameraDetectActivity", "刪除外部聲紋檔案失敗", e)
-        }
-        try {
-            val f2 = File(filesDir, "elder_embedding.vec")
-            if (f2.exists()) f2.delete()
-        } catch (e: Exception) {
-            Log.e("CameraDetectActivity", "刪除內部聲紋檔案失敗", e)
-        }
-
+        // 停 STT/監聽並釋放 MIC
+        try { stt?.stopListening() } catch (_: Exception) {}
+        try { stt?.cancel() } catch (_: Exception) {}
+        if (sttLoopEnabled) stopSttLoop()
         stopBackgroundVoiceMonitor()
+        forceReleaseMic()
+
+        // 刪聲紋檔（內外存）
+        fun deleteQuietly(f: File?) {
+            if (f == null) return
+            runCatching { if (f.exists()) f.delete() }
+                .onFailure { e -> Log.e("MainActivity", "刪除檔案失敗: ${f.absolutePath}", e) }
+        }
+        deleteQuietly(File(getExternalFilesDir(null), "elder_embedding.vec"))
+        deleteQuietly(File(filesDir,                 "elder_embedding.vec"))
+
+        // 清記憶體狀態
         previousEmbedding = null
         currentSegment.clear()
+        sttEmitAllowed = false
+        sttGateDeadline = 0L
+        lastElderAt = 0L
+
+        // 回未註冊並提示
         setRegisteredUI(false)
+        updateStatus("請先註冊聲音")
         Toast.makeText(this, "已重置為未註冊狀態", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        val rot = safeRotation()
+        imageAnalysis?.targetRotation = rot
+        preview?.targetRotation = rot
     }
 
     override fun onResume() {
         super.onResume()
-        // 恢復註冊狀態（會自動決定是否開背景監聽）
-        setRegisteredUI(hasRegisteredElder())
 
-        // 有麥克風權限，且目前沒在跑 → 啟動 STT
+        // 旋轉同步：橫直切換/回前景都更新 targetRotation
+        val rot = safeRotation()
+        imageAnalysis?.targetRotation = rot
+        preview?.targetRotation = rot
+
+        // 預覽對齊方式：維持 FillCenter（CenterCrop）
+        try {
+            if (previewView.scaleType != PreviewView.ScaleType.FILL_CENTER) {
+                previewView.scaleType = PreviewView.ScaleType.FILL_CENTER
+            }
+        } catch (_: Throwable) { /* ignore */ }
+
+        // 原本流程
+        setRegisteredUI(hasRegisteredElder())
         if (hasAudioPermission() && !sttLoopEnabled && !isSttRunning) {
             startSttIfPermitted()
         }
+        startDetectionIfReady()
     }
 
     override fun onPause() {
         super.onPause()
+        orientationListener?.disable()
 
-        // 影像推論暫停即可，不影響 WS
+        // —— 影像偵測：停 —— //
         allowProcess = false
         lastProcessTimeMs = 0L
 
-        // 語音暫停（這段與連線無關）
+        // —— 語音：停 —— //
         sttEmitAllowed = false
         sttGateDeadline = 0L
         runCatching { stt?.stopListening() }
@@ -2166,13 +2240,23 @@ class MainActivity : AppCompatActivity() {
         if (sttLoopEnabled) stopSttLoop()
         stopBackgroundVoiceMonitor()
 
-        // ❗️關鍵：如果目前「正在偵測」（sendWsEnabled=true），不要動 WS；保留 sender loop 以便送 ping。
-        // 只有在沒有偵測時才把 WS 關掉。
-        if (!sendWsEnabled) {
+        // —— 播放：停（避免背景繼續播 TTS）—— //
+        try { ttsPlayer?.setOnCompletionListener(null) } catch (_: Exception) {}
+        try { ttsPlayer?.stop() } catch (_: Exception) {}
+        try { ttsPlayer?.release() } catch (_: Exception) {}
+        ttsPlayer = null
+        aiSpeaking = false
+
+        // —— WS 與 Sender loop：一律關 —— //
+        // 用開關把它關閉，會觸發你的 onCheckedChangeListener 裡的 stopSenderLoop() + ws.close()
+        if (sendWsEnabled) {
+            switchSendWs.isChecked = false
+        } else {
             stopSenderLoop()
             try { ws.close(1000, "paused") } catch (_: Exception) {}
         }
-        // 不要動 switchSendWs 的勾選狀態，也不要把 sendWsEnabled 改成 false
+
+        // 其餘 session 狀態清空
         currentSessionId = 0
         sessionIdleDeadlineMs = 0L
         sttHandler.removeCallbacks(sessionIdleReset)
@@ -2214,7 +2298,7 @@ class MainActivity : AppCompatActivity() {
         if (!renderEnabled) return
         val vw = view.width.coerceAtLeast(1)
         val vh = view.height.coerceAtLeast(1)
-        val (r, padX, padY) = calcFitCenter(vw, vh, srcW, srcH)
+        val (r, padX, padY) = calcFillCenter(vw, vh, srcW, srcH)
 
         val d = object : android.graphics.drawable.Drawable() {
             private val boxPaint = android.graphics.Paint().apply {
@@ -2258,12 +2342,20 @@ class MainActivity : AppCompatActivity() {
         view.overlay.add(d)
     }
 
+    /** 與 PreviewView = fillCenter (CenterCrop) 對齊 */
+    private fun calcFillCenter(vw: Int, vh: Int, srcW: Int, srcH: Int): Triple<Float, Float, Float> {
+        val r = kotlin.math.max(vw / srcW.toFloat(), vh / srcH.toFloat()) // ★ 用 max()
+        val padX = (vw - srcW * r) / 2f
+        val padY = (vh - srcH * r) / 2f
+        return Triple(r, padX, padY)
+    }
+
     /** 畫骨架（盒+關節+連線） */
     private fun drawPoseOnOverlay(view: View, srcW: Int, srcH: Int, poses: List<Pose>) {
         if (!renderEnabled) return
         val vw = view.width.coerceAtLeast(1)
         val vh = view.height.coerceAtLeast(1)
-        val (r, padX, padY) = calcFitCenter(vw, vh, srcW, srcH)
+        val (r, padX, padY) = calcFillCenter(vw, vh, srcW, srcH)
 
         val edges = arrayOf(
             intArrayOf(5,6), intArrayOf(5,7), intArrayOf(7,9),
@@ -2311,27 +2403,30 @@ class MainActivity : AppCompatActivity() {
 
         view.overlay.add(d)
     }
+
     override fun onStart() {
         super.onStart()
 
-        if (!aiReceiverRegistered) {
-            val filter = IntentFilter(ACTION_AI_REPLY)
-            ContextCompat.registerReceiver(
-                /* context = */ this,
-                /* receiver = */ aiReplyReceiver,
-                /* filter = */ filter,
-                /* flags = */ ContextCompat.RECEIVER_NOT_EXPORTED
-            )
-            aiReceiverRegistered = true
+        // ← 用 Events 取代本來的 registerReceiver(ACTION_AI_REPLY)
+        Events.onAiReply(this) { e ->
+            val text = e.text
+            val audioUrl = e.audioUrl
+            if (text.isNotBlank()) appendTranscript(text, "ai")
+            if (audioUrl.isNotBlank()) playTtsFromUrl(audioUrl, text)
+            else if (text.isNotBlank() && !aiSpeaking) showAiAnswer(text)
         }
+
+        // 你原有的連線
+        lifecycleScope.launch { VoiceBridge.connectRoom(elderId) }
     }
 
     override fun onStop() {
         super.onStop()
-        if (aiReceiverRegistered) {
-            try { unregisterReceiver(aiReplyReceiver) } catch (_: Exception) {}
-            aiReceiverRegistered = false
-        }
+
+        // ← 取代原本的 unregisterReceiver(aiReplyReceiver)
+        Events.offAiReply(this)
+
+        lifecycleScope.launch { VoiceBridge.disconnect() }
     }
 
     private fun safeRotation(): Int {
@@ -2344,12 +2439,23 @@ class MainActivity : AppCompatActivity() {
         return Surface.ROTATION_0
     }
 
-    private fun addTextOverlay(view: View, text: String) {
+    private fun addTextOverlay(
+        view: View,
+        text: String,
+        offsetRightDp: Int = 16,   // ➜ 往右偏移量
+        offsetDownDp: Int = 24     // ➜ 往下偏移量
+    ) {
         if (!renderEnabled) return
+
+        val density = view.resources.displayMetrics.density
+        val offsetX = offsetRightDp * density       // px
+        val offsetY = offsetDownDp * density        // px
+
         val vw = view.width.coerceAtLeast(1)
         val vh = view.height.coerceAtLeast(1)
+
         val d = object : android.graphics.drawable.Drawable() {
-            private val pad = 10f
+            private val pad = 10f // px
             private val textPaint = android.graphics.Paint().apply {
                 color = android.graphics.Color.WHITE
                 textSize = 32f
@@ -2361,19 +2467,35 @@ class MainActivity : AppCompatActivity() {
             }
             override fun draw(canvas: android.graphics.Canvas) {
                 val fm = textPaint.fontMetrics
-                val th = fm.bottom - fm.top
                 val tw = textPaint.measureText(text)
-                val left = pad
-                val top = pad
-                canvas.drawRect(left - pad, top - th - pad, left + tw + pad, top + pad, bgPaint)
-                canvas.drawText(text, left, top - fm.top, textPaint)
+
+                // 你希望錨定的位置（視為「左上角」），維持 offset
+                val anchorX = pad + offsetX
+                val anchorY = pad + offsetY
+
+                // 計算 baseline：要讓文字「上緣」貼著 anchorY，就用 baseline = anchorY - fm.top
+                val baseX = anchorX
+                val baseY = anchorY - fm.top
+
+                // 用 baseline 反推文字真正的上下邊界
+                val rectTop    = baseY + fm.top    - pad
+                val rectBottom = baseY + fm.bottom + pad
+                val rectLeft   = baseX - pad
+                val rectRight  = baseX + tw + pad
+
+                canvas.drawRect(rectLeft, rectTop, rectRight, rectBottom, bgPaint)
+                canvas.drawText(text, baseX, baseY, textPaint)
             }
+
             override fun setAlpha(alpha: Int) {}
             override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) {}
             override fun getOpacity() = android.graphics.PixelFormat.TRANSLUCENT
         }.apply { setBounds(0, 0, vw, vh) }
+
         view.overlay.add(d)
+        view.invalidate()
     }
+
 
     private fun processFrame(bitmap: Bitmap) {
         lastFrameW = bitmap.width
@@ -2399,8 +2521,6 @@ class MainActivity : AppCompatActivity() {
             lastDetectInferAt = SystemClock.elapsedRealtime()
             lastObjResult = objRes
         }
-
-        frameId = (frameId % 60) + 1
 
         // —— Overlay 與 HUD（用快取畫） —— //
         val objResForDraw = lastObjResult
@@ -2460,19 +2580,22 @@ class MainActivity : AppCompatActivity() {
                             val pose = if (includePose)   lastPoseResult else null
 
                             if (hasPayload(obj, pose, includeDetect, includePose)) {
+                                // ✅ 真正要送時，才產生「同一幀」的 fid（第一次為 1）
+                                val fid = nextFrameId()
+
                                 if (SEND_MODE == "frame") {
                                     val frameJson = buildFrameJson(
-                                        fid = frameId, width = w, height = h,
+                                        fid = fid, width = w, height = h,
                                         obj = obj, pose = pose,
                                         includeDetect = includeDetect, includePose = includePose
                                     ).toString()
                                     try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
                                     lastAnySendAt = now
                                 } else {
-                                    // split：分開送，對齊後端測試
+                                    // split：pose 與 object 共用同一個 fid（同一幀）
                                     if (includePose && (pose?.poses?.isNotEmpty() == true)) {
                                         val poseJson = buildPoseJson(
-                                            frameId,
+                                            fid,
                                             Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
                                             pose
                                         ).toString()
@@ -2481,7 +2604,7 @@ class MainActivity : AppCompatActivity() {
                                     }
                                     if (includeDetect && (obj?.outputBox?.isNotEmpty() == true)) {
                                         val objJson = buildObjectJson(
-                                            frameId,
+                                            fid,
                                             Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
                                             obj
                                         ).toString()
@@ -2502,14 +2625,15 @@ class MainActivity : AppCompatActivity() {
 
                         val obj = lastObjResult
                         if (hasPayload(obj, null, includeDetect = true, includePose = false)) {
+                            val fid = nextFrameId()
                             val frameJson = buildFrameJson(
-                                fid = frameId, width = w, height = h,
+                                fid = fid, width = w, height = h,
                                 obj = obj, pose = null,
                                 includeDetect = true, includePose = false
                             ).toString()
                             try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
                             lastDetectSendAt = now
-                            lastAnySendAt = now          // ★ 別忘了更新「最近一次傳輸」
+                            lastAnySendAt = now
                         }
                     }
 
