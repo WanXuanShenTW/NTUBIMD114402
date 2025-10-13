@@ -80,11 +80,14 @@ class MainActivity : AppCompatActivity() {
 
     // ==== 新增：推論與傳送的時間戳與結果快取 ====
     // 推論節奏（毫秒）
-    private val POSE_INFER_MS = 100L
+    private val POSE_INFER_MS = 200L
     private val DETECT_INFER_MS = 1000L
 
     private var lastPoseInferAt = 0L
     private var lastDetectInferAt = 0L
+
+    private var detectSeq: Long = 0L                 // detect 版本號（每次 detect 更新就 +1）
+    @Volatile private var lastDetectTsMs: Long = 0L
 
     // 最後一次成功推論的結果（送包與畫面都用這份）
     @Volatile private var lastPoseResult: PoseResult? = null
@@ -149,7 +152,7 @@ class MainActivity : AppCompatActivity() {
     private var lastDetectSendAt = 0L
     private val POSE_SEND_FPS = 5.0
     private val DETECT_SEND_FPS = 2.5
-    private val SEND_MODE = "split"
+    private val SEND_MODE = "frame"
     private var lastAnySendAt = 0L
 
     // 開關：執行哪種偵測
@@ -2520,6 +2523,9 @@ class MainActivity : AppCompatActivity() {
             objMs = SystemClock.elapsedRealtime() - t0
             lastDetectInferAt = SystemClock.elapsedRealtime()
             lastObjResult = objRes
+
+            detectSeq += 1
+            lastDetectTsMs = System.currentTimeMillis()
         }
 
         // —— Overlay 與 HUD（用快取畫） —— //
@@ -2557,68 +2563,63 @@ class MainActivity : AppCompatActivity() {
                     if (!sendWsEnabled) return
 
                     val now = SystemClock.elapsedRealtime()
-                    val poseInterval = 100L     // Pose 約 10Hz（實際依條件 5~10Hz）
-                    val detectInterval = 1000L  // Detect 1Hz
+
+                    // ★ 調整：pose 固定 200ms 一次（≈ 5 FPS），detect 不再「逢十夾帶」
+                    val poseInterval = 200L     // ← 每 200ms 送一包 frame（以 pose 節奏）
+                    val detectInterval = 1000L  // 備用：只開 detect 時才會用到
 
                     val wantPose = poseDetectEnabled
                     val wantDetect = objectDetectEnabled
 
-                    // 100ms 一拍：優先送 Pose，每第 10 包（約每 1s）夾一次 Detect
+                    // ─────────────────────────────────────────────────────────────
+                    // ★ 新邏輯：每 200ms 送出一包「frame（含 pose + 最近一次 detect）」。
+                    //   若 detect 沒更新，就沿用快取；若 detect 尚未有結果，就只送 pose。
+                    // ─────────────────────────────────────────────────────────────
                     if (wantPose && (now - lastPoseSendAt >= poseInterval)) {
-                        poseBurstCounter++
-
                         val includePose = true
-                        val includeDetect = wantDetect &&
-                                (poseBurstCounter % 10 == 0) &&
-                                (now - lastDetectSendAt >= detectInterval)
+                        val includeDetect = wantDetect
 
                         val w = if (lastFrameW > 0) lastFrameW else 640
                         val h = if (lastFrameH > 0) lastFrameH else 480
 
-                        if (includePose || includeDetect) {
-                            val obj = if (includeDetect) lastObjResult else null
-                            val pose = if (includePose)   lastPoseResult else null
+                        val obj = if (includeDetect) lastObjResult else null
+                        val pose = if (includePose)   lastPoseResult else null
 
-                            if (hasPayload(obj, pose, includeDetect, includePose)) {
-                                // ✅ 真正要送時，才產生「同一幀」的 fid（第一次為 1）
-                                val fid = nextFrameId()
-
-                                if (SEND_MODE == "frame") {
-                                    val frameJson = buildFrameJson(
-                                        fid = fid, width = w, height = h,
-                                        obj = obj, pose = pose,
-                                        includeDetect = includeDetect, includePose = includePose
-                                    ).toString()
-                                    try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
-                                    lastAnySendAt = now
-                                } else {
-                                    // split：pose 與 object 共用同一個 fid（同一幀）
-                                    if (includePose && (pose?.poses?.isNotEmpty() == true)) {
-                                        val poseJson = buildPoseJson(
-                                            fid,
-                                            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
-                                            pose
-                                        ).toString()
-                                        try { ws.send(poseJson) } catch (t: Throwable) { Log.e(TAG, "WS send pose error", t) }
-                                        lastAnySendAt = now
-                                    }
-                                    if (includeDetect && (obj?.outputBox?.isNotEmpty() == true)) {
-                                        val objJson = buildObjectJson(
-                                            fid,
-                                            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
-                                            obj
-                                        ).toString()
-                                        try { ws.send(objJson) } catch (t: Throwable) { Log.e(TAG, "WS send object error", t) }
-                                        lastAnySendAt = now
-                                    }
-                                }
-
-                                lastPoseSendAt = now
-                                if (includeDetect) lastDetectSendAt = now
+                        // ★★★ 只改這裡：拿掉 hasPayload 判斷，直接照節拍送 ★★★
+                        val fid = nextFrameId()
+                        if (SEND_MODE == "frame") {
+                            val frameJson = buildFrameJson(
+                                fid = fid, width = w, height = h,
+                                obj = obj, pose = pose,
+                                includeDetect = includeDetect, includePose = includePose
+                            ).toString()
+                            try { ws.send(frameJson) } catch (t: Throwable) { Log.e(TAG, "WS send error", t) }
+                            lastAnySendAt = now
+                        } else {
+                            // 若仍保留 split 模式相容性：同一幀同一 fid
+                            if (includePose && (pose?.poses?.isNotEmpty() == true)) {
+                                val poseJson = buildPoseJson(
+                                    fid,
+                                    Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
+                                    pose
+                                ).toString()
+                                try { ws.send(poseJson) } catch (t: Throwable) { Log.e(TAG, "WS send pose error", t) }
+                                lastAnySendAt = now
+                            }
+                            if (includeDetect && (obj?.outputBox?.isNotEmpty() == true)) {
+                                val objJson = buildObjectJson(
+                                    fid,
+                                    Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
+                                    obj
+                                ).toString()
+                                try { ws.send(objJson) } catch (t: Throwable) { Log.e(TAG, "WS send object error", t) }
+                                lastAnySendAt = now
                             }
                         }
+                        lastPoseSendAt = now
+                        // 不再用 burst/夾帶邏輯，因此 lastDetectSendAt 不再在這裡更新
                     }
-                    // 備援：只開 Detect 時，每 1s 單獨送一次
+                    // 備援：只開 Detect 時，每 1s 單獨送一次（保留你的原行為）
                     else if (!wantPose && wantDetect && (now - lastDetectSendAt >= detectInterval)) {
                         val w = if (lastFrameW > 0) lastFrameW else 640
                         val h = if (lastFrameH > 0) lastFrameH else 480
@@ -2637,7 +2638,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    // ★ 保活：5 秒內沒有任何傳輸就送一個 ping
+                    // ★ 保活：5 秒無任何傳輸就 ping 一次
                     if (SystemClock.elapsedRealtime() - lastAnySendAt >= 5000L) {
                         sendPing()
                     }
@@ -2801,6 +2802,10 @@ class MainActivity : AppCompatActivity() {
             put("image_size", JSONObject().apply {
                 put("width", width); put("height", height)
             })
+            put("detect_seq", detectSeq)
+            put("detect_ts", lastDetectTsMs)
+            val age = if (lastDetectTsMs > 0) System.currentTimeMillis() - lastDetectTsMs else -1L
+            put("detect_age_ms", age)
             put("persons", persons)
             put("detections", dets)
         }
