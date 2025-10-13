@@ -33,15 +33,15 @@ async def on_fall_start(user_id: str, start_time: str, result: dict, clip: dict)
         pose_before_fall=POSE_BEFORE_FALL
     )
     print(f"[FALL EVENT] elder_id={user_id} recorded to DB.")
-    # url = "https://5af5869ce9b3.ngrok-free.app//webhook/elder"
-    # async with aiohttp.ClientSession() as session:
-    #     async with session.post(url, json=body, timeout=5) as response:
-    #         print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
-    #         try:
-    #             response_data = await response.json()
-    #             print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
-    #         except Exception as e:
-    #             print("[WEBHOOK RESPONSE][ERROR]", str(e))
+    url = "https://smartcare.southeastasia.cloudapp.azure.com/eric/webhook/elder"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=body, timeout=5) as response:
+            print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
+            try:
+                response_data = await response.json()
+                print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
+            except Exception as e:
+                print("[WEBHOOK RESPONSE][ERROR]", str(e))
 
 async def on_fall_recover(
     user_id: str,

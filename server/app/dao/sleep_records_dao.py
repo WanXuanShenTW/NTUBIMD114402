@@ -83,3 +83,29 @@ async def get_sleep_time_by_week(conn, user_id: int, date: str, sunday_first: bo
         if not rows:
             raise NotFoundError(f"找不到 user_id={user_id} 在 {start_date_str} 起始的一周的睡眠記錄")
         return rows
+    
+# === 新增：抓與 [day_start, day_end) 有交集的睡眠區段（未裁切）===
+from aiomysql.cursors import DictCursor
+from typing import Any, Dict, List
+
+async def get_sleep_records_overlapping(
+    conn,
+    user_id: int,
+    day_start,   # datetime.datetime
+    day_end      # datetime.datetime
+) -> List[Dict[str, Any]]:
+    """
+    取出與 [day_start, day_end) 有交集的 sleep_records。
+    條件：sleep_time < day_end AND COALESCE(wake_time, day_end) > day_start
+    """
+    sql = """
+        SELECT record_id, user_id, sleep_time, wake_time
+        FROM `114-402`.sleep_records
+        WHERE user_id = %s
+          AND sleep_time < %s
+          AND COALESCE(wake_time, %s) > %s
+        ORDER BY sleep_time ASC
+    """
+    async with conn.cursor(DictCursor) as cur:
+        await cur.execute(sql, (user_id, day_end, day_end, day_start))
+        return await cur.fetchall()

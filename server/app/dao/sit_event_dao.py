@@ -57,3 +57,25 @@ async def get_sit_events_by_week(conn, user_id: int, start_date: str, end_date: 
         if not rows:
             raise NotFoundError(f"找不到 user_id={user_id} 在 {start_date} 至 {end_date} 的久坐事件記錄")
         return rows
+    
+async def get_sit_events_overlapping(
+    conn,
+    user_id: int,
+    day_start,   # datetime.datetime
+    day_end      # datetime.datetime
+) -> List[Dict[str, Any]]:
+    """
+    取出與 [day_start, day_end) 有交集的 sit_events。
+    條件：start_at < day_end AND (end_at IS NULL OR end_at > day_start)
+    """
+    sql = """
+        SELECT record_id, user_id, start_at, end_at
+        FROM `114-402`.sit_events
+        WHERE user_id = %s
+          AND start_at < %s
+          AND (end_at IS NULL OR end_at > %s)
+        ORDER BY start_at ASC
+    """
+    async with conn.cursor(DictCursor) as cur:
+        await cur.execute(sql, (user_id, day_end, day_start))
+        return await cur.fetchall()

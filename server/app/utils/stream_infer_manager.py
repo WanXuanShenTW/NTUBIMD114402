@@ -48,7 +48,7 @@ MULTI_STRIDE       = int(getattr(ml, "STRIDE", 5))
 # ====== 事件觸發/恢復參數（可用環境變數覆寫） ======
 FALL_START_THR     = float(os.getenv("SC_FALL_START_THR", getattr(bl, "DECISION_THR", 0.60)))
 FALL_RECOVER_THR   = float(os.getenv("SC_FALL_RECOVER_THR", 0.45))
-FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "2"))
+FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "1"))
 FALL_RECOVER_HITS  = int(os.getenv("SC_FALL_RECOVER_HITS", "2"))
 
 # ====== 多動作（multi）事件的門檻（針對 walk 測試，可擴充）======
@@ -56,9 +56,11 @@ ACTION_START_THR   = float(os.getenv("SC_ACTION_START_THR", "0.60"))
 ACTION_START_HITS  = int(os.getenv("SC_ACTION_START_HITS", "2"))
 ENABLED_ACTIONS    = [s.strip() for s in os.getenv("SC_ENABLED_ACTIONS", "walk").split(",") if s.strip()]
 
+# ====== 幀插值（骨架倍頻）開關：0=關，1=開（將相鄰兩幀插一幀，變成兩倍幀率） ======
+INTERP_DOUBLE = bool(int(os.getenv("SC_INTERP_DOUBLE", "0")))
+
 def _torch_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def _calc_in_channels(include_bone: bool, num_obj: int, num_edges: int) -> int:
     """C = 1(bbox_mask) + 1(dist) + 17(kps) + Edges + num_obj + 2(coord)"""
@@ -149,6 +151,78 @@ class RelationMapConfig:
         self.kp_conf_th = float(kp_conf_th)
         self.include_bone_lines = bool(include_bone_lines)
         self.object_classes = list(object_classes or [])
+
+def _lin(v1: Optional[float], v2: Optional[float], a: float) -> float:
+    if (v1 is None) and (v2 is None):
+        return 0.0
+    if v1 is None:
+        return float(v2)
+    if v2 is None:
+        return float(v1)
+    return float(v1) * (1.0 - a) + float(v2) * a
+
+def _interp_frame(prev_rec: Dict[str, Any], curr_rec: Dict[str, Any], alpha: float = 0.5) -> Dict[str, Any]:
+    """
+    以線性插值建立 prev 與 curr 中間的骨架/框幀（不做影像插值）。
+    - bbox: 若兩邊皆有則線性插；否則沿用可得者；仍無則 None。
+    - kps : 對 17 個關節 (x,y,conf) 做線性插值；單邊缺失則沿用有的；皆缺則該點為 0。
+    - 其餘欄位：img_w/h 取 curr；ts_ms 取均值（若皆為數字）。
+    註：frame_id 不重用外部序號（server 內部用 frame_seq 控序）；此處僅標示 synth=True 以供除錯。
+    """
+    # 正規化為 (bbox, kps, img_w, img_h)
+    p_bbox, p_kps, p_w, p_h = _extract_basic_frame(prev_rec)
+    c_bbox, c_kps, c_w, c_h = _extract_basic_frame(curr_rec)
+
+    # bbox
+    if p_bbox and c_bbox:
+        bbox = [
+            _lin(p_bbox[0], c_bbox[0], alpha),
+            _lin(p_bbox[1], c_bbox[1], alpha),
+            _lin(p_bbox[2], c_bbox[2], alpha),
+            _lin(p_bbox[3], c_bbox[3], alpha),
+        ]
+    else:
+        bbox = c_bbox or p_bbox or None
+
+    # kps（17 個點）
+    kps: List[dict] = []
+    for i in range(17):
+        px = py = pc = None
+        cx = cy = cc = None
+        if i < len(p_kps):
+            px = p_kps[i].get("x"); py = p_kps[i].get("y"); pc = p_kps[i].get("conf", 1.0)
+        if i < len(c_kps):
+            cx = c_kps[i].get("x"); cy = c_kps[i].get("y"); cc = c_kps[i].get("conf", 1.0)
+        kps.append({
+            "x": _lin(px, cx, alpha),
+            "y": _lin(py, cy, alpha),
+            "conf": _lin(pc, cc, alpha),
+        })
+
+    # 其他欄位
+    img_w = c_w or p_w or 640.0
+    img_h = c_h or p_h or 480.0
+
+    ts_mid = None
+    try:
+        p_ts = prev_rec.get("ts_ms")
+        c_ts = curr_rec.get("ts_ms")
+        if isinstance(p_ts, (int, float)) and isinstance(c_ts, (int, float)):
+            ts_mid = int(round((float(p_ts) + float(c_ts)) / 2.0))
+    except Exception:
+        ts_mid = None
+
+    return {
+        "type": "frame_interp",
+        "frame_id": prev_rec.get("frame_id"),  # 只做展示用途；實際序按 frame_seq 控
+        "ts_ms": ts_mid,
+        "bbox": bbox,
+        "kps": kps,
+        "detections": [],  # 插值不帶物件
+        "img_w": img_w,
+        "img_h": img_h,
+        "synth": True,     # 標記為插值幀
+    }
 
 def _gauss2d(h, w, cx, cy, sigma):
     yy, xx = np.mgrid[0:h, 0:w]
@@ -488,6 +562,9 @@ class StreamInferManager:
         # ★ 新增：拆包聚合暫存（user_id -> frame_id -> partial dict）
         self._pending: Dict[str, Dict[Any, Dict[str, Any]]] = defaultdict(dict)
         
+        # ★ 新增：記住上一個「實際」幀（非插值），供插值用
+        self._last_real_frame: Dict[str, Optional[Dict[str, Any]]] = defaultdict(lambda: None)
+        
         # ===== 多動作狀態機（目前先針對 walk，通用寫法可擴充）=====
         self._curr_action          = defaultdict(lambda: None)   # 目前穩定中的動作（event）
         self._action_start_time    = {}                          # 動作開始時間
@@ -602,20 +679,46 @@ class StreamInferManager:
         if not kps:
             return
 
-        # === 行動端已改為單調遞增：frame_seq 直接等於 frame_id ===
+        # === frame_seq 與插值/倍幀 ===
+        buf = self.buffers[user_id]
+
         fid_raw = merged.get("frame_id")
         try:
-            frame_seq = int(fid_raw) if fid_raw is not None else None
+            fid_int = int(fid_raw) if fid_raw is not None else None
         except Exception:
-            frame_seq = None
-        merged["frame_seq"] = frame_seq
+            fid_int = None
 
-        # === 用 frame_seq 入 buffer（避免回捲造成的誤判重複）===
-        buf = self.buffers[user_id]
-        if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
-            buf.append(merged)
+        if not INTERP_DOUBLE:
+            # 直接用行動端的單調 frame_id
+            merged["frame_seq"] = fid_int
+            # 入 buffer（避免重複）
+            if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
+                buf.append(merged)
+        else:
+            # 倍幀：把實際幀的 server 序列映射為偶數（2*N），插值幀使用中間奇數（2*N-1）
+            # 先嘗試與前一個「實際幀」做插值
+            prev_real = self._last_real_frame[user_id]
+            if prev_real is not None and (prev_real.get("frame_id") is not None) and (fid_int is not None):
+                try:
+                    prev_id = int(prev_real["frame_id"])
+                    # 插值幀：介於 prev_id 與 fid_int 之間
+                    synth = _interp_frame(prev_real, merged, alpha=0.5)
+                    synth["frame_seq"] = 2 * prev_id + 1
+                    # 入 buffer：先插值幀
+                    if len(buf) == 0 or (buf[-1].get("frame_seq") != synth.get("frame_seq")):
+                        buf.append(synth)
+                except Exception as _e:
+                    print(f"[STREAM][INTERP][WARN] user={user_id} synth fail: {_e}")
 
-        # === 用 frame_seq 控制觸發頻率：尾序號每差滿 BIN_STRIDE（預設 5）就推一次 ===
+            # 實際幀：映射為偶數序列（2 * fid）
+            merged["frame_seq"] = (2 * fid_int) if (fid_int is not None) else None
+            if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
+                buf.append(merged)
+
+            # 記下這個「實際」幀，供下一筆做插值
+            self._last_real_frame[user_id] = merged
+
+        # === 用 frame_seq 控制觸發頻率：尾序號每差滿 BIN_STRIDE 就推一次 ===
         tail_seq = buf[-1].get("frame_seq")
         next_seq = self._next_infer_tail_seq[user_id]
 
