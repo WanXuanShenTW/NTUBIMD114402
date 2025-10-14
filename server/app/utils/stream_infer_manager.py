@@ -16,7 +16,6 @@ from typing import Dict, Any, List, Tuple, Optional
 from collections import defaultdict, deque
 from datetime import datetime
 import time
-from dotenv import load_dotenv
 
 import numpy as np
 import torch
@@ -35,7 +34,6 @@ def _now_str() -> str:
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-load_dotenv()  # 從 .env 載入環境變數
 
 # ====== 模型路徑與視窗設定（可用環境變數覆寫） ======
 BIN_MODEL_PATH     = os.getenv("SC_BIN_MODEL_PATH",     "models/binary/best.pt")
@@ -49,9 +47,9 @@ MULTI_WINDOW       = int(getattr(ml, "WINDOW", 10))   # 二階段都用 10
 MULTI_STRIDE       = int(getattr(ml, "STRIDE", 5))
 
 # ====== 事件觸發/恢復參數（可用環境變數覆寫） ======
-FALL_START_THR     = float(os.getenv("SC_FALL_START_THR", getattr(bl, "DECISION_THR", 0.55)))
+FALL_START_THR     = float(os.getenv("SC_FALL_START_THR", getattr(bl, "DECISION_THR", 0.60)))
 FALL_RECOVER_THR   = float(os.getenv("SC_FALL_RECOVER_THR", 0.45))
-FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "2"))
+FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "1"))
 FALL_RECOVER_HITS  = int(os.getenv("SC_FALL_RECOVER_HITS", "2"))
 
 # ====== 多動作（multi）事件的門檻（針對 walk 測試，可擴充）======
@@ -62,20 +60,7 @@ ENABLED_ACTIONS    = [s.strip() for s in os.getenv("SC_ENABLED_ACTIONS", "walk")
 # ====== 幀插值（骨架倍頻）開關：0=關，1=開（將相鄰兩幀插一幀，變成兩倍幀率） ======
 INTERP_DOUBLE = bool(int(os.getenv("SC_INTERP_DOUBLE", "0")))
 
-# ====== 前處理/有效幀/Kalman 設定（可用環境變數覆寫）======
-# 前處理繪圖/計算時的 kp 門檻（heatmap/motion 使用）
-KP_CONF_TH = float(os.getenv("SC_KP_CONF_TH", "0.2"))
-
-# 有效幀判斷：關鍵點信心值門檻 & 最少關鍵點數（低於此則整幀丟棄，不入 buffer）
-VALID_KP_CONF_TH = float(os.getenv("SC_VALID_KP_CONF_TH", os.getenv("SC_KP_CONF_TH", "0.2")))
-VALID_MIN_KP     = int(os.getenv("SC_VALID_MIN_KP", "5"))
-
-# Kalman（先提供配置；預設關閉）
-KALMAN_ON    = bool(int(os.getenv("SC_KALMAN_ON", "0")))
-KALMAN_Q_POS = float(os.getenv("SC_KALMAN_Q_POS", "1e-3"))  # process noise
-KALMAN_R_POS = float(os.getenv("SC_KALMAN_R_POS", "1e-2"))  # measurement noise
-
-METRICS_ON = bool(int(os.getenv("SC_METRICS", "0")))
+METRICS_ON = bool(int(os.getenv("SC_METRICS", "1")))
 METRICS_INTERVAL_MS = int(os.getenv("SC_METRICS_INTERVAL_MS", "5000"))  # 每幾毫秒聚合印一次
 
 def _torch_device():
@@ -86,10 +71,12 @@ def _calc_in_channels(include_bone: bool, num_obj: int, num_edges: int) -> int:
     e = (num_edges if include_bone else 0)
     return 1 + 1 + 17 + e + num_obj + 2
 
+
 def _safe_softmax(logits: torch.Tensor, dim: int = -1) -> torch.Tensor:
     logits = torch.nan_to_num(logits, nan=0.0, posinf=1e4, neginf=-1e4)
     logits = logits - logits.max(dim=dim, keepdim=True).values
     return torch.softmax(logits, dim=dim)
+
 
 def _extract_basic_frame(rec: Dict[str, Any]) -> Tuple[Optional[list], List[dict], float, float]:
     """
@@ -359,6 +346,7 @@ def _compute_motion_and_mask_simple(parsed_window: List[Tuple[dict, list, list, 
 
     return feats, mask
 
+
 class _StageModels:
     """
     打包單一 stage（binary / multi）所需的設定與模型
@@ -501,16 +489,15 @@ class _StageModels:
         motion_feats, valid_mask = _compute_motion_and_mask_simple(
             parsed_window,
             motion_dim=(self.MOTION_DIM if self.USE_MOTION else 0),
-            kp_conf_th=KP_CONF_TH
+            kp_conf_th=float(getattr(self.m, "KP_CONF_TH", 0.2))  # 放寬一點降低 0 熱圖機率
         )
-
 
         # RelationMap 轉張量（以簡易版 rasterize，並確保通道數 == in_ch）
         want_in_ch = _calc_in_channels(self.INCLUDE_BONE, len(self.OBJECT_CLASSES), self.NUM_EDGES)
         cfg = RelationMapConfig(
             H=self.H, W=self.W,
             sigma_kp=float(getattr(self.m, "SIGMA_KP", 2.0)),
-            kp_conf_th=KP_CONF_TH,
+            kp_conf_th=float(getattr(self.m, "KP_CONF_TH", 0.2)),
             include_bone_lines=self.INCLUDE_BONE,
             object_classes=self.OBJECT_CLASSES,
         )
@@ -541,6 +528,7 @@ class _StageModels:
             "pred": pred_name,
         }
 
+
 class StreamInferManager:
     """
     伺服器端推論中樞：
@@ -551,8 +539,9 @@ class StreamInferManager:
     def __init__(self):
         self.device = _torch_device()
 
-        # 每個 user 的原始幀緩衝（至少保留 10 幀）
-        self.buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=max(40, MULTI_WINDOW+20)))
+        # 每個 user 的原始幀緩衝：移除 maxlen，避免 insert() 於滿載時噴 IndexError
+        self.buffers: Dict[str, deque] = defaultdict(lambda: deque())
+
 
         # 事件處理器（由 pose_routes.py 設定）
         self.handlers: Dict[str, Any] = {}
@@ -622,6 +611,29 @@ class StreamInferManager:
                 except Exception as e:
                     print(f"[ASYNC][{tag}][{idx}][ERROR] {e}")
         asyncio.create_task(_runner())
+    
+    def _insert_sorted_unique(self, buf: deque, rec: dict, key: str = "frame_seq"):
+        """
+        將單幀以 key（預設 frame_seq）為排序鍵插入 deque：
+        - 若已存在同鍵，直接覆蓋該位置（不丟棄）
+        - 否則按升冪插入正確位置，確保 buf[-1] 永遠是最新幀
+        備註：deque.insert 是 O(n)，但我們的視窗長度很小（~40），可接受。
+        """
+        ks = rec.get(key)
+        if ks is None:
+            buf.append(rec)
+            return
+        n = len(buf)
+        for i in range(n - 1, -1, -1):
+            vi = buf[i].get(key)
+            if vi == ks:
+                buf[i] = rec
+                return
+            if (vi is not None) and (vi < ks):
+                buf.insert(i + 1, rec)
+                return
+        buf.appendleft(rec)
+
 
     def _load_models(self):
         self.bin_stage.load_weights(BIN_MODEL_PATH, BIN_CLASSES_PATH)
@@ -720,13 +732,9 @@ class StreamInferManager:
         if merged is None:
             return  # 等待另一半
 
-        # 有效幀過濾：至少有 VALID_MIN_KP 個 kp，其 conf ≥ VALID_KP_CONF_TH，否則丟棄
+        # 確保只有在有 kps 時才入 buffer（避免全 0）
         _, kps, _, _ = _extract_basic_frame(merged)
-        valid_pts = [p for p in (kps or []) if float(p.get("conf", 0.0)) >= VALID_KP_CONF_TH]
-        if len(valid_pts) < VALID_MIN_KP:
-            fid_tmp = merged.get("frame_id")
-            if fid_tmp is not None:
-                self._pending[user_id].pop(fid_tmp, None)  # 避免 pending 囤積
+        if not kps:
             return
 
         # ====== [新增] 時間丟包 + 網路延遲度量 ======
@@ -767,37 +775,35 @@ class StreamInferManager:
 
         if not INTERP_DOUBLE:
             merged["frame_seq"] = fid_int
+            # 亂序不丟棄：插入到正確位置（相同序號則覆蓋）
+            self._insert_sorted_unique(buf, merged, key="frame_seq")
 
-            if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
-                buf.append(merged)
         else:
-            last_tail = buf[-1].get("frame_seq") if len(buf) > 0 else None
-
-            # 先嘗試插入合成幀（prev_real 存在時）
+            # 先嘗試插入「插值幀」（夾在上一張實際幀與本次實際幀之間）
             prev_real = self._last_real_frame[user_id]
             if prev_real is not None and (prev_real.get("frame_id") is not None) and (fid_int is not None):
                 try:
                     prev_id = int(prev_real["frame_id"])
-                    synth_seq = 2 * prev_id + 1
+                except Exception:
+                    prev_id = None
+                if prev_id is not None:
                     synth = _interp_frame(prev_real, merged, alpha=0.5)
+                    synth_seq = 2 * prev_id + 1     # 奇數序：夾在 2*prev_id 與 2*fid_int 之間
                     synth["frame_seq"] = synth_seq
-                    if len(buf) == 0 or (buf[-1].get("frame_seq") != synth.get("frame_seq")):
-                        buf.append(synth)
-                    last_tail = synth_seq
-                except Exception as _e:
-                    print(f"[STREAM][INTERP][WARN] user={user_id} synth fail: {_e}")
+                    # 亂序也不丟棄：直接按 frame_seq 排序插入（相同序號覆蓋）
+                    self._insert_sorted_unique(buf, synth, key="frame_seq")
 
-            # 再加入實際幀（偶數序）
+            # 再插入「本次實際幀」（偶數序）
             real_seq = (2 * fid_int) if (fid_int is not None) else None
-
             merged["frame_seq"] = real_seq
-            if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
-                buf.append(merged)
+            self._insert_sorted_unique(buf, merged, key="frame_seq")
 
+            # 記住本次實際幀，供下次插值用
             self._last_real_frame[user_id] = merged
 
+
         # === 用 frame_seq 控制觸發頻率：尾序號每差滿 BIN_STRIDE 就推一次 ===
-        tail_seq = buf[-1].get("frame_seq")
+        tail_seq = buf[-1].get("frame_seq") if buf else None
         next_seq = self._next_infer_tail_seq[user_id]
 
         # 初始化：第一次看到尾序號時，先把目標設在「當前尾序號」
@@ -1019,16 +1025,7 @@ class StreamInferManager:
             tail_id  = clip_bin[-1].get("frame_id") if clip_bin else None
             head_seq = clip_bin[0].get("frame_seq") if clip_bin else None
             tail_seq = clip_bin[-1].get("frame_seq") if clip_bin else None
-            # 取視窗「尾幀」的擷取時間
-            tail_ts_ms = clip_bin[-1].get("ts_ms")  # 行動端每幀必須有 ts_ms
-            emit_ms = int(time.time() * 1000)       # 伺服器送出時刻
 
-            # 體感延遲（擷取→送出），沒有 ts_ms 就給 None
-            latency_ms = int(emit_ms - tail_ts_ms) if isinstance(tail_ts_ms, (int, float)) else None
-
-            # 只回一個欄位：latency_ms
-            result_dict["latency_ms"] = latency_ms
-            
             print(f"user={user_id},frames={head_id}-{tail_id},frames_seq={head_seq}-{tail_seq},predict={result_dict}")
             
             # 不阻塞推論鎖：送出結果改為背景執行
@@ -1214,6 +1211,7 @@ class StreamInferManager:
 
         self.state_bin_pred[user_id] = "non_fall"
         print(f"[STREAM] force_recover user={user_id} reason={reason}")
+
 
 # === Singleton ===
 stream_infer_manager = StreamInferManager()
