@@ -39,8 +39,8 @@ def build_message(*, status: Optional[str], message: Optional[str], detected_at:
 
     status_norm = (status or "").strip().lower()
     ts = detected_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if status_norm in ("跌倒", "fall", "fall_detected"):
+    print(status_norm)
+    if status_norm in ("跌倒", "fall","true"):
         return f"⚠️ 注意！偵測到跌倒事件 ⚠️\n時間：{ts}\n請立即檢查長者狀況，確保安全。"
     if status_norm in ("離床", "bed_exit", "leave_bed"):
         return f"ℹ️ 離床提醒\n時間：{ts}\n請留意長者是否需要協助。"
