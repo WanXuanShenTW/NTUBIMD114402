@@ -15,6 +15,7 @@ import asyncio
 from typing import Dict, Any, List, Tuple, Optional
 from collections import defaultdict, deque
 from datetime import datetime
+import time
 
 import numpy as np
 import torch
@@ -58,6 +59,13 @@ ENABLED_ACTIONS    = [s.strip() for s in os.getenv("SC_ENABLED_ACTIONS", "walk")
 
 # ====== 幀插值（骨架倍頻）開關：0=關，1=開（將相鄰兩幀插一幀，變成兩倍幀率） ======
 INTERP_DOUBLE = bool(int(os.getenv("SC_INTERP_DOUBLE", "0")))
+
+# ====== 即時模式的落後丟包策略 ======
+DROP_STALE_MS = int(os.getenv("SC_DROP_STALE_MS", "0"))       # 毫秒；0=不啟用
+ENFORCE_ASC   = bool(int(os.getenv("SC_ENFORCE_ASC", "1")))   # 只接受遞增序號
+
+METRICS_ON = bool(int(os.getenv("SC_METRICS", "1")))
+METRICS_INTERVAL_MS = int(os.getenv("SC_METRICS_INTERVAL_MS", "5000"))  # 每幾毫秒聚合印一次
 
 def _torch_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -576,6 +584,20 @@ class StreamInferManager:
         self._last_multi_tail_seq = defaultdict(lambda: None)
         self._last_infer_tail_seq = defaultdict(lambda: None)
         self._next_infer_tail_seq = defaultdict(lambda: None)
+        
+        # 指標：每 user 聚合統計
+        self._metrics = defaultdict(lambda: {
+            "recv_count": 0,
+            "drop_stale": 0,
+            "drop_asc": 0,
+            "net_ms_sum": 0.0,
+            "infer_ms_sum": 0.0,
+            "infer_count": 0,
+            "last_report_ts": time.time(),
+            "last_ts_ms": None,     # 上一筆 ts_ms（估算輸入 FPS）
+            "fps_ema": None,        # 輸入 FPS 的 EMA
+            "budget_ms": None,      # BIN_STRIDE/fps_ema 推導的理論預算
+        })
 
     def _load_models(self):
         self.bin_stage.load_weights(BIN_MODEL_PATH, BIN_CLASSES_PATH)
@@ -679,6 +701,43 @@ class StreamInferManager:
         if not kps:
             return
 
+        # ====== [新增] 時間丟包 + 網路延遲度量 ======
+        m = self._metrics[user_id]
+        try:
+            ts_ms = merged.get("ts_ms")
+            if isinstance(ts_ms, (int, float)):
+                now_ms = int(time.time() * 1000)
+                lag = now_ms - int(ts_ms)
+
+                # 網路/端上排隊延遲統計
+                if lag >= 0:
+                    m["net_ms_sum"] += lag
+                    m["recv_count"] += 1
+
+                # 超時丟包（可關）
+                if DROP_STALE_MS > 0 and lag > DROP_STALE_MS:
+                    # 清理 pending 以免囤積
+                    fid_tmp = merged.get("frame_id")
+                    if fid_tmp is not None:
+                        self._pending[user_id].pop(fid_tmp, None)
+                    m["drop_stale"] += 1
+                    print(f"[STREAM][DROP][STALE] user={user_id} lag={lag}ms thr={DROP_STALE_MS}ms frame_id={merged.get('frame_id')}")
+                    return
+
+                # 估算輸入 FPS（用 ts_ms 差；EMA）
+                last_ts = m["last_ts_ms"]
+                m["last_ts_ms"] = int(ts_ms)
+                if last_ts is not None and int(ts_ms) > int(last_ts):
+                    inst_fps = 1000.0 / float(int(ts_ms) - int(last_ts))
+                    if m["fps_ema"] is None:
+                        m["fps_ema"] = inst_fps
+                    else:
+                        m["fps_ema"] = 0.2 * inst_fps + 0.8 * m["fps_ema"]
+                    if m["fps_ema"] > 0:
+                        m["budget_ms"] = (BIN_STRIDE * 1000.0) / m["fps_ema"]
+        except Exception:
+            pass
+
         # === frame_seq 與插值/倍幀 ===
         buf = self.buffers[user_id]
 
@@ -689,33 +748,53 @@ class StreamInferManager:
             fid_int = None
 
         if not INTERP_DOUBLE:
-            # 直接用行動端的單調 frame_id
             merged["frame_seq"] = fid_int
-            # 入 buffer（避免重複）
+
+            # [新增] 只接受遞增序號（避免舊幀拖慢）
+            last_tail = buf[-1].get("frame_seq") if len(buf) > 0 else None
+            if ENFORCE_ASC and (last_tail is not None) and (fid_int is not None) and (fid_int <= last_tail):
+                fid_tmp = merged.get("frame_id")
+                if fid_tmp is not None:
+                    self._pending[user_id].pop(fid_tmp, None)
+                self._metrics[user_id]["drop_asc"] += 1
+                print(f"[STREAM][DROP][OORD] user={user_id} seq={fid_int} <= tail={last_tail}")
+                return
+
             if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
                 buf.append(merged)
         else:
-            # 倍幀：把實際幀的 server 序列映射為偶數（2*N），插值幀使用中間奇數（2*N-1）
-            # 先嘗試與前一個「實際幀」做插值
+            last_tail = buf[-1].get("frame_seq") if len(buf) > 0 else None
+
+            # 先嘗試插入合成幀（prev_real 存在時）
             prev_real = self._last_real_frame[user_id]
             if prev_real is not None and (prev_real.get("frame_id") is not None) and (fid_int is not None):
                 try:
                     prev_id = int(prev_real["frame_id"])
-                    # 插值幀：介於 prev_id 與 fid_int 之間
-                    synth = _interp_frame(prev_real, merged, alpha=0.5)
-                    synth["frame_seq"] = 2 * prev_id + 1
-                    # 入 buffer：先插值幀
-                    if len(buf) == 0 or (buf[-1].get("frame_seq") != synth.get("frame_seq")):
-                        buf.append(synth)
+                    synth_seq = 2 * prev_id + 1
+                    # [新增] 插值幀也要遞增
+                    if (not ENFORCE_ASC) or (last_tail is None) or (synth_seq > last_tail):
+                        synth = _interp_frame(prev_real, merged, alpha=0.5)
+                        synth["frame_seq"] = synth_seq
+                        if len(buf) == 0 or (buf[-1].get("frame_seq") != synth.get("frame_seq")):
+                            buf.append(synth)
+                        last_tail = synth_seq
                 except Exception as _e:
                     print(f"[STREAM][INTERP][WARN] user={user_id} synth fail: {_e}")
 
-            # 實際幀：映射為偶數序列（2 * fid）
-            merged["frame_seq"] = (2 * fid_int) if (fid_int is not None) else None
+            # 再加入實際幀（偶數序）
+            real_seq = (2 * fid_int) if (fid_int is not None) else None
+            if ENFORCE_ASC and (last_tail is not None) and (real_seq is not None) and (real_seq <= last_tail):
+                fid_tmp = merged.get("frame_id")
+                if fid_tmp is not None:
+                    self._pending[user_id].pop(fid_tmp, None)
+                self._metrics[user_id]["drop_asc"] += 1
+                print(f"[STREAM][DROP][OORD] user={user_id} seq={real_seq} <= tail={last_tail}")
+                return
+
+            merged["frame_seq"] = real_seq
             if len(buf) == 0 or (buf[-1].get("frame_seq") != merged.get("frame_seq")):
                 buf.append(merged)
 
-            # 記下這個「實際」幀，供下一筆做插值
             self._last_real_frame[user_id] = merged
 
         # === 用 frame_seq 控制觸發頻率：尾序號每差滿 BIN_STRIDE 就推一次 ===
@@ -741,16 +820,46 @@ class StreamInferManager:
         fid = merged.get("frame_id")
         if fid is not None:
             self._pending[user_id].pop(fid, None)
+            
+        # ====== 週期性輸出 metrics 彙總 ======
+        if METRICS_ON:
+            mm = self._metrics[user_id]
+            now_sec = time.time()
+            if (now_sec - mm["last_report_ts"]) * 1000.0 >= METRICS_INTERVAL_MS:
+                avg_net   = (mm["net_ms_sum"] / mm["recv_count"]) if mm["recv_count"] else 0.0
+                avg_infer = (mm["infer_ms_sum"] / mm["infer_count"]) if mm["infer_count"] else 0.0
+                fps_in    = mm["fps_ema"] if mm["fps_ema"] else 0.0
+                budget    = mm["budget_ms"] if mm["budget_ms"] else 0.0
+                print(
+                    f"[METRIC] user={user_id} "
+                    f"fps_in≈{fps_in:.2f} net_ms(avg)={avg_net:.0f} "
+                    f"infer_ms(avg)={avg_infer:.0f} budget≈{budget:.0f}ms "
+                    f"drops(stale/asc)={mm['drop_stale']}/{mm['drop_asc']}"
+                )
+                # reset window
+                mm["net_ms_sum"] = 0.0; mm["recv_count"] = 0
+                mm["infer_ms_sum"] = 0.0; mm["infer_count"] = 0
+                mm["last_report_ts"] = now_sec
 
     async def _run_two_stage(self, user_id: str, clip_bin: List[Dict[str, Any]]):
         async with self._locks[user_id]:
+            t0_total = time.perf_counter()
+            
+            # 本窗 head/tail（用來對齊是哪個尾端觸發）
+            head_seq = clip_bin[0].get("frame_seq") if clip_bin else None
+            tail_seq = clip_bin[-1].get("frame_seq") if clip_bin else None
+            
             parsed_bin = []
             for rec in clip_bin:
                 bbox, kps, img_w, img_h = _extract_basic_frame(rec)
                 parsed_bin.append((bbox, kps, [], img_w, img_h))
 
             # Binary 推論
+            # ===== Binary（同階）計時 =====
+            t0_bin = time.perf_counter()
             bin_out = self.bin_stage.infer(parsed_bin)
+            t1_bin = time.perf_counter()
+            bin_ms = (t1_bin - t0_bin) * 1000.0
             bin_pred = bin_out["pred"]
             bin_probs = bin_out["probs"]
             class_names_bin = self.bin_stage.class_names
@@ -768,7 +877,8 @@ class StreamInferManager:
                     "thr": FALL_START_THR,
                 }
             }
-
+            # 預設 multi_ms=0（這一窗若是 fall，就不會跑 multi）
+            multi_ms = 0.0
             # Multi 推論（若不是跌倒則進行多類別推論）
             if bin_pred != "fall":
                 tail_seq = clip_bin[-1].get("frame_seq", None)
@@ -777,7 +887,11 @@ class StreamInferManager:
                     for rec in clip_bin:
                         bbox, kps, img_w, img_h = _extract_basic_frame(rec)
                         parsed_mul.append((bbox, kps, [], img_w, img_h))
+                        # ===== Multi（同階）計時 =====
+                    t0_mul = time.perf_counter()
                     mul_out = self.mul_stage.infer(parsed_mul)
+                    t1_mul = time.perf_counter()
+                    multi_ms = (t1_mul - t0_mul) * 1000.0
                     result_dict["stage"] = "multi"
                     result_dict["multi"] = {
                         "class_names": self.mul_stage.class_names,
@@ -1001,7 +1115,36 @@ class StreamInferManager:
                     self._fall_peak[user_id] = 0.0
 
             self.state_bin_pred[user_id] = bin_out["pred"]
+            
+            t1_total = time.perf_counter()
+            total_ms = (t1_total - t0_total) * 1000.0
 
+            m = self._metrics[user_id]
+            m["infer_ms_sum"] += total_ms
+            m["infer_count"]  += 1
+
+            budget = m.get("budget_ms")
+            budget_str = f"{budget:.0f}ms" if budget else "n/a"
+
+            # 若未啟用同階計時，這兩個會是 0
+            bin_ms   = locals().get("bin_ms", 0.0)
+            multi_ms = locals().get("multi_ms", 0.0)
+
+            status = "ok"
+            if budget is not None and total_ms > (float(budget) + 5.0):
+                status = "slow"
+
+            print(
+                f"[PERF] user={user_id} frames_seq={head_seq}-{tail_seq} "
+                f"bin={bin_ms:.1f}ms multi={multi_ms:.1f}ms total={total_ms:.1f}ms "
+                f"budget≈{budget_str} status={status}"
+            )
+            if status == "slow":
+                print(
+                    f"[PERF][SLOW] user={user_id} total_ms={total_ms:.1f}ms > budget={budget_str} "
+                    f"(tail_seq={tail_seq})"
+                )
+                
     async def force_recover(self, user_id: str, reason: str = "manual"):
         """
         斷線或出錯時呼叫，清除該 user 狀態（以及必要時觸發 recover 事件）
@@ -1047,6 +1190,7 @@ class StreamInferManager:
         self._last_multi_tail_seq[user_id] = None
         self._next_infer_tail_seq[user_id] = None
         self._pending[user_id].clear()
+        self._last_real_frame[user_id] = None   # ★ 插值狀態重置，避免跨段殘影
 
         self.state_bin_pred[user_id] = "non_fall"
         print(f"[STREAM] force_recover user={user_id} reason={reason}")

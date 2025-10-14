@@ -1,6 +1,6 @@
 import json
 from fastapi import APIRouter, WebSocket
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 import traceback
 import aiohttp
 
@@ -82,7 +82,6 @@ async def on_state_event_recover(user_id: str, event_name: str, start_time: str,
 async def ws_pose(websocket: WebSocket):
     user_id = websocket.query_params.get("user_id")
 
-    # ✅ Lazy load：第一次有 WebSocket 才初始化模型
     stream_infer_manager.set_handlers(
         on_fall_start=on_fall_start,
         on_fall_recover=on_fall_recover,
