@@ -31,16 +31,16 @@ async def on_fall_start(user_id: str, start_time: str, result: dict = None,
         print(f"[FALL_START] {user_id} {start_time}")
         # 依你的 service 實作調整欄位
         record_id = await add_fall_event(
-            elder_id=int(user_id),
+            user_id=int(user_id),
             location=LOCATION,
             pose_before=POSE_BEFORE_FALL,
             start_time=start_time
         )
         print(f"[INFO] 新增跌倒事件成功: record_id={record_id}")
         print("[✅] Connection released to pool")
-        print(f"[FALL EVENT] elder_id={user_id} recorded to DB.")
+        print(f"[FALL EVENT] user_id={user_id} recorded to DB.")
     except Exception as e:
-        print(f"[FALL_START][ERROR] user={user_id}: {e}")
+        print(f"[FALL_START][ERROR] user_id={user_id}: {e}")
         traceback.print_exc()
 
 
