@@ -38,20 +38,21 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler, Subset
 from sklearn.metrics import f1_score, confusion_matrix, classification_report
 from tqdm import tqdm
 from typing import Optional, List, Tuple, Dict
+from collections import Counter
 
 # ===================== Config（沿用基準類別＋布林 use_objects） =====================
 class Config:
     # 路徑（分開設定）
-    pose_root = "outputs/skeletons/YOLO/YOLO-pose"
-    obj_root  = "outputs/skeletons/YOLO/YOLO-detect"
+    pose_root = "outputs/skeletons/binary/YOLO-pose"
+    obj_root  = "outputs/skeletons/binary/YOLO-detect"
     out_dir   = "outputs/models/test"
 
     # 是否使用物件框
     use_objects = True            
-    object_classes = ["bed", "chair"]  # 空則不建立物件通道
+    object_classes = ["bed", "chair", "bench"]  # 空則不建立物件通道
 
     # 時序
-    window = 20
+    window = 10
     stride = 5
 
     # Relation Map
@@ -82,8 +83,26 @@ class Config:
     require_full_first_frame = True
     half_len_override = None
     require_full_skeleton_all = False
-    full_kp_min = 17
+    full_kp_min = 8
     bbox_required = True
+
+    # ====== On-the-fly 擴增（只給稀有類：fall；不改模型大小/輸出）======
+    aug_for_rare = True           # 開啟針對稀有類（fall）的擴增
+    aug_prob = 0.40               # 每個 window 觸發擴增的機率
+    aug_hflip = True              # 允許左右翻轉（不會違反重力/因果）
+    # 仿射變換（整段 window 使用同一組參數；避免跨幀不一致）
+    aug_affine_scale = (0.90, 1.10)        # 縮放
+    aug_affine_rotate_deg = (-12.0, 12.0)  # 小角度旋轉；禁止 180°（上下顛倒）
+    aug_affine_translate = (-0.05, 0.05)   # 位移（相對於寬/高的比例）
+    # 關節點雜訊/遮擋
+    aug_kp_noise_px = 2.0          # 每幀對 keypoints 加入高斯噪聲（像素）
+    aug_kp_dropout_prob = 0.05     # 少量 keypoints 置為低信心，模擬遮擋
+
+    # ---- Non-fall 下採樣（只影響資料量，不改模型結構）----
+    non_fall_downsample_ratio = 0.5   # 設 1.0 表示不下採樣；0.5 表示保留一半
+
+    # ---- Fall 過採樣（訓練索引層面重複正類樣本；不改模型結構）----
+    pos_oversample_mult = 2           # 1=不過採樣；2=將 fall 索引重複 2 倍
 
 # ===================== 穩定預設 =====================
 _SEED = 42
@@ -95,7 +114,7 @@ _LSTM_LAYERS = 2
 _WEIGHT_DECAY = 1e-4
 _GRAD_CLIP = 1.0
 _AMP = True
-_EARLY_STOP_PATIENCE = 10
+_EARLY_STOP_PATIENCE = 5
 _SAVE_TOP_K = 3
 _FOCAL_GAMMA = 2.0
 
@@ -622,6 +641,128 @@ def _extract_pose_basic(p):
     return bbox, kps_list, float(img_w), float(img_h)
 
 # ===================== Dataset =====================
+# ===================== Augmentation helpers (cause-safe, on-the-fly for FALL) =====================
+import numpy as _np
+import cv2 as _cv2
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def _affine_matrix(iw, ih, scale=1.0, rot_deg=0.0, tx_rel=0.0, ty_rel=0.0):
+    cx, cy = iw * 0.5, ih * 0.5
+    M = _cv2.getRotationMatrix2D((cx, cy), rot_deg, scale)  # 2x3
+    A = _np.vstack([M, [0, 0, 1]]).astype(_np.float32)
+    A[0, 2] += tx_rel * iw
+    A[1, 2] += ty_rel * ih
+    return A[:2, :]
+
+def _apply_affine_to_point(x, y, M):
+    nx = M[0,0]*x + M[0,1]*y + M[0,2]
+    ny = M[1,0]*x + M[1,1]*y + M[1,2]
+    return float(nx), float(ny)
+
+def _apply_affine_to_bbox_xyxy(bxyxy, M, iw, ih):
+    if bxyxy is None:
+        return None
+    x1,y1,x2,y2 = bxyxy
+    pts = [(x1,y1),(x1,y2),(x2,y1),(x2,y2)]
+    tp = [_apply_affine_to_point(px,py,M) for (px,py) in pts]
+    xs = [p[0] for p in tp]; ys = [p[1] for p in tp]
+    nx1, nx2 = _clamp(min(xs), 0, iw-1), _clamp(max(xs), 0, iw-1)
+    ny1, ny2 = _clamp(min(ys), 0, ih-1), _clamp(max(ys), 0, ih-1)
+    if nx2 < nx1 or ny2 < ny1:
+        return None
+    return [nx1, ny1, nx2, ny2]
+
+def _maybe_dropout_kps(kps, drop_prob):
+    out = []
+    for d in (kps or []):
+        dd = dict(d)
+        if random.random() < float(drop_prob):
+            dd['conf'] = min(0.05, float(dd.get('conf', dd.get('confidence', 1.0))))
+        out.append(dd)
+    return out
+
+def _jitter_kps_gauss(kps, noise_px, iw, ih):
+    if not noise_px or noise_px <= 0:
+        return kps
+    out = []
+    for d in (kps or []):
+        x = float(d.get('x', 0.0)); y = float(d.get('y', 0.0))
+        nx = _clamp(x + _np.random.normal(0, noise_px), 0, iw-1)
+        ny = _clamp(y + _np.random.normal(0, noise_px), 0, ih-1)
+        out.append({'x': nx, 'y': ny, 'conf': float(d.get('conf', d.get('confidence', 1.0)))})
+    return out
+
+def _maybe_hflip_point(x, y, iw):
+    return iw - 1 - x, y
+
+def _maybe_hflip(parsed_win, do_flip):
+    if not do_flip:
+        return parsed_win
+    out = []
+    for (bbox, kps, dets, iw, ih) in parsed_win:
+        bxyxy = _bbox_xyxy_from_any(bbox)
+        if bxyxy is not None:
+            x1,y1,x2,y2 = bxyxy
+            fx1, _ = _maybe_hflip_point(x1, y1, iw)
+            fx2, _ = _maybe_hflip_point(x2, y2, iw)
+            bbox = [min(fx1,fx2), y1, max(fx1,fx2), y2]
+        nkps = []
+        for d in (kps or []):
+            nx, ny = _maybe_hflip_point(float(d['x']), float(d['y']), iw)
+            nkps.append({'x': nx, 'y': ny, 'conf': float(d.get('conf', d.get('confidence',1.0)))})
+        ndets = []
+        for od in (dets or []):
+            bb = od.get('bbox') or od.get('xyxy')
+            bxyxy = _bbox_xyxy_from_any(bb)
+            if bxyxy is not None:
+                x1,y1,x2,y2 = bxyxy
+                fx1,_ = _maybe_hflip_point(x1, y1, iw)
+                fx2,_ = _maybe_hflip_point(x2, y2, iw)
+                nb = [min(fx1,fx2), y1, max(fx1,fx2), y2]
+                od = dict(od); od['bbox'] = nb
+            ndets.append(od)
+        out.append((bbox, nkps, ndets, iw, ih))
+    return out
+
+def _augment_window_consistently(parsed_win, cfg):
+    if not parsed_win:
+        return parsed_win
+    do_flip = bool(getattr(cfg, "aug_hflip", False) and (random.random() < 0.5))
+    win = _maybe_hflip(parsed_win, do_flip)
+    iw0, ih0 = win[0][3], win[0][4]
+    sc = random.uniform(*getattr(cfg, "aug_affine_scale", (1.0,1.0)))
+    rot = random.uniform(*getattr(cfg, "aug_affine_rotate_deg", (0.0,0.0)))
+    tx  = random.uniform(*getattr(cfg, "aug_affine_translate", (0.0,0.0)))
+    ty  = random.uniform(*getattr(cfg, "aug_affine_translate", (0.0,0.0)))
+    M = _affine_matrix(iw0, ih0, scale=sc, rot_deg=rot, tx_rel=tx, ty_rel=ty)
+
+    out = []
+    for (bbox, kps, dets, iw, ih) in win:
+        bxyxy = _bbox_xyxy_from_any(bbox)
+        nb = _apply_affine_to_bbox_xyxy(bxyxy, M, iw, ih) if bxyxy is not None else None
+        nkps = []
+        for d in (kps or []):
+            x, y = float(d.get('x', 0.0)), float(d.get('y', 0.0))
+            ax, ay = _apply_affine_to_point(x, y, M)
+            ax = _clamp(ax, 0, iw-1); ay = _clamp(ay, 0, ih-1)
+            nkps.append({'x': ax, 'y': ay, 'conf': float(d.get('conf', d.get('confidence',1.0)))})
+        nkps = _maybe_dropout_kps(nkps, getattr(cfg, "aug_kp_dropout_prob", 0.0))
+        nkps = _jitter_kps_gauss(nkps, getattr(cfg, "aug_kp_noise_px", 0.0), iw, ih)
+        ndets = []
+        for od in (dets or []):
+            bb = od.get('bbox') or od.get('xyxy')
+            bxyxy = _bbox_xyxy_from_any(bb)
+            if bxyxy is not None:
+                nb2 = _apply_affine_to_bbox_xyxy(bxyxy, M, iw, ih)
+                od = dict(od)
+                if nb2 is not None:
+                    od['bbox'] = nb2
+            ndets.append(od)
+        out.append((nb, nkps, ndets, iw, ih))
+    return out
+
 class PoseObjectDataset(Dataset):
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -675,6 +816,8 @@ class PoseObjectDataset(Dataset):
         # 建立 windows
         self.windows = []
 
+        self.enable_aug = True
+        
         # 重要：掃「實際存在的資料夾名」
         scan_classes = self.orig_class_names
 
@@ -767,6 +910,19 @@ class PoseObjectDataset(Dataset):
 
         if not self.windows:
             raise RuntimeError("No training windows built. Check data roots.")
+
+        # ---- 針對 non_fall(=0) 做下採樣：不改模型大小，只減少負樣本數量 ----
+        if self.binary_mode:
+            r = float(getattr(self.cfg, "non_fall_downsample_ratio", 1.0))
+            if r < 1.0:
+                idxs0 = [i for i, (y, _f, _p, _o) in enumerate(self.windows) if y == 0]  # non_fall
+                idxs1 = [i for i, (y, _f, _p, _o) in enumerate(self.windows) if y == 1]  # fall
+                keep0 = max(1, int(len(idxs0) * r))
+                random.shuffle(idxs0)
+                selected = sorted(idxs1 + idxs0[:keep0])
+                self.windows = [self.windows[i] for i in selected]
+                print(f"[Downsample] non_fall kept {keep0}/{len(idxs0)} (ratio={r}), fall kept {len(idxs1)}")
+
         # motion mean/std
         self.motion_stats = self._estimate_motion_stats(n_limit=2000)
 
@@ -778,21 +934,29 @@ class PoseObjectDataset(Dataset):
             parsed = []
             for fid in frames:
                 p = poses[fid]; o = objs.get(fid) if self.use_objects else None
-                bbox,kps,iw,ih = _extract_pose_basic(p)
+                bbox, kps, iw, ih = _extract_pose_basic(p)
                 dets = (o.get("detections") or o.get("objects") or o.get("boxes") or o.get("bboxes") or o.get("predictions") or []) if o else []
-                parsed.append((bbox,kps,dets,iw,ih))
+                parsed.append((bbox, kps, dets, iw, ih))
             if self.enable_kf:
-                window_kps=[kps for (_,kps,_,_,_) in parsed]
-                smoothed=kalman_smooth_kps(window_kps, half_slide=self.kf_half, half_len=self.half_len, require_full_first=True, step=self.stride)
-                parsed=[(bbox,smoothed[j],d,iw,ih) for j,(bbox,_,d,iw,ih) in enumerate(parsed)]
-            M,_=compute_motion_feats_with_mask_from_parsed(parsed)
-            if M.shape[0]>0:
+                window_kps = [kps for (_, kps, _, _, _) in parsed]
+                smoothed = kalman_smooth_kps(window_kps, half_slide=self.kf_half, half_len=self.half_len, require_full_first=True, step=self.stride)
+                parsed = [(bbox, smoothed[j], d, iw, ih) for j, (bbox, _k, d, iw, ih) in enumerate(parsed)]
+            if getattr(self.cfg, "aug_for_rare", False) and bool(getattr(self, "binary_mode", False)):
+                try:
+                    is_rare = (int(y) == 1)
+                except Exception:
+                    is_rare = False
+                if is_rare and (random.random() < float(getattr(self.cfg, "aug_prob", 0.5))):
+                    parsed = _augment_window_consistently(parsed, self.cfg)
+            M, _ = compute_motion_feats_with_mask_from_parsed(parsed)
+            if M.shape[0] > 0:
                 ms.append(M)
         if not ms:
-            return {"mean":[0.0]*9, "std":[1.0]*9}
-        M=np.concatenate(ms,axis=0)
-        mean=M.mean(axis=0); std=M.std(axis=0)+1e-6
+            return {"mean": [0.0]*9, "std": [1.0]*9}
+        M = np.concatenate(ms, axis=0)
+        mean = M.mean(axis=0); std = M.std(axis=0) + 1e-6
         return {"mean": mean.tolist(), "std": std.tolist()}
+
 
     def __len__(self):
         return len(self.windows)
@@ -809,6 +973,13 @@ class PoseObjectDataset(Dataset):
             window_kps=[kps for (_,kps,_,_,_) in parsed]
             smoothed=kalman_smooth_kps(window_kps, half_slide=self.kf_half, half_len=self.half_len, require_full_first=True, step=self.stride)
             parsed=[(bbox,smoothed[j],d,iw,ih) for j,(bbox,_,d,iw,ih) in enumerate(parsed)]
+
+        # 在 __getitem__ 用這個旗標
+        if self.enable_aug and getattr(self.cfg, "aug_for_rare", False) and self.binary_mode:
+            is_rare = (int(y_idx) == 1)
+            if is_rare and (random.random() < float(getattr(self.cfg, "aug_prob", 0.5))):
+                parsed = _augment_window_consistently(parsed, self.cfg)
+
         # motion + mask（並做 z-score）
         M,mask = compute_motion_feats_with_mask_from_parsed(parsed)
         mm=np.array(self.motion_stats['mean'],np.float32); ss=np.array(self.motion_stats['std'],np.float32)
@@ -824,30 +995,32 @@ class PoseObjectDataset(Dataset):
         return (X,M,mask), y
 
 # ===================== Model（支援 motion_dim 與 mask） =====================
+
 class SpaceCNN(nn.Module):
-    def __init__(self, in_ch, out_dim=256):
+    def __init__(self, in_ch: int, out_ch: int = 256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 64, 3, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 64, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, 3, padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, 3, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)
+            nn.Conv2d(in_ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1,1))
         )
-        self.fc = nn.Linear(256, out_dim)
+        self.proj = nn.Linear(256, out_ch)
     def forward(self, x):
-        return self.fc(self.net(x).flatten(1))
+        z = self.net(x).flatten(1)
+        return self.proj(z)
+
 
 class TemporalHead(nn.Module):
-    def __init__(self, in_dim, num_classes, mode="attn", dropout=0.0):
+    def __init__(self, in_dim: int, num_classes: int, mode: str = "attn", dropout: float = 0.3):
         super().__init__()
         self.mode = mode
-        self.drop = nn.Dropout(dropout) if dropout>0 else nn.Identity()
+        self.drop = nn.Dropout(dropout)
         if mode == "attn":
             self.attn = nn.Linear(in_dim, 1)
         self.fc = nn.Linear(in_dim, num_classes)
-    def forward(self, seq_feats: torch.Tensor, mask: Optional[torch.Tensor]=None):
-        # seq_feats: (B,T,D); mask: (B,T) in {0,1}
+    def forward(self, seq_feats: torch.Tensor, mask = None):
         if (mask is not None) and (self.mode in ("mean","attn")):
             if self.mode == "mean":
                 m = mask.unsqueeze(-1)
@@ -869,7 +1042,6 @@ class TemporalHead(nn.Module):
                 g = seq_feats[:, -1]
         g = self.drop(g)
         return self.fc(g)
-
 class CNNLSTM(nn.Module):
     def __init__(self, in_ch, num_classes, cnn_out=256, lstm_h=256, lstm_layers=2,
                  bidirectional=False, temporal_pool="attn", dropout=0.3, motion_dim:int=9):
@@ -928,7 +1100,6 @@ def build_loaders(cfg: Config, ds: PoseObjectDataset, idx_tr, idx_va):
     va_subset = Subset(ds, idx_va)
     # Weighted sampler（類別平衡）
     labels_tr = [ds.windows[i][0] for i in idx_tr]
-    from collections import Counter
     cnt = Counter(labels_tr)
     total_tr = float(len(labels_tr))
     weight_per_class = {c: (total_tr / n) if n>0 else 0.0 for c,n in cnt.items()}
@@ -947,7 +1118,25 @@ def train(cfg: Config):
     idx = list(range(n)); random.shuffle(idx)
     split = int(n * 0.8)
     idx_tr, idx_va = idx[:split], idx[split:]
-    dl_tr, dl_va = build_loaders(cfg, ds, idx_tr, idx_va)
+    
+    # ---- Fall 過採樣（索引層面；避免與 WeightedRandomSampler 疊加）----
+    # 僅在二元分類（fall=1）時有意義；多類可以保留為 1
+    if getattr(cfg, "pos_oversample_mult", 1) and cfg.pos_oversample_mult > 1:
+        pos = [i for i in idx_tr if ds.windows[i][0] == 1]  # fall=1（稀有類）
+        neg = [i for i in idx_tr if ds.windows[i][0] == 0]  # non_fall=0
+        m = int(cfg.pos_oversample_mult)
+        idx_tr = neg + pos * m
+        random.shuffle(idx_tr)
+        print(f"[Oversample] fall x{m}: pos {len(pos)} -> {len(pos)*m}, neg {len(neg)}")
+
+        # 避免「索引過採樣」再搭配 WeightedRandomSampler 造成雙重平衡
+        _use_sampler_backup = cfg.use_sampler
+        cfg.use_sampler = False
+        dl_tr, dl_va = build_loaders(cfg, ds, idx_tr, idx_va)
+        cfg.use_sampler = _use_sampler_backup
+    else:
+        dl_tr, dl_va = build_loaders(cfg, ds, idx_tr, idx_va)
+
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # in_ch 對齊 rasterizer
@@ -978,6 +1167,8 @@ def train(cfg: Config):
 
     for ep in range(1, cfg.epochs+1):
         # ========= Train =========
+        ds.enable_aug = True
+        
         model.train(); tot=0; corr=0; loss_sum=0.0
         pbar = tqdm(dl_tr, desc=f"Epoch {ep}/{cfg.epochs} [train]")
         for (X,M,mask), y in pbar:
@@ -997,6 +1188,7 @@ def train(cfg: Config):
             pbar.set_postfix({"loss": f"{loss_sum/max(1,tot):.4f}", "acc": f"{corr/max(1,tot):.3f}"})
         tr_loss = loss_sum/max(1,tot); tr_acc = corr/max(1,tot)
 
+        ds.enable_aug = False
         # ========= Valid =========
         acc, mf1 = evaluate(model, dl_va, device, use_motion=True)
         score = mf1  # 仍用 macro-f1 當排序標準

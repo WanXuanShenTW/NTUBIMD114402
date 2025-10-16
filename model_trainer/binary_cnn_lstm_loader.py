@@ -23,8 +23,10 @@ MODEL_PATH      = "outputs/models/test/best.pt"       # best.pt（state_dict）�
 CLASSES_PATH    = "outputs/models/test/classes.json"   # 若載入 best.pt 需提供類別清單
 
 # 測試檔（影片級 JSON，list 形式；索引=幀號）
-POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_011.json"
-OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/fall/fall_011.json"
+POSE_JSON   = "outputs/skeletons/binary/YOLO-pose/fall/Home_video (2)_back.json"
+OBJECT_JSON = "outputs/skeletons/binary/YOLO-detect/fall/Home_video (2)_back.json"
+# POSE_JSON       = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
+# OBJECT_JSON     = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
 # POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/normal/normal_002.json"
 # OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/normal/normal_002.json"
 # POSE_JSON       = "medias/test/normal/ps_IMG_7694.json"
@@ -34,13 +36,13 @@ OUT_CSV         = None  # 例如 "preds.csv"；不要輸出就設 None
 # Relation Map 與物件通道（需與訓練一致）
 H, W                   = 64, 64
 INCLUDE_BONE_LINES     = True
-OBJECT_CLASSES         = ["bed", "chair"]  # 若不用物件通道 → []
+OBJECT_CLASSES         = ["bed", "chair", "bench"]  # 若不用物件通道 → []
 
 # LSTM / 時序（需與訓練一致）
 LSTM_HIDDEN            = 256
 BIDIRECTIONAL          = False
 TEMPORAL_POOL          = "attn"   # "last" | "mean" | "attn"
-WINDOW                 = 20
+WINDOW                 = 10
 STRIDE                 = 5
 DROPOUT                = 0.3
 
@@ -529,15 +531,16 @@ class SpaceCNN(nn.Module):
     def __init__(self, in_ch, out_dim=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch,64,3,padding=1), nn.ReLU(),
-            nn.Conv2d(64,64,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64,128,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128,256,3,padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)
+            nn.Conv2d(in_ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1,1))
         )
-        self.fc = nn.Linear(256,out_dim)
-    def forward(self,x):
-        return self.fc(self.net(x).flatten(1))
+        self.proj = nn.Linear(256, out_dim)
+    def forward(self, x):
+        z = self.net(x).flatten(1)
+        return self.proj(z)
 
 class TemporalHead(nn.Module):
     def __init__(self, in_dim, num_classes, mode="attn", dropout=0.0):
@@ -603,17 +606,38 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
     # 計算輸入通道數（與訓練一致）
     in_ch = 1 + 1 + 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + len(OBJECT_CLASSES) + 2
 
+
     # 讀類別 & 權重
     class_names = None
-    sd = torch.load(MODEL_PATH, map_location=device)
-    state = None
-    if isinstance(sd, dict) and 'model_state' in sd:
-        state = sd['model_state']
-        class_names = sd.get('class_names')
-    elif isinstance(sd, dict):
-        state = sd
+
+    # === Robust ckpt loading ===
+    import traceback
+    if (not os.path.exists(MODEL_PATH)) or (not os.path.isfile(MODEL_PATH)):
+        raise FileNotFoundError(f"模型檔不存在或非檔案：{MODEL_PATH}")
+    _sz = os.path.getsize(MODEL_PATH)
+    if _sz < 1024:
+        raise RuntimeError(f"模型檔案過小({_sz} bytes)，可能是空檔/未完整寫入：{MODEL_PATH}")
+
+    obj = None
+    try:
+        obj = torch.load(MODEL_PATH, map_location=device, weights_only=True)  # type: ignore
+    except TypeError:
+        try:
+            obj = torch.load(MODEL_PATH, map_location=device)
+        except EOFError as e:
+            raise RuntimeError(f"讀取模型遇到 EOFError，檔案可能損毀：{MODEL_PATH}") from e
+        except Exception as e:
+            raise RuntimeError(f"讀取模型失敗：{MODEL_PATH}\n{traceback.format_exc()}") from e
+
+    # 正規化成 state_dict
+    if isinstance(obj, dict) and 'model_state' in obj:
+        state = obj['model_state']
+        class_names = obj.get('class_names', class_names)
+    elif isinstance(obj, dict):
+        state = obj
     else:
-        raise RuntimeError('Unsupported checkpoint format')
+        raise RuntimeError(f'不支援的 ckpt 內容型別：{type(obj)}')
+
     if class_names is None:
         if CLASSES_PATH and os.path.isfile(CLASSES_PATH):
             with open(CLASSES_PATH,'r',encoding='utf-8') as f:
@@ -625,6 +649,15 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
                     class_names = json.load(f)
     if class_names is None:
         raise RuntimeError('Class names not found. 請提供 CLASSES_PATH 或使用含 class_names 的 ckpt')
+
+    # 根據 ckpt 權重自動選擇 temporal_pool
+    pool_mode = TEMPORAL_POOL
+    try:
+        _has_attn = any(k.startswith("head.attn.") for k in state.keys())
+        if (not _has_attn) and (pool_mode == "attn"):
+            pool_mode = "last"
+    except Exception:
+        pass
 
     # ==== 決定二元稀有類索引（僅二元時生效）====
     rare_idx = None
@@ -638,9 +671,41 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
     # 建模（含 motion_dim）
     model = CNNLSTM(in_ch=in_ch, num_classes=len(class_names), cnn_out=256,
                     lstm_h=LSTM_HIDDEN, lstm_layers=2, bidirectional=BIDIRECTIONAL,
-                    temporal_pool=TEMPORAL_POOL, dropout=DROPOUT,
+                    temporal_pool=pool_mode, dropout=DROPOUT,
                     motion_dim=(_MOTION_DIM if _USE_MOTION else 0)).to(device)
-    model.load_state_dict(state)
+    
+    # ===== 舊→新鍵名映射（對齊新版 SpaceCNN） =====
+    fix = {}
+    for k, v in list(state.items()):
+        nk = k
+        nk = nk.replace("cnn.fc.", "cnn.proj.")
+        nk = nk.replace("cnn.net.2.", "cnn.net.0.")
+        nk = nk.replace("cnn.net.5.", "cnn.net.3.")
+        nk = nk.replace("cnn.net.8.", "cnn.net.6.")
+        if nk != k:
+            fix[nk] = v
+            del state[k]
+    state.update(fix)
+
+    # ===== 若 head.fc 輸出維度與目前模型不同，直接跳過該權重，改用隨機初始化 =====
+    try:
+        if "head.fc.weight" in state:
+            out_ckpt = state["head.fc.weight"].shape[0]
+            out_model = model.head.fc.out_features
+            if out_ckpt != out_model:
+                del state["head.fc.weight"]
+                if "head.fc.bias" in state:
+                    del state["head.fc.bias"]
+                print(f"[Warn] ckpt num_classes={out_ckpt} 與目前模型 {out_model} 不同，已跳過 head.fc 權重載入。")
+    except Exception:
+        pass
+
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print("[Warn] Missing keys:", missing)
+    if unexpected:
+        print("[Warn] Unexpected keys:", unexpected)
+
     model.eval()
 
     # 物件取得函式
