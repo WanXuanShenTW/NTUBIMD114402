@@ -8,6 +8,8 @@ from starlette.websockets import WebSocketDisconnect
 from ..utils.ws_connection_manager import ws_manager
 from ..utils.ws_message_dispatcher import handle_ws_text, notify_user_disconnected
 from ..service.fall_event_service import add_fall_event
+from ..service.sit_event_service import add_sit_event
+from ..service.sleep_records_service import add_sleep_record
 
 # 使用模組級單例 + 初始化工具
 from ..utils import stream_infer_manager as sim_mod
@@ -18,31 +20,48 @@ pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
 LOCATION = "客廳"
 POSE_BEFORE_FALL = "站立"
 
-
 # ---------------------------
 # 事件 Handler（供推論核心呼叫）
 # ---------------------------
 async def on_fall_start(user_id: str, start_time: str, result: dict = None,
-                        peak_score: float = None, payload: dict = None, **kwargs):
+                        peak_score: float = None, payload: dict = None, clip: dict = None, **kwargs):
     """
     跌倒開始：寫 DB + 基本 log
     """
+    elder_id = int(user_id)
+    # 從參數 clip 或 kwargs 取得（manager 會以 clip=... 傳入）
+    if clip is None:
+        clip = kwargs.get("clip")
+    _start = clip.get("start") if isinstance(clip, dict) else None
+    _end = clip.get("end") if isinstance(clip, dict) else None
+
+    body = {
+        "elder_id": elder_id,
+        "start": _start,
+        "end": _end,
+    }
     try:
         print(f"[FALL_START] {user_id} {start_time}")
         # 依你的 service 實作調整欄位
         record_id = await add_fall_event(
             user_id=int(user_id),
             location=LOCATION,
-            pose_before=POSE_BEFORE_FALL,
-            start_time=start_time
+            pose_before_fall=POSE_BEFORE_FALL,
+            detected_time=start_time
         )
-        print(f"[INFO] 新增跌倒事件成功: record_id={record_id}")
-        print("[✅] Connection released to pool")
         print(f"[FALL EVENT] user_id={user_id} recorded to DB.")
+        url = "https://smartcare.southeastasia.cloudapp.azure.com/eric/webhook/elder"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, timeout=5) as response:
+                print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
+                try:
+                    response_data = await response.json()
+                    print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
+                except Exception as e:
+                    print("[WEBHOOK RESPONSE][ERROR]", str(e))
     except Exception as e:
         print(f"[FALL_START][ERROR] user_id={user_id}: {e}")
         traceback.print_exc()
-
 
 async def on_fall_recover(user_id: str, start_time: str, end_time: str,
                           peak_score: float = None, reason: str = "", payload: dict = None, **kwargs):
@@ -55,11 +74,10 @@ async def on_fall_recover(user_id: str, start_time: str, end_time: str,
         print(f"[FALL_RECOVER][ERROR] user={user_id}: {e}")
         traceback.print_exc()
 
-
 async def on_state_event_start(user_id: str, event_name: str,
                                start_time: str, peak_score: float = None,
                                prev_action_name: str = None, curr_action_name: str = None,
-                               payload: dict = None, **kwargs):
+                               payload: dict = None, clip: dict | None = None, **kwargs):
     """
     多動作：事件開始（例如 walk）
     """
@@ -67,19 +85,25 @@ async def on_state_event_start(user_id: str, event_name: str,
         print(f"[STATE_START] user={user_id} event={event_name} at {start_time} "
               f"peak={peak_score if peak_score is not None else 'n/a'} "
               f"prev={prev_action_name or 'none'} -> curr={curr_action_name or event_name}")
+
     except Exception as e:
         print(f"[STATE_START][ERROR] user={user_id}: {e}")
         traceback.print_exc()
 
-
 async def on_state_event_recover(user_id: str, event_name: str,
                                  start_time: str, end_time: str, peak_score: float = None,
                                  prev_action_name: str = None, curr_action_name: str = None,
-                                 payload: dict = None, **kwargs):
+                                 payload: dict = None, clip: dict | None = None, **kwargs):
     """
     多動作：事件恢復（例如 walk -> none 或 walk -> 另一個事件）
     """
     try:
+        if prev_action_name == "sitstill":
+            await add_sit_event(user_id=user_id, start_at=start_time, end_at=end_time)
+            print(f"[SIT EVENT] user_id={user_id} recorded to DB.")
+        elif prev_action_name == "liestill":
+            await add_sleep_record(user_id=user_id, start_time=start_time, end_time=end_time)
+            print(f"[SLEEP RECORD] user_id={user_id} recorded to DB.")
         print(f"[STATE_RECOVER] {user_id} {event_name} {start_time} {end_time} "
               f"{peak_score if peak_score is not None else 'n/a'} "
               f"prev= {prev_action_name or 'none'} curr= {curr_action_name or 'none'}")

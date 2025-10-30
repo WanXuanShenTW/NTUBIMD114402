@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
+from dotenv import load_dotenv
 from fastapi import FastAPI
 import asyncio
 
@@ -20,6 +22,9 @@ from .routes.sleep_records_routes import sleep_records_router
 from .routes.sit_event_route import sit_event_router
 from .routes.interactions_records_routes import interactions_router
 from .routes.activity_routes import activity_router
+
+ROOT = Path(__file__).resolve().parents[1]  
+load_dotenv(ROOT / ".env")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

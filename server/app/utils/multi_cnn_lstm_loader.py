@@ -21,14 +21,12 @@ import torch.nn as nn
 import cv2
 
 # ===================== 常數設定（請依環境調整） =====================
-MODEL_PATH      = "outputs/models/test/multi/best.pt"       # best.pt（state_dict）或 epXXX_score*.pt（完整 ckpt）
-CLASSES_PATH    = "outputs/models/test/multi/classes.json"   # 若載入 best.pt 需提供類別清單
+MODEL_PATH      = "outputs/models/test/multi_rareaware/best.pt"       # best.pt（state_dict）或 epXXX_score*.pt（完整 ckpt）
+CLASSES_PATH    = "outputs/models/test/multi_rareaware/classes.json"   # 若載入 best.pt 需提供類別清單
 
 # 測試檔（影片級 JSON，list 形式；索引=幀號）
-# POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_011.json"
-# OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/fall/fall_011.json"
-POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/normal/normal_002.json"
-OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/normal/normal_002.json"
+POSE_JSON       = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
+OBJECT_JSON     = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
 # POSE_JSON       = "medias/test/fall/IMG_7704-pose.json"    # ← 這裡放「pose」JSON
 # OBJECT_JSON     = "medias/test/fall/IMG_7704-detect.json"  # ← 這裡放「detect/objects」JSON
 # POSE_JSON       = "outputs/skeletons/multi/YOLO-pose/lie/780251760.975590_back.json"
@@ -529,17 +527,19 @@ def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=0.3):
 class SpaceCNN(nn.Module):
     def __init__(self, in_ch, out_dim=256):
         super().__init__()
+        # Match trainer architecture: Conv+BN blocks and a linear projection named "proj"
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch,64,3,padding=1), nn.ReLU(),
-            nn.Conv2d(64,64,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(64,128,3,padding=1), nn.ReLU(), nn.MaxPool2d(2),
-            nn.Conv2d(128,256,3,padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)
+            nn.Conv2d(in_ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1,1))
         )
-        self.fc = nn.Linear(256,out_dim)
-    def forward(self,x):
-        return self.fc(self.net(x).flatten(1))
-
+        self.proj = nn.Linear(256, out_dim)
+    def forward(self, x):
+        z = self.net(x).flatten(1)
+        return self.proj(z)
+    
 class TemporalHead(nn.Module):
     def __init__(self, in_dim, num_classes, mode="attn", dropout=0.0):
         super().__init__()
@@ -577,7 +577,7 @@ class TemporalHead(nn.Module):
                 g = seq_feats[:, -1]
         g = self.drop(g)
         return self.fc(g)
-
+    
 class CNNLSTM(nn.Module):
     def __init__(self, in_ch, num_classes, cnn_out=256, lstm_h=256, lstm_layers=2,
                  bidirectional=False, temporal_pool="attn", dropout=0.3, motion_dim=0):
@@ -640,6 +640,15 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
     if class_names is None:
         raise RuntimeError('Class names not found. 請提供 CLASSES_PATH 或使用含 class_names 的 ckpt')
 
+    # Motion normalization stats from checkpoint (if available)
+    motion_norm = None
+    try:
+        if isinstance(sd, dict) and ('motion_norm' in sd):
+            motion_norm = sd.get('motion_norm')
+    except Exception:
+        motion_norm = None
+
+
     # 建模（含 motion_dim）
     model = CNNLSTM(in_ch=in_ch, num_classes=len(class_names), cnn_out=256,
                     lstm_h=LSTM_HIDDEN, lstm_layers=2, bidirectional=BIDIRECTIONAL,
@@ -692,6 +701,17 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
             x = torch.from_numpy(np.stack(clips)).unsqueeze(0).float().to(device)            # (1,T,C,H,W)
             M = torch.from_numpy(motion_feats).unsqueeze(0).float().to(device) if _USE_MOTION else None  # (1,T,9)
             mask = torch.from_numpy(valid_mask).unsqueeze(0).float().to(device)                           # (1,T)
+
+            # Apply motion normalization using statistics saved in checkpoint (if present)
+            if (_USE_MOTION) and (M is not None) and (motion_norm is not None):
+                try:
+                    mm = torch.tensor(motion_norm.get('mean', [0.0]*9), dtype=M.dtype, device=M.device)
+                    ss = torch.tensor(motion_norm.get('std',  [1.0]*9), dtype=M.dtype, device=M.device)
+                    ss = torch.clamp(ss, min=1e-6)
+                    M = (M - mm) / ss
+                except Exception:
+                    pass
+                           # (1,T)
 
             # 清理 NaN/Inf（保守）
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)

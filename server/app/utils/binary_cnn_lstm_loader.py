@@ -20,7 +20,7 @@ import cv2
 
 # ===================== 常數設定（請依環境調整） =====================
 MODEL_PATH      = "models/binary/best.pt"       # best.pt（state_dict）或 epXXX_score*.pt（完整 ckpt）
-CLASSES_PATH    = "models/binary/classes.json"   # 若載入 best.pt 需提供類別清單
+CLASSES_PATH    = "outputs/models/test/classes.json"   # 若載入 best.pt 需提供類別清單
 
 # 測試檔（影片級 JSON，list 形式；索引=幀號）
 # POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/fall/fall_011.json"
@@ -45,7 +45,7 @@ STRIDE                 = 5
 DROPOUT                = 0.3
 
 # ===== 前置：KF 與完整性判斷（與訓練一致） =====
-ENABLE_KALMAN               = True
+ENABLE_KALMAN               = False
 KALMAN_HALF_SLIDE           = False    # 1~10 初始化；之後每 5 幀用 5~15、10~20 覆蓋尾段
 REQUIRE_FULL_FIRST_FRAME    = False   # 視窗第一幀必須完整，否則此視窗不推論
 HALF_LEN_OVERRIDE           = None    # 預設用 WINDOW//2 (=10)
@@ -312,7 +312,6 @@ class Kalman2D:
     def get_xy(self):
         return float(self.x[0,0]), float(self.x[1,0])
 
-
 def _kf_run_on_segment(kps_seq, require_full_first=True):
     L = len(kps_seq)
     if L == 0:
@@ -346,7 +345,6 @@ def _kf_run_on_segment(kps_seq, require_full_first=True):
             smoothed.append({'x': x, 'y': y, 'conf': float(frame[j].get('conf',1.0)) if j < len(frame) else 0.0})
         out.append(smoothed)
     return out
-
 
 def kalman_smooth_kps(window_kps, *, half_slide=True, half_len=10, require_full_first=True, step=5):
     """半視窗 KF：0~half 覆蓋，之後每 step 覆蓋尾段（與 trainer/online 一致）"""

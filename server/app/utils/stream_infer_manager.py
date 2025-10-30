@@ -26,11 +26,12 @@ import numpy as np
 import torch
 
 # === 導入兩個 loader（請確保檔案位於 app/utils/ 下）===
-from ..utils import binary_cnn_lstm_loader as bl
-from ..utils import multi_cnn_lstm_loader as ml
+from . import binary_cnn_lstm_loader as bl
+from . import multi_cnn_lstm_loader as ml
 
 # WS 管理（保持原專案結構）
-from ..utils.ws_connection_manager import ws_manager
+from .ws_connection_manager import ws_manager
+
 
 
 # ===================== 統一設定（可用環境變數覆寫） =====================
@@ -68,28 +69,28 @@ MULTI_MODEL_PATH   = os.getenv("SC_MULTI_MODEL_PATH",   "models/multi/best.pt")
 MULTI_CLASSES_PATH = os.getenv("SC_MULTI_CLASSES_PATH", "models/multi/classes.json")
 
 # 事件門檻與連續命中
-FALL_START_THR     = float(os.getenv("SC_FALL_START_THR", "0.60"))
-FALL_RECOVER_THR   = float(os.getenv("SC_FALL_RECOVER_THR", "0.45"))
-FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "1"))
-FALL_RECOVER_HITS  = int(os.getenv("SC_FALL_RECOVER_HITS", "2"))
+FALL_START_THR     = float(os.getenv("SC_FALL_START_THR", "0.70"))
+FALL_RECOVER_THR   = float(os.getenv("SC_FALL_RECOVER_THR", "0.50"))
+FALL_START_HITS    = int(os.getenv("SC_FALL_START_HITS", "2"))
+FALL_RECOVER_HITS  = int(os.getenv("SC_FALL_RECOVER_HITS", "3"))
 
 # （多動作示例）
-ACTION_START_THR   = float(os.getenv("SC_ACTION_START_THR", "0.60"))
-ACTION_START_HITS  = int(os.getenv("SC_ACTION_START_HITS", "2"))
-ENABLED_ACTIONS    = [s.strip() for s in os.getenv("SC_ENABLED_ACTIONS", "walk").split(",") if s.strip()]
+ACTION_START_THR   = float(os.getenv("SC_ACTION_START_THR", "0.50"))
+ACTION_START_HITS  = int(os.getenv("SC_ACTION_START_HITS", "3"))
+ENABLED_ACTIONS    = [s.strip() for s in os.getenv("SC_ENABLED_ACTIONS", "walk,sitstill,liestill").split(",") if s.strip()]
 
 # 幀插值（骨架倍頻）開關：0=關，1=開（將相鄰兩幀插一幀，變成兩倍幀率）
 INTERP_DOUBLE      = bool(int(os.getenv("SC_INTERP_DOUBLE", "0")))
 
 # 指標列印
-METRICS_ON         = bool(int(os.getenv("SC_METRICS", "1")))
+METRICS_ON         = bool(int(os.getenv("SC_METRICS", "0")))
 METRICS_INTERVAL_MS= int(os.getenv("SC_METRICS_INTERVAL_MS", "5000"))  # 每幾毫秒聚合印一次
 
 
 # ===================== 小工具 =====================
 def _now_str() -> str:
     try:
-        from ..utils.response_util import now_str
+        from .response_util import now_str
         return now_str()
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -530,6 +531,13 @@ class StreamInferManager:
         if on_fall_recover:        self.handlers["on_fall_recover"] = on_fall_recover
         if on_state_event_start:   self.handlers["on_state_event_start"] = on_state_event_start
         if on_state_event_recover: self.handlers["on_state_event_recover"] = on_state_event_recover
+        
+        # 只做可觀測性：不改任務邏輯
+        try:
+            names = [k for k in ("on_fall_start","on_fall_recover","on_state_event_start","on_state_event_recover") if k in self.handlers]
+            print(f"[STREAM][HANDLERS] registered: {', '.join(names)}")
+        except Exception:
+            pass
 
     async def ingest(self, user_id: str, data: Dict[str, Any]):
         """
@@ -720,6 +728,14 @@ class StreamInferManager:
 
     async def _run_two_stage(self, user_id: str, clip_bin: List[Dict[str, Any]]):
         async with self._locks[user_id]:
+            # Prepare clip5 for webhook/state events (latest 5 frames)
+            _clip5 = clip_bin[-5:] if len(clip_bin) >= 5 else clip_bin
+            clip_meta = {
+                "start": _clip5[0] if _clip5 else (clip_bin[0] if clip_bin else None),
+                "end": _clip5[-1] if _clip5 else (clip_bin[-1] if clip_bin else None),
+                "size": len(_clip5),
+                "win": {"window": MULTI_WINDOW, "stride": MULTI_STRIDE}
+            }
             t0_total = time.perf_counter()
             
             # head/tail（用於日誌）
@@ -815,6 +831,7 @@ class StreamInferManager:
                                                 peak_score=float(act_prob),
                                                 prev_action_name="none",
                                                 curr_action_name=cand,
+                                                clip=clip_meta,
                                                 payload=result_dict,
                                             ),
                                             tag=f"state_start:{user_id}:{cand}"
@@ -859,6 +876,7 @@ class StreamInferManager:
                                                 peak_score=prev_peak,
                                                 prev_action_name=prev,
                                                 curr_action_name=cand,
+                                                clip=clip_meta,
                                                 payload=result_dict,
                                             ))
                                         # 再 start 新動作
@@ -875,6 +893,7 @@ class StreamInferManager:
                                                 peak_score=float(act_prob),
                                                 prev_action_name=prev,
                                                 curr_action_name=cand,
+                                                clip=clip_meta,
                                                 payload=result_dict,
                                             ))
                                         if tasks:
@@ -921,7 +940,14 @@ class StreamInferManager:
                     start_time = _now_str()
                     self._fall_start_ts[user_id] = start_time
 
-                    clip_meta = {"start": clip_bin[0], "end": clip_bin[-1], "win": {"window": BIN_WINDOW, "stride": BIN_STRIDE}}
+                    # 供 webhook 使用(改自clip5)
+                    _clip = clip_bin
+                    clip_meta = {
+                        "start": _clip[0] if _clip else clip_bin[0],
+                        "end": _clip[-1] if _clip else clip_bin[-1],
+                        "size": len(_clip),
+                        "win": {"window": BIN_WINDOW, "stride": BIN_STRIDE}
+                    }
                     if self.handlers.get("on_fall_start"):
                         self._spawn(
                             self.handlers["on_fall_start"](
@@ -1006,19 +1032,12 @@ class StreamInferManager:
             budget_str = f"{budget:.0f}ms" if budget else "n/a"
 
             status = "ok"
-            if budget is not None and total_ms > (float(budget) + 5.0):
-                status = "slow"
 
             print(
                 f"[PERF] user={user_id} frames_seq={head_seq}-{tail_seq} "
                 f"bin={bin_ms:.1f}ms multi={multi_ms:.1f}ms total={total_ms:.1f}ms "
                 f"budget≈{budget_str} status={status}"
             )
-            if status == "slow":
-                print(
-                    f"[PERF][SLOW] user={user_id} total_ms={total_ms:.1f}ms > budget={budget_str} "
-                    f"(tail_seq={tail_seq})"
-                )
                 
     async def force_recover(self, user_id: str, reason: str = "manual"):
         """
