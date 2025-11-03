@@ -45,7 +45,7 @@ class Config:
     # 路徑（分開設定）
     pose_root = "outputs/skeletons/binary/YOLO-pose"
     obj_root  = "outputs/skeletons/binary/YOLO-detect"
-    out_dir   = "outputs/models/test"
+    out_dir   = "outputs/models/binary"
 
     # 是否使用物件框
     use_objects = True            
@@ -54,6 +54,13 @@ class Config:
     # 時序
     window = 10
     stride = 5
+    
+    # —— 針對稀有/非稀有類別的差別步長（只影響建 window）——
+    stride_pos = 3   # fall 類用更密的 stride（例：2 幀）
+    stride_neg = 5   # non_fall 類維持原本（例：5 幀）
+
+    # （可選）限制每支 non_fall 影片最多切多少個 window，0=不限制
+    max_neg_windows_per_seq = 0
 
     # Relation Map
     H, W = 64, 64
@@ -88,7 +95,7 @@ class Config:
 
     # ====== On-the-fly 擴增（只給稀有類：fall；不改模型大小/輸出）======
     aug_for_rare = True           # 開啟針對稀有類（fall）的擴增
-    aug_prob = 0.40               # 每個 window 觸發擴增的機率
+    aug_prob = 0.50               # 每個 window 觸發擴增的機率
     aug_hflip = True              # 允許左右翻轉（不會違反重力/因果）
     # 仿射變換（整段 window 使用同一組參數；避免跨幀不一致）
     aug_affine_scale = (0.90, 1.10)        # 縮放
@@ -99,10 +106,10 @@ class Config:
     aug_kp_dropout_prob = 0.05     # 少量 keypoints 置為低信心，模擬遮擋
 
     # ---- Non-fall 下採樣（只影響資料量，不改模型結構）----
-    non_fall_downsample_ratio = 0.5   # 設 1.0 表示不下採樣；0.5 表示保留一半
+    non_fall_downsample_ratio = 0.25   # 設 1.0 表示不下採樣；0.5 表示保留一半
 
     # ---- Fall 過採樣（訓練索引層面重複正類樣本；不改模型結構）----
-    pos_oversample_mult = 2           # 1=不過採樣；2=將 fall 索引重複 2 倍
+    pos_oversample_mult = 3           # 1=不過採樣；2=將 fall 索引重複 2 倍
 
 # ===================== 穩定預設 =====================
 _SEED = 42
@@ -114,7 +121,7 @@ _LSTM_LAYERS = 2
 _WEIGHT_DECAY = 1e-4
 _GRAD_CLIP = 1.0
 _AMP = True
-_EARLY_STOP_PATIENCE = 5
+_EARLY_STOP_PATIENCE = 10
 _SAVE_TOP_K = 3
 _FOCAL_GAMMA = 2.0
 
@@ -839,7 +846,23 @@ class PoseObjectDataset(Dataset):
                     continue
 
                 # 以 window/stride 切片
-                for i in range(0, len(frames) - self.window + 1, self.stride):
+                
+                # —— 依類別決定 stride（fall 用 stride_pos，non_fall 用 stride_neg）——
+                is_binary = bool(getattr(self, "binary_mode", False))
+                if is_binary:
+                    # 正類（稀有類）名稱：cfg.rare_class_name（預設 'fall'）
+                    is_pos = (cname == getattr(self.cfg, "rare_class_name", "fall"))
+                else:
+                    is_pos = False  # 多類情境這段不啟用；此檔主要針對 binary
+
+                step_this = int(getattr(self.cfg, "stride_pos", self.stride) if is_pos
+                                else getattr(self.cfg, "stride_neg", self.stride))
+                step_this = max(1, step_this)
+
+                # ——（可選）限制每支 non_fall 序列最多切出的 window 數；0=不限制 —— 
+                neg_added_this_seq = 0
+                max_neg_windows = int(getattr(self.cfg, "max_neg_windows_per_seq", 0))
+                for i in range(0, len(frames) - self.window + 1, step_this):
                     win_frames = frames[i:i + self.window]
 
                     # 是否要求完整骨架（全幀/首幀）
@@ -906,6 +929,13 @@ class PoseObjectDataset(Dataset):
 
                     # 存 window（__getitem__ 會再用 poses/objs 重建張量）
                     self.windows.append((y_idx, win_frames, poses, objs))
+                    
+                    # —— 若是 non_fall（y=0），且設定了每序列上限，則累計並可能提早結束 —— 
+                    if is_binary and (int(y_idx) == 0) and (max_neg_windows > 0):
+                        neg_added_this_seq += 1
+                        if neg_added_this_seq >= max_neg_windows:
+                            break
+
 
 
         if not self.windows:
