@@ -1,18 +1,12 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-display_dual_fps_realtimesync.py
+display.py  (real-time video + mapped skeleton; initial pause support)
 
-目標：影片「原生 FPS + 牆鐘同步」播放（跟一般播放器一樣順），
-      骨架/偵測依自訂 FPS 前進。若處理負荷過高，**會丟幀**以維持時間同步。
-
-- 影片以 wall-clock 對齊：依 elapsed_time 計算應顯示的 frame_idx，必要時跳幀。
-- 骨架索引同樣依 elapsed_time 計算（與影片互不干擾）。
-- 影片貼到畫布採 letterbox，骨架/框經同一映射疊上去（不變形）。
-- 保留 two-stage / binary-only 推論整合（透過 run_on_json）。
-
-熱鍵：Space 暫停/續播（維持時間對齊）、q/ESC 離開
+- 影片以「原生 FPS + 牆鐘同步」播放（與一般播放器一致；必要時自動丟幀）。
+- 骨架/偵測依自訂 FPS 依牆鐘時間前進（與影片互不干擾）。
+- 座標以 letterbox 對映，避免變形與偏移。
+- 新增：INITIAL_PAUSE，起始先停住，按「Space」或「滑鼠左鍵」才開始。
 """
 
 import os
@@ -30,28 +24,36 @@ import numpy as np
 # ==============================
 # 🔧 設定區
 # ==============================
-# POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/liestill/780385481.887354_back.json"
-# DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/liestill/780385481.887354_back.json"
+POSE_JSON_PATH       = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
+DETECT_JSON_PATH     = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
+# POSE_JSON_PATH   = "outputs/skeletons/binary-backup/YOLO-pose/fall/Home_video (2)_back.json"
+# DETECT_JSON_PATH = "outputs/skeletons/binary-backup/YOLO-detect/fall/Home_video (2)_back.json"
+# POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/lie/780251760.975590_back.json"
+# DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/lie/780251760.975590_back.json"
 # POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/sitstill/Sitting (20).json"
 # DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/sitstill/Sitting (20).json"
-POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/walk/Walking (11).json"
-DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/walk/Walking (11).json"
+# POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/walk/Walking (70).json"
+# DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/walk/Walking (70).json"
 
 MODE             = "two-stage"    # "two-stage" | "binary-only" | "none"
 
 ENABLE_VIDEO     = True
-# VIDEO_PATH       = "medias/train_video/multi/liestill/780385481.887354_back.mp4"
+VIDEO_PATH       = "medias/train_video/binary/non_fall/Office_video (18)_back_front.mp4"
+# VIDEO_PATH       = "medias/raw_n_edited/fall_all/Home_video (2)_back.mp4"
+# VIDEO_PATH       = "medias/train_video/multi/lie/780251760.975590_back.mp4"
 # VIDEO_PATH       = "medias/train_video/multi/sitstill/Sitting (20).mp4"
-VIDEO_PATH       = "medias/train_video/multi/walk/Walking (11).mp4"
+# VIDEO_PATH       = "medias/train_video/multi/walk/Walking (70).mp4"
 VIDEO_FRAME_OFFSET = 0            # JSON 第 0 幀對應影片的第幾幀（對齊起點用）
 
-SKELETON_FPS     = 10              # 骨架的節奏（與影片無關）
+SKELETON_FPS     = 10             # 骨架的節奏（與影片無關）
 JSON_FRAME_OFFSET = 0             # JSON 幀起始偏移
 
 CANVAS_WIDTH     = 640
 CANVAS_HEIGHT    = 480
 SHOW_TOPK        = 3
 DEBUG_DRAW_MAPPING = False
+
+INITIAL_PAUSE    = True           # ★ 新增：起始先暫停，按 Space/滑鼠左鍵 才開始
 
 # 顏色
 COLOR_SKELETON   = (255, 255, 0)
@@ -61,6 +63,9 @@ COLOR_DET_BOX    = (100, 100, 255)
 COLOR_MAP_BORDER = (0, 200, 255)
 
 EXTRA_PY_PATHS   = []
+
+# Add a global variable for the threshold
+FALL_THRESHOLD = 0.7  # Default threshold for fall detection
 
 # ==============================
 # YOLOv8(=COCO-17) 關節連線
@@ -215,12 +220,13 @@ def binary_is_fall(r: dict, class_names: Optional[List[str]]) -> bool:
     pred = str(r.get("pred","")).lower()
     if "fall" in pred:
         return True
+    # Modify the binary_is_fall function to use the global threshold
     probs = r.get("probs", None)
     if isinstance(class_names, list) and isinstance(probs, list) and len(class_names) == len(probs):
         try:
             import numpy as _np
             fall_idx = class_names.index("fall")
-            return int(_np.argmax(_np.array(probs))) == fall_idx
+            return probs[fall_idx] >= FALL_THRESHOLD  # Use the global threshold
         except ValueError:
             pass
     return False
@@ -245,7 +251,7 @@ def extract_pred_prob(r: dict, class_names: Optional[List[str]], prefer_rare: bo
     return (str(pred) if pred else "N/A"), None
 
 # ==============================
-# 主流程：影片 wall-clock 同步 + 骨架自訂 FPS
+# 主流程：影片 wall-clock 同步 + 骨架自訂 FPS + 初始暫停
 # ==============================
 def main():
     pose_data = read_json(POSE_JSON_PATH)
@@ -288,55 +294,106 @@ def main():
             mul_index = build_frame_result_index(mres, total_json)
             print(f"[Info] Multi  windows={len(mres)} classes={mul_classes}")
 
-    # 牆鐘同步
-    start_t = time.perf_counter()
-    last_sk_idx = -1
-    cache = {}
-
-    # 初始化影片指標（避免反覆 set 影響效能）
+    # ------- 初始暫停：顯示起始畫面，按 Space/滑鼠左鍵才開始 -------
+    start_t = None
     last_v_idx = -1
-    if cap is not None and VIDEO_FRAME_OFFSET > 0:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(VIDEO_FRAME_OFFSET))
-        last_v_idx = VIDEO_FRAME_OFFSET - 1
+    last_sk_idx = -1
 
-    paused = False
+    if INITIAL_PAUSE:
+        # 準備畫布
+        canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
+        # 顯示影片起始影格
+        if cap is not None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(VIDEO_FRAME_OFFSET))
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                new_w = int(round(src_w * scale)); new_h = int(round(src_h * scale))
+                resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                canvas[y0:y0+new_h, x0:x0+new_w] = resized
+        # 顯示骨架/方框起始幀
+        sk0 = int(JSON_FRAME_OFFSET)
+        kps_pp, pose_boxes = parse_pose_frame(pose_data[min(max(sk0,0), total_json-1)])
+        det_objs = parse_detect_frame(det_data[min(max(sk0,0), total_json-1)])
+        if det_objs:
+            det_to_draw = [d for d in det_objs if str(d.get("class_name","")).lower() != "person"]
+            if det_to_draw:
+                draw_detections_mapped(canvas, det_to_draw, scale, x0, y0, color=COLOR_DET_BOX, thickness=1)
+        draw_skeletons_mapped(canvas, kps_pp, scale, x0, y0, point_color=COLOR_KP, line_color=COLOR_SKELETON, thickness=2)
+        if det_objs:
+            draw_detections_mapped(canvas, det_objs, scale, x0, y0, color=COLOR_DET_BOX, thickness=1)
 
+        # 疊加提示文字
+        msg = "Paused — Press SPACE or CLICK to start"
+        (tw, th), _ = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+        x_center = (CANVAS_WIDTH - tw) // 2
+        y_center = (CANVAS_HEIGHT) // 2
+        cv2.rectangle(canvas, (x_center-12, y_center- th - 12), (x_center + tw + 12, y_center + 12), (30,30,30), -1)
+        cv2.putText(canvas, msg, (x_center, y_center),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
+
+        started = [False]
+        def _on_mouse(event, x, y, flags, userdata):
+            if event == cv2.EVENT_LBUTTONDOWN:
+                started[0] = True
+
+        cv2.namedWindow("Detect+Pose Player (RealTime Sync)", cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback("Detect+Pose Player (RealTime Sync)", _on_mouse)
+        while True:
+            cv2.imshow("Detect+Pose Player (RealTime Sync)", canvas)
+            key = cv2.waitKey(10) & 0xFF
+            if key in (27, ord('q')):  # 允許直接離開
+                if cap is not None:
+                    cap.release()
+                cv2.destroyAllWindows()
+                return
+            if key == ord(' ') or started[0]:
+                break
+
+        # 釋放起始幀，重設影片指標到 offset，並準備 wall-clock 基準
+        if cap is not None:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(VIDEO_FRAME_OFFSET))
+        start_t = time.perf_counter()
+        last_v_idx = int(VIDEO_FRAME_OFFSET) - 1
+        last_sk_idx = int(JSON_FRAME_OFFSET) - 1
+    else:
+        start_t = time.perf_counter()
+        last_v_idx = int(VIDEO_FRAME_OFFSET) - 1
+        last_sk_idx = int(JSON_FRAME_OFFSET) - 1
+
+    cache = {}
+    # ------- 播放主迴圈 -------
     while True:
         now = time.perf_counter()
         elapsed = now - start_t
 
-        # 影片索引 = floor(elapsed * video_fps) + 偏移
-        if cap is not None:
+        # 影片索引（牆鐘同步）
+        if ENABLE_VIDEO and (cap is not None):
             target_v_idx = int(elapsed * video_fps) + int(VIDEO_FRAME_OFFSET)
             if target_v_idx >= total_vid:
                 break  # 播放完
             if target_v_idx != last_v_idx:
                 if target_v_idx == last_v_idx + 1:
-                    # 正常遞增：直接 read 下一幀（最快）
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         break
                 else:
-                    # 跳幀：seek 到目標幀，再 read
                     cap.set(cv2.CAP_PROP_POS_FRAMES, target_v_idx)
                     ok, frame = cap.read()
                     if not ok or frame is None:
                         break
                 last_v_idx = target_v_idx
 
-            # 建立畫布並貼影片
             canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
             new_w = int(round(src_w * scale)); new_h = int(round(src_h * scale))
             resized = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
             canvas[y0:y0+new_h, x0:x0+new_w] = resized
         else:
-            # 無影片：以骨架節奏刷新
             canvas = np.zeros((CANVAS_HEIGHT, CANVAS_WIDTH, 3), dtype=np.uint8)
 
-        # 骨架索引 = floor(elapsed * SKELETON_FPS) + 偏移
-        sk_idx = JSON_FRAME_OFFSET + int(elapsed * SKELETON_FPS)
+        # 骨架索引（牆鐘同步，自訂 FPS）
+        sk_idx = int(JSON_FRAME_OFFSET) + int(elapsed * SKELETON_FPS)
         if sk_idx >= total_json:
-            sk_idx = total_json - 1  # clamp
+            sk_idx = total_json - 1
 
         if sk_idx != last_sk_idx:
             kps_pp, pose_boxes = parse_pose_frame(pose_data[sk_idx])
@@ -364,22 +421,29 @@ def main():
 
         # 疊加骨架/框
         if cache:
+            # pose 的人框保留
             if cache["pose_boxes"]:
                 pseudo = [{"class_name": "person", "bbox": b, "confidence": 1.0} for b in cache["pose_boxes"]]
                 draw_detections_mapped(canvas, pseudo, scale, x0, y0, color=COLOR_POSE_BOX, thickness=1)
+
+            # 骨架
             draw_skeletons_mapped(canvas, cache["kps_pp"], scale, x0, y0, point_color=COLOR_KP, line_color=COLOR_SKELETON, thickness=2)
+
+            # detect 的 person 框不顯示；其他 detect 類別照常
             if cache["det_objs"]:
-                draw_detections_mapped(canvas, cache["det_objs"], scale, x0, y0, color=COLOR_DET_BOX, thickness=1)
+                det_to_draw = [d for d in cache["det_objs"] if str(d.get("class_name","")).lower() != "person"]
+                if det_to_draw:
+                    draw_detections_mapped(canvas, det_to_draw, scale, x0, y0, color=COLOR_DET_BOX, thickness=1)
 
         # 左上資訊
-        if cap is not None:
+        if ENABLE_VIDEO and (cap is not None):
             cv2.putText(canvas, f"V {last_v_idx+1}/{total_vid}  {video_fps:.2f}fps | SK {sk_idx+1}/{total_json}  {SKELETON_FPS}fps",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA)
         else:
             cv2.putText(canvas, f"SK {sk_idx+1}/{total_json}  {SKELETON_FPS}fps  (no video)",
                         (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA)
 
-        if DEBUG_DRAW_MAPPING and cap is not None:
+        if DEBUG_DRAW_MAPPING and ENABLE_VIDEO and (cap is not None):
             cv2.rectangle(canvas, (x0, y0), (x0+int(round(src_w*scale)), y0+int(round(src_h*scale))), COLOR_MAP_BORDER, 1)
 
         # 右上：推論標頭
@@ -395,29 +459,27 @@ def main():
 
         cv2.imshow("Detect+Pose Player (RealTime Sync)", canvas)
 
-        # 極短的 GUI 事件延遲：不阻塞播放（若硬體吃不消會丟幀）
+        # 不阻塞 GUI（1ms），保持 wall-clock 對齊（不足時丟幀）
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord('q')):
             break
         elif key == ord(' '):
-            paused = not paused
-            if paused:
-                # 暫停：停在畫面，直到再按空白或 q
-                while True:
-                    k2 = cv2.waitKey(10) & 0xFF
-                    if k2 in (27, ord('q')):
-                        cap and cap.release()
-                        cv2.destroyAllWindows()
-                        return
-                    elif k2 == ord(' '):
-                        # 續播：重設基準時間，避免 elapsed 積累
-                        # 令當前 elapsed 對應到現在的 v_idx / sk_idx
-                        now2 = time.perf_counter()
-                        # 將 start_t 往後推，讓 elapsed 維持原值
-                        start_t += (now2 - now)
-                        break
+            # 暫停：停住到再按空白或 q；續播時重設起始時間保持對齊
+            while True:
+                k2 = cv2.waitKey(10) & 0xFF
+                if k2 in (27, ord('q')):
+                    if cap is not None:
+                        cap.release()
+                    cv2.destroyAllWindows()
+                    return
+                elif k2 == ord(' '):
+                    now2 = time.perf_counter()
+                    paused_dt = now2 - now
+                    start_t += paused_dt
+                    break
 
-    cap and cap.release()
+    if ENABLE_VIDEO and (cap is not None):
+        cap.release()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
