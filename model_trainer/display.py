@@ -24,12 +24,14 @@ import numpy as np
 # ==============================
 # 🔧 設定區
 # ==============================
-POSE_JSON_PATH       = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
-DETECT_JSON_PATH     = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
+# POSE_JSON_PATH     = "outputs/skeletons/test/pose/Meet and Split (46).json"
+# DETECT_JSON_PATH   = "outputs/skeletons/test/detect/Meet and Split (46).json"
+# POSE_JSON_PATH   = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
+# DETECT_JSON_PATH = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
 # POSE_JSON_PATH   = "outputs/skeletons/binary-backup/YOLO-pose/fall/Home_video (2)_back.json"
 # DETECT_JSON_PATH = "outputs/skeletons/binary-backup/YOLO-detect/fall/Home_video (2)_back.json"
-# POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/lie/780251760.975590_back.json"
-# DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/lie/780251760.975590_back.json"
+POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/lie/780251760.975590_back.json"
+DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/lie/780251760.975590_back.json"
 # POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/sitstill/Sitting (20).json"
 # DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/sitstill/Sitting (20).json"
 # POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/walk/Walking (70).json"
@@ -38,9 +40,10 @@ DETECT_JSON_PATH     = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_vid
 MODE             = "two-stage"    # "two-stage" | "binary-only" | "none"
 
 ENABLE_VIDEO     = True
-VIDEO_PATH       = "medias/train_video/binary/non_fall/Office_video (18)_back_front.mp4"
+# VIDEO_PATH       = "medias/test/Meet and Split (46).mp4"
+# VIDEO_PATH       = "medias/train_video/binary/non_fall/Office_video (18)_back_front.mp4"
 # VIDEO_PATH       = "medias/raw_n_edited/fall_all/Home_video (2)_back.mp4"
-# VIDEO_PATH       = "medias/train_video/multi/lie/780251760.975590_back.mp4"
+VIDEO_PATH       = "medias/train_video/multi/lie/780251760.975590_back.mp4"
 # VIDEO_PATH       = "medias/train_video/multi/sitstill/Sitting (20).mp4"
 # VIDEO_PATH       = "medias/train_video/multi/walk/Walking (70).mp4"
 VIDEO_FRAME_OFFSET = 0            # JSON 第 0 幀對應影片的第幾幀（對齊起點用）
@@ -66,6 +69,102 @@ EXTRA_PY_PATHS   = []
 
 # Add a global variable for the threshold
 FALL_THRESHOLD = 0.7  # Default threshold for fall detection
+
+# ==============================
+# 🆕 新增：單人目標追蹤邏輯 (Target Tracker)
+# ==============================
+def _bbox_area(bbox):
+    # bbox: [x1, y1, x2, y2]
+    w = max(0, bbox[2] - bbox[0])
+    h = max(0, bbox[3] - bbox[1])
+    return w * h
+
+def _iou(box1, box2):
+    # box: [x1, y1, x2, y2]
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    b1_area = _bbox_area(box1)
+    b2_area = _bbox_area(box2)
+    union_area = b1_area + b2_area - inter_area
+    
+    return inter_area / (union_area + 1e-6)
+
+class TargetTracker:
+    def __init__(self, kp_conf_th=0.5, min_kps=5, iou_track_th=0.3):
+        self.last_bbox = None
+        self.kp_conf_th = kp_conf_th
+        self.min_kps = min_kps
+        self.iou_track_th = iou_track_th
+
+    def _count_valid_kps(self, kps):
+        cnt = 0
+        for k in kps:
+            # 兼容 dict 或 list 格式
+            conf = 1.0
+            if isinstance(k, dict):
+                conf = float(k.get('conf', k.get('confidence', 1.0)))
+            elif isinstance(k, (list, tuple)) and len(k) > 2:
+                conf = float(k[2])
+            if conf >= self.kp_conf_th:
+                cnt += 1
+        return cnt
+
+    def update(self, persons: List[dict]) -> Optional[dict]:
+        """
+        輸入: 本幀所有 person list
+        輸出: 被鎖定的那個 person dict，若無則回傳 None
+        """
+        if not persons:
+            self.last_bbox = None
+            return None
+
+        # 1. Tracking (嘗試追蹤上一幀的人)
+        if self.last_bbox is not None:
+            best_p = None
+            best_iou = -1.0
+            for p in persons:
+                bbox = p.get('bbox') or p.get('box')
+                if not bbox: continue
+                # 確保 bbox 格式為 list [x1,y1,x2,y2]
+                if len(bbox) == 4:
+                    val = _iou(self.last_bbox, bbox)
+                    if val > best_iou:
+                        best_iou = val
+                        best_p = p
+            
+            # 若 IoU 足夠高，認定為同一人，更新 bbox 並回傳
+            if best_iou >= self.iou_track_th and best_p:
+                self.last_bbox = best_p.get('bbox') or best_p.get('box')
+                return best_p
+            else:
+                # 追蹤失敗 (離開畫面或被遮擋)，清除記錄，進入重新選擇
+                self.last_bbox = None
+        
+        # 2. Selection (重新鎖定策略：骨架完整度優先，其次選最近/最大的)
+        candidates = []
+        for p in persons:
+            kps = p.get('keypoints', [])
+            bbox = p.get('bbox') or p.get('box')
+            if not bbox: continue
+            
+            vk = self._count_valid_kps(kps)
+            # 必須滿足最小骨架點數
+            if vk >= self.min_kps:
+                area = _bbox_area(bbox)
+                candidates.append((area, p))
+        
+        if not candidates:
+            return None
+            
+        # 依面積排序 (由大到小 -> 離鏡頭最近)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        selected = candidates[0][1]
+        self.last_bbox = selected.get('bbox') or selected.get('box')
+        return selected
 
 # ==============================
 # YOLOv8(=COCO-17) 關節連線
@@ -112,6 +211,95 @@ def parse_pose_frame(frame: dict):
                 pts.append((x, y))
         kps_pp.append(pts)
     return kps_pp, boxes
+
+def parse_pose_and_track(frame_data, tracker: TargetTracker):
+    """
+    解析 JSON 並區分：
+    - target_data: (kps_list, boxes_list) -> 被鎖定的人
+    - ignored_data: list of (kps_list, boxes_list) -> 其他被忽略的人
+    """
+    persons = []
+    
+    # === 1. 資料正規化：將不同格式統一轉為 List of Dicts ===
+    if isinstance(frame_data, dict):
+        # A. 優先找標準格式 (List of Dicts)
+        if 'persons' in frame_data:
+            persons = frame_data['persons']
+        elif 'bodies' in frame_data:
+            persons = frame_data['bodies']
+            
+        # B. 處理 YOLO 分離格式 (Structure of Arrays) -> 這是報錯的主因
+        # 如果 JSON 是 {"boxes": [...], "keypoints": [...]}
+        elif 'boxes' in frame_data and 'keypoints' in frame_data:
+            boxes = frame_data['boxes']
+            kps = frame_data['keypoints']
+            # 手動將它們合併成 person dict
+            persons = []
+            for i in range(min(len(boxes), len(kps))):
+                persons.append({
+                    'bbox': boxes[i],
+                    'keypoints': kps[i]
+                })
+        
+        # C. 只有 keypoints 的情況
+        elif 'keypoints' in frame_data:
+            kps = frame_data['keypoints']
+            # 將每個 keypoint list 包裝成 dict
+            persons = [{'keypoints': k, 'bbox': None} for k in kps]
+
+    elif isinstance(frame_data, list):
+        # 假設 list 裡面就是 person dicts
+        persons = frame_data
+
+    # === 2. 防呆檢查 ===
+    # 確保進入 Tracker 的每個元素真的是 Dict，避免 list.get() 錯誤
+    valid_persons = []
+    for p in persons:
+        if isinstance(p, dict):
+            valid_persons.append(p)
+        elif isinstance(p, list):
+            # 若發現還有單純的 list (例如純座標)，幫它包一層
+            valid_persons.append({'keypoints': p, 'bbox': None})
+    
+    # === 3. 呼叫追蹤器 ===
+    target_person = tracker.update(valid_persons)
+    
+    target_res = ([], []) # kps, boxes
+    ignored_res = []      # list of (kps, boxes)
+
+    for p in valid_persons:
+        # 提取 bbox
+        bbox = p.get('bbox') or p.get('box')
+        if bbox:
+            bbox = [float(x) for x in bbox] # 確保是 float list
+        
+        # 提取 keypoints (統一轉成 list of (x,y))
+        raw_kps = p.get('keypoints', [])
+        pts = []
+        # 防呆：有時 raw_kps 可能是 None
+        if raw_kps:
+            for k in raw_kps[:17]: 
+                # 支援 {"x":, "y":} 或 [x, y, c]
+                if isinstance(k, dict):
+                    pts.append((float(k.get('x',0)), float(k.get('y',0))))
+                elif isinstance(k, (list, tuple)) and len(k) >= 2:
+                    pts.append((float(k[0]), float(k[1])))
+                else:
+                    pts.append((0.0, 0.0))
+        else:
+            # 補 17 個 0
+            pts = [(0.0, 0.0)] * 17
+        
+        # 封裝結果
+        data_packet = ([pts], [bbox] if bbox else [])
+        
+        # 分類
+        if p is target_person:
+            target_res = data_packet
+        else:
+            ignored_res.append(data_packet)
+            
+    return target_res, ignored_res
 
 def parse_detect_frame(frame: dict) -> List[dict]:
     out = []
@@ -274,7 +462,7 @@ def main():
             src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
             total_vid = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             print(f"[Info] Video opened: fps={video_fps:.3f}, size=({src_w},{src_h}), frames={total_vid}")
-
+            
     if cap is None:
         # fallback：無影片時，用畫布尺寸當來源大小
         src_w, src_h = CANVAS_WIDTH, CANVAS_HEIGHT
@@ -294,6 +482,11 @@ def main():
             mul_index = build_frame_result_index(mres, total_json)
             print(f"[Info] Multi  windows={len(mres)} classes={mul_classes}")
 
+    # 🆕 初始化追蹤器
+    # min_kps=5: 至少要有5個點才納入候選
+    # iou_track_th=0.3: 前後幀重疊 30% 以上才持續追蹤
+    tracker = TargetTracker(kp_conf_th=0.5, min_kps=5, iou_track_th=0.3)
+    
     # ------- 初始暫停：顯示起始畫面，按 Space/滑鼠左鍵才開始 -------
     start_t = None
     last_v_idx = -1
@@ -396,9 +589,13 @@ def main():
             sk_idx = total_json - 1
 
         if sk_idx != last_sk_idx:
-            kps_pp, pose_boxes = parse_pose_frame(pose_data[sk_idx])
+            # 🆕 改用追蹤邏輯解析
+            # target_bundle: (kps_list, boxes_list) for target
+            # ignored_list: list of (kps_list, boxes_list) for others
+            target_bundle, ignored_list = parse_pose_and_track(pose_data[sk_idx], tracker)
             det_objs = parse_detect_frame(det_data[sk_idx])
 
+            # 處理文字標頭 (維持原樣)
             headers = []
             if MODE == "binary-only":
                 r = bin_index[sk_idx]
@@ -416,22 +613,38 @@ def main():
                         lab_m, prob_m = extract_pred_prob(rm, mul_classes, prefer_rare=False)
                         headers.append(f"MULTI: {lab_m} ({prob_m:.2f})" if prob_m is not None else f"MULTI: {lab_m}")
 
-            cache = {"kps_pp": kps_pp, "pose_boxes": pose_boxes, "det_objs": det_objs, "headers": headers}
+            # 更新 Cache 結構
+            cache = {
+                "target": target_bundle, 
+                "ignored": ignored_list, 
+                "det_objs": det_objs, 
+                "headers": headers
+            }
             last_sk_idx = sk_idx
 
         # 疊加骨架/框
         if cache:
-            # pose 的人框保留
-            if cache["pose_boxes"]:
-                pseudo = [{"class_name": "person", "bbox": b, "confidence": 1.0} for b in cache["pose_boxes"]]
-                draw_detections_mapped(canvas, pseudo, scale, x0, y0, color=COLOR_POSE_BOX, thickness=1)
+            # 1. 先畫「被忽略」的人 (灰色/暗色) - 代表這些人不會被送去判斷
+            for (ign_kps, ign_boxes) in cache.get("ignored", []):
+                # 畫框 (灰色)
+                pseudo = [{"class_name": "ignore", "bbox": b, "confidence": 0.5} for b in ign_boxes]
+                draw_detections_mapped(canvas, pseudo, scale, x0, y0, color=(128, 128, 128), thickness=1)
+                # 畫骨架 (灰色)
+                draw_skeletons_mapped(canvas, ign_kps, scale, x0, y0, point_color=(128,128,128), line_color=(100,100,100), thickness=1)
 
-            # 骨架
-            draw_skeletons_mapped(canvas, cache["kps_pp"], scale, x0, y0, point_color=COLOR_KP, line_color=COLOR_SKELETON, thickness=2)
+            # 2. 再畫「被鎖定」的目標 (亮色/綠色) - 代表這是傳給後端的對象
+            tgt_kps, tgt_boxes = cache.get("target", ([], []))
+            if tgt_boxes:
+                # 畫框 (亮青色)
+                pseudo = [{"class_name": "TARGET", "bbox": b, "confidence": 1.0} for b in tgt_boxes]
+                draw_detections_mapped(canvas, pseudo, scale, x0, y0, color=(0, 255, 255), thickness=2)
+                # 畫骨架 (標準亮色: 點綠/線黃)
+                draw_skeletons_mapped(canvas, tgt_kps, scale, x0, y0, point_color=COLOR_KP, line_color=COLOR_SKELETON, thickness=2)
 
-            # detect 的 person 框不顯示；其他 detect 類別照常
-            if cache["det_objs"]:
-                det_to_draw = [d for d in cache["det_objs"] if str(d.get("class_name","")).lower() != "person"]
+            # 3. 畫環境物件 (Detect JSON 中的物品，排除 person)
+            det_objs = cache.get("det_objs", [])
+            if det_objs:
+                det_to_draw = [d for d in det_objs if str(d.get("class_name","")).lower() != "person"]
                 if det_to_draw:
                     draw_detections_mapped(canvas, det_to_draw, scale, x0, y0, color=COLOR_DET_BOX, thickness=1)
 
