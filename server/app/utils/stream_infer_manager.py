@@ -948,14 +948,19 @@ class StreamInferManager:
                         "size": len(_clip),
                         "win": {"window": BIN_WINDOW, "stride": BIN_STRIDE}
                     }
-                    if self.handlers.get("on_fall_start"):
-                        self._spawn(
-                            self.handlers["on_fall_start"](
-                                user_id=user_id, start_time=start_time, result=result_dict, clip=clip_meta
-                            ),
-                            tag=f"fall_start:{user_id}"
-                        )
-
+                    curr_act = self._curr_action.get(user_id)
+                if self.handlers.get("on_fall_start"):
+                    self._spawn(
+                        self.handlers["on_fall_start"](
+                            user_id=user_id,
+                            start_time=start_time,
+                            result=result_dict,
+                            prev_action_name=curr_act,
+                            curr_action_name="fall",
+                            clip=clip_meta
+                        ),
+                        tag=f"fall_start:{user_id}"
+                    )
                     # 若此時有正在進行的動作（如 walk），先把它 recover，curr 指向 fall
                     try:
                         curr_act = self._curr_action.get(user_id)
