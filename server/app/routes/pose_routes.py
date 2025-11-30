@@ -24,7 +24,9 @@ POSE_BEFORE_FALL = "站立"
 # 事件 Handler（供推論核心呼叫）
 # ---------------------------
 async def on_fall_start(user_id: str, start_time: str, result: dict = None,
-                        peak_score: float = None, payload: dict = None, clip: dict = None, **kwargs):
+                        peak_score: float = None, prev_action_name: str | None = None,
+                        curr_action_name: str | None = None, payload: dict = None,
+                        clip: dict = None, **kwargs):
     """
     跌倒開始：寫 DB + 基本 log
     """
@@ -35,30 +37,40 @@ async def on_fall_start(user_id: str, start_time: str, result: dict = None,
     _start = clip.get("start") if isinstance(clip, dict) else None
     _end = clip.get("end") if isinstance(clip, dict) else None
 
+    pose_before = (prev_action_name or POSE_BEFORE_FALL)
     body = {
         "elder_id": elder_id,
         "start": _start,
-        "end": _end,
+        "end": _end
     }
     try:
         print(f"[FALL_START] {user_id} {start_time}")
         # 依你的 service 實作調整欄位
+        if pose_before.lower() in ["lie", "liestill", "lying"]:
+            pose_before = "躺"
+        elif pose_before.lower() in ["sit", "sitstill", "sitting"]:
+            pose_before = "坐"
+        else:
+            pose_before = "走路"
         record_id = await add_fall_event(
             user_id=int(user_id),
             location=LOCATION,
-            pose_before_fall=POSE_BEFORE_FALL,
+            pose_before_fall=pose_before,
             detected_time=start_time
         )
         print(f"[FALL EVENT] user_id={user_id} recorded to DB.")
         url = "https://smartcare.southeastasia.cloudapp.azure.com/eric/webhook/elder"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=body, timeout=5) as response:
-                print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
-                try:
-                    response_data = await response.json()
-                    print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
-                except Exception as e:
-                    print("[WEBHOOK RESPONSE][ERROR]", str(e))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=body, timeout=10) as response:
+                    print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
+                    try:
+                        response_data = await response.json()
+                        print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
+                    except Exception as e:
+                        print("[WEBHOOK RESPONSE][ERROR]", str(e))
+        except Exception as e:
+            print(f"[Webhook][Warn] 無法發送跌倒通知 (可能是測試端未開啟): {e}")
     except Exception as e:
         print(f"[FALL_START][ERROR] user_id={user_id}: {e}")
         traceback.print_exc()
