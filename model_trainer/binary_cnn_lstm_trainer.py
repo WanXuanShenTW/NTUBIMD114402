@@ -46,7 +46,9 @@ class Config:
     pose_root = "outputs/skeletons/binary/YOLO-pose"
     obj_root  = "outputs/skeletons/binary/YOLO-detect"
     out_dir   = "outputs/models/HM/focal/binary"
-
+    video_root = "medias/train_video/binary"   # 請改成你存放影片的根目錄
+    video_exts = [".mp4", ".avi", ".mov", ".mkv"] # 支援多種格式 (優先順序)
+    
     # 是否使用物件框
     use_objects = True            
     object_classes = ["bed", "chair", "bench"]  # 空則不建立物件通道
@@ -126,7 +128,7 @@ _LSTM_LAYERS = 2
 _WEIGHT_DECAY = 1e-4
 _GRAD_CLIP = 1.0
 _AMP = False
-_EARLY_STOP_PATIENCE = 10
+_EARLY_STOP_PATIENCE = 5
 _SAVE_TOP_K = 3
 _FOCAL_GAMMA = 2.0
 _MOTION_CLIP_V = 5.0   # 10 FPS 建議放寬一點 (原本 3.0)
@@ -602,9 +604,16 @@ def _list_json_files_recursive(root):
                 files.append(os.path.join(dirpath, fn))
     return sorted(files)
 
-def load_pose_sequence(pose_path):
+def load_pose_sequence(pose_path, video_root=None, video_exts=None):
+    """
+    讀取骨架序列，並嘗試從同名影片檔讀取正確的 W, H。
+    如果找不到影片，會印出警告並回退到掃描骨架最大值。
+    """
+    if video_exts is None: video_exts = [".mp4"] # 預設
+    
     poses = {}
     files = []
+    
     if os.path.isdir(pose_path):
         for dirpath, _, filenames in os.walk(pose_path):
             for fn in filenames:
@@ -612,15 +621,81 @@ def load_pose_sequence(pose_path):
                     files.append(os.path.join(dirpath, fn))
     elif os.path.isfile(pose_path):
         files = [pose_path]
+
     for fp in files:
         recs = read_any_json(fp)
+        
+        # === [核心修改] 嘗試讀取對應的影片解析度 ===
+        fixed_w, fixed_h = 0.0, 0.0
+        
+        # 嘗試尋找影片的邏輯
+        found_video = False
+        if video_root and os.path.isdir(video_root):
+            # 取得檔名 (不含副檔名)
+            base_name = os.path.splitext(os.path.basename(fp))[0]
+            # 取得父資料夾名稱 (例如 "fall")
+            parent_dir = os.path.basename(os.path.dirname(fp))
+            
+            # 嘗試所有可能的副檔名
+            for ext in video_exts:
+                # 嘗試 1: video_root/class/video.mp4
+                vid_path = os.path.join(video_root, parent_dir, base_name + ext)
+                if not os.path.exists(vid_path):
+                    # 嘗試 2: video_root/video.mp4 (不分資料夾)
+                    vid_path = os.path.join(video_root, base_name + ext)
+                
+                if os.path.exists(vid_path):
+                    try:
+                        cap = cv2.VideoCapture(vid_path)
+                        if cap.isOpened():
+                            fixed_w = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                            fixed_h = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                            found_video = True
+                            # print(f"[Info] Found video: {vid_path} -> {fixed_w}x{fixed_h}")
+                        cap.release()
+                    except Exception as e:
+                        print(f"[Error] Failed to read video metadata: {vid_path}, err={e}")
+                    
+                    if found_video: break # 找到了就跳出迴圈
+
+        # 如果找不到影片，印出警告 (方便除錯)
+        if not found_video and video_root:
+             print(f"[Warn] Video not found for JSON: {os.path.basename(fp)} (checked in {video_root})")
+
+        # === [備案] 如果沒影片或讀失敗，回退到「掃描骨架最大值」 ===
+        if fixed_w == 0 or fixed_h == 0:
+            max_x, max_y = 0.0, 0.0
+            for r in recs:
+                # 掃描 persons
+                persons = r.get("persons", []) if isinstance(r, dict) else []
+                for p in persons:
+                    for k in p.get("keypoints", []):
+                        max_x = max(max_x, float(k.get("x", 0)))
+                        max_y = max(max_y, float(k.get("y", 0)))
+                # 掃描 boxes
+                boxes = (r.get('boxes') if isinstance(r,dict) else []) or []
+                for b in boxes: 
+                     if isinstance(b,(list,tuple)) and len(b)==4: 
+                         max_x=max(max_x, b[2]); max_y=max(max_y, b[3])
+            
+            # 給一點緩衝，避免座標貼邊
+            fixed_w = max(640.0, max_x + 10)
+            fixed_h = max(480.0, max_y + 10)
+            
+            # 如果是回退模式，也可以印個 log 讓你知道
+            # print(f"[Info] Fallback resolution for {os.path.basename(fp)}: {fixed_w}x{fixed_h}")
+        
+        # 3. 寫入每一幀
         for idx, r in enumerate(recs):
-            if isinstance(r, dict) and r.get("type") not in (None, "pose"):
-                continue
+            if isinstance(r, dict) and r.get("type") not in (None, "pose"): continue
             fid = _get_frame_id(r) if isinstance(r, dict) else None
-            if fid is None:
-                fid = idx
-            poses[fid] = r if isinstance(r, dict) else {"raw": r}
+            if fid is None: fid = idx
+            
+            frame_data = r if isinstance(r, dict) else {"raw": r}
+            frame_data['_fixed_w'] = fixed_w
+            frame_data['_fixed_h'] = fixed_h
+            poses[fid] = frame_data
+            
     return poses
 
 def load_object_sequence(obj_path):
@@ -669,8 +744,16 @@ def _find_sequences_for_class(pose_cdir, obj_cdir, use_objects):
 def _extract_pose_basic(p):
     bbox = None
     kps_list = []
-    img_w = 1.0
-    img_h = 1.0
+    
+    # 優先讀取 load_pose_sequence 算好的固定解析度
+    if isinstance(p, dict) and '_fixed_w' in p:
+        img_w = float(p['_fixed_w'])
+        img_h = float(p['_fixed_h'])
+    else:
+        # 萬一沒有，才用舊邏輯猜 (通常不會發生)
+        img_w = 640.0
+        img_h = 480.0
+
     if isinstance(p, dict) and p.get("persons"):
         person = max(p.get("persons", []), key=lambda x: x.get("score", 0.0))
         bbox = person.get("bbox")
@@ -679,32 +762,28 @@ def _extract_pose_basic(p):
             {"x": float(k.get("x", 0.0)), "y": float(k.get("y", 0.0)), "conf": float(k.get("conf", k.get("confidence", 1.0)))}
             for k in (kps_list[:17] if isinstance(kps_list, list) else [])
         ]
-        img_w = p.get("image_size", {}).get("width", 1) or 1
-        img_h = p.get("image_size", {}).get("height", 1) or 1
+        # 如果 JSON 本身有 image_size 且沒有 _fixed_w，也可以用
+        if '_fixed_w' not in p:
+            img_w = p.get("image_size", {}).get("width", img_w) or img_w
+            img_h = p.get("image_size", {}).get("height", img_h) or img_h
+
     else:
+        # Fallback for old format
         boxes = (p.get("boxes") if isinstance(p, dict) else None) or []
         kps_all = (p.get("keypoints") if isinstance(p, dict) else None) or []
         best_i, best_area = 0, -1
         for i, b in enumerate(boxes):
-            if not (isinstance(b, (list, tuple)) and len(b) == 4):
-                continue
+            if not (isinstance(b, (list, tuple)) and len(b) == 4): continue
             x1, y1, x2, y2 = b
             area = max(0, x2 - x1) * max(0, y2 - y1)
-            if area > best_area:
-                best_area = area; best_i = i
+            if area > best_area: best_area = area; best_i = i
         bbox = boxes[best_i] if boxes else None
         kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
         kps_list = ([{"x": float(x), "y": float(y), "conf": 1.0} for (x, y) in kp_raw[:17]] if kp_raw else [])
-        xs, ys = [], []
-        for b in boxes:
-            if isinstance(b, (list, tuple)) and len(b) == 4:
-                xs += [b[0], b[2]]; ys += [b[1], b[3]]
-        for grp in kps_all:
-            for pt in grp:
-                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                    xs.append(pt[0]); ys.append(pt[1])
-        img_w = max(1.0, max(xs) if xs else 640.0)
-        img_h = max(1.0, max(ys) if ys else 480.0)
+        
+        # 如果是舊邏輯且沒有 _fixed_w，這裡原本是用 max(xs) 猜
+        # 但現在我們盡量依賴 _fixed_w
+
     return bbox, kps_list, float(img_w), float(img_h)
 
 # ===================== Dataset =====================
@@ -893,7 +972,11 @@ class PoseObjectDataset(Dataset):
 
             for pose_path, obj_path in seq_paths:
                 # 讀單一序列（以 frame_id 為 key 的 dict）
-                poses = load_pose_sequence(pose_path)
+                poses = load_pose_sequence(
+                    pose_path, 
+                    video_root=getattr(self.cfg, "video_root", None),
+                    video_exts=getattr(self.cfg, "video_exts", [".mp4"])
+                )
                 objs  = load_object_sequence(obj_path) if (self.use_objects and obj_path) else {}
 
                 # 兩邊取交集的 frame 清單

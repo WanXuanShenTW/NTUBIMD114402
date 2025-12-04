@@ -304,29 +304,48 @@ def _bbox_xyxy_from_any(b):
         return float(b[0]),float(b[1]),float(b[2]),float(b[3])
     return None
 
-def extract_pose_from_record(rec: dict):
+def extract_pose_from_record(rec: dict, fixed_w=None, fixed_h=None):
+    # 1. 解析 BBox 與 Keypoints
     if isinstance(rec, dict) and rec.get("persons"):
         person = max(rec.get("persons", []), key=lambda x: x.get("score", 0.0))
         bbox = person.get("bbox")
         kps = person.get("keypoints") or []
         kps_list = ([{"x": float(k.get("x",0.0)), "y": float(k.get("y",0.0)), "conf": float(k.get("conf", k.get("confidence",1.0)))} for k in kps[:17]] if kps else [])
-        img_w = rec.get("image_size",{}).get("width", 640.0) or 640.0
-        img_h = rec.get("image_size",{}).get("height",480.0) or 480.0
-        return bbox, kps_list, float(img_w), float(img_h)
-    
-    boxes = (rec.get('boxes') if isinstance(rec, dict) else None) or []
-    kps_all = (rec.get('keypoints') if isinstance(rec, dict) else None) or []
-    best_i, best_area = 0, -1
-    for i,b in enumerate(boxes):
-        if not (isinstance(b,(list,tuple)) and len(b)==4): continue
-        x1,y1,x2,y2 = b
-        area = max(0,x2-x1)*max(0,y2-y1)
-        if area>best_area: best_i=i; best_area=area
-    bbox = boxes[best_i] if boxes else None
-    kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
-    kps_list = ([{"x":float(x),"y":float(y),"conf":1.0} for (x,y) in kp_raw[:17]] if kp_raw else [])
-    img_w = 640.0; img_h = 480.0 
-    return bbox, kps_list, img_w, img_h
+        
+        # 嘗試讀取 JSON 內的 image_size
+        img_w = rec.get("image_size",{}).get("width", 0.0)
+        img_h = rec.get("image_size",{}).get("height",0.0)
+    else:
+        # Fallback for other formats
+        boxes = (rec.get('boxes') if isinstance(rec, dict) else None) or []
+        kps_all = (rec.get('keypoints') if isinstance(rec, dict) else None) or []
+        best_i, best_area = 0, -1
+        for i,b in enumerate(boxes):
+            if not (isinstance(b,(list,tuple)) and len(b)==4): continue
+            x1,y1,x2,y2 = b
+            area = max(0,x2-x1)*max(0,y2-y1)
+            if area>best_area: best_i=i; best_area=area
+        bbox = boxes[best_i] if boxes else None
+        kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
+        kps_list = ([{"x":float(x),"y":float(y),"conf":1.0} for (x,y) in kp_raw[:17]] if kp_raw else [])
+        img_w = 0.0; img_h = 0.0
+
+    # === [關鍵修改] 決定最終寬高 ===
+    # 優先權 1: 外部傳入的固定寬高 (來自影片檔或全域掃描)
+    if fixed_w and fixed_h and fixed_w > 0 and fixed_h > 0:
+        final_w = fixed_w
+        final_h = fixed_h
+    # 優先權 2: JSON 裡面自帶的 image_size
+    elif img_w > 0 and img_h > 0:
+        final_w = img_w
+        final_h = img_h
+    # 優先權 3: (最不推薦) 用座標最大值去猜 --> 這是導致抖動的主因
+    else:
+        # 這裡可以設一個預設值 (例如 1920x1080) 來避免太離譜的抖動
+        final_w = 1920.0 
+        final_h = 1080.0
+        
+    return bbox, kps_list, float(final_w), float(final_h)
 
 def extract_objects_from_record(rec: dict):
     objs = (rec.get('objects') if isinstance(rec, dict) else None) or \
@@ -475,11 +494,44 @@ def frame_has_full_skeleton(bbox, kps, *, kp_need=17, require_bbox=True):
             
     return cnt >= kp_need
 
+def try_get_video_resolution(json_path):
+    """嘗試尋找同名影片並讀取解析度"""
+    if not json_path: return 0, 0
+    
+    # 可能的副檔名
+    exts = [".mp4", ".avi", ".mov", ".mkv"]
+    base_no_ext = os.path.splitext(json_path)[0]
+    
+    found_path = None
+    for ext in exts:
+        test_path = base_no_ext + ext
+        if os.path.exists(test_path):
+            found_path = test_path
+            break
+            
+    if found_path:
+        try:
+            cap = cv2.VideoCapture(found_path)
+            if cap.isOpened():
+                w = float(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                h = float(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                cap.release()
+                print(f"[Info] Loader found video: {os.path.basename(found_path)} ({int(w)}x{int(h)})")
+                return w, h
+        except:
+            pass
+            
+    print(f"[Warn] Loader could not find video for {os.path.basename(json_path)}, coordinate stability might suffer.")
+    return 0, 0
+
 # ===================== 主流程 =====================
 def run_on_json(pose_json: str, object_json: Optional[str]=None):
     poses = read_any_json(pose_json)
     objs  = read_any_json(object_json) if object_json else None
     T = len(poses)
+    
+    fixed_w, fixed_h = try_get_video_resolution(pose_json)
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     in_ch = 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + len(OBJECT_CLASSES) + 2
@@ -514,7 +566,11 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
         for start in range(0, max(0, T - WINDOW + 1), STRIDE):
             parsed = []
             for i in range(start, start + WINDOW):
-                bbox, kps, img_w, img_h = extract_pose_from_record(poses[i])
+                bbox, kps, img_w, img_h = extract_pose_from_record(
+                    poses[i], 
+                    fixed_w=fixed_w, 
+                    fixed_h=fixed_h
+                )
                 dets = get_obj(i)
                 parsed.append((bbox, kps, dets, img_w, img_h))
 
