@@ -45,7 +45,7 @@ class Config:
     # 路徑（分開設定）
     pose_root = "outputs/skeletons/binary/YOLO-pose"
     obj_root  = "outputs/skeletons/binary/YOLO-detect"
-    out_dir   = "outputs/models/binary"
+    out_dir   = "outputs/models/HM/focal/binary"
 
     # 是否使用物件框
     use_objects = True            
@@ -56,7 +56,7 @@ class Config:
     stride = 5
     
     # —— 針對稀有/非稀有類別的差別步長（只影響建 window）——
-    stride_pos = 3   # fall 類用更密的 stride（例：2 幀）
+    stride_pos = 1   # fall 類用更密的 stride（例：2 幀）
     stride_neg = 5   # non_fall 類維持原本（例：5 幀）
 
     # （可選）限制每支 non_fall 影片最多切多少個 window，0=不限制
@@ -64,7 +64,11 @@ class Config:
 
     # Relation Map
     H, W = 64, 64
-    include_bone_lines = True
+    include_bone_lines = False
+
+    # === Heatmap 參數 ===
+    sigma_kp = 2.0   # 骨架點的高斯 sigma
+    sigma_obj = 4.0  # 物件中心填滿的高斯 sigma (較大)
 
     # 模型
     lstm_hidden  = 256
@@ -75,7 +79,7 @@ class Config:
     # 訓練
     epochs     = 50
     batch_size = 8
-    lr         = 1e-3
+    lr         = 1e-5
     use_sampler = True
     loss = "focal"               # "focal" | "ce"
     
@@ -85,13 +89,14 @@ class Config:
     binary_class_names = ("non_fall", "fall")  # (非稀有, 稀有) 兩類名稱
 
     # 輸入前處理 / 過濾規則（沿用基準）
-    enable_kalman = True
-    kalman_half_slide = True
     require_full_first_frame = True
     half_len_override = None
     require_full_skeleton_all = False
     full_kp_min = 8
-    bbox_required = True
+    bbox_required = False
+
+    # 插值設定
+    max_missing_interpolate = 3  # 訓練時最多連續補幾幀
 
     # ====== On-the-fly 擴增（只給稀有類：fall；不改模型大小/輸出）======
     aug_for_rare = True           # 開啟針對稀有類（fall）的擴增
@@ -106,10 +111,10 @@ class Config:
     aug_kp_dropout_prob = 0.05     # 少量 keypoints 置為低信心，模擬遮擋
 
     # ---- Non-fall 下採樣（只影響資料量，不改模型結構）----
-    non_fall_downsample_ratio = 0.25   # 設 1.0 表示不下採樣；0.5 表示保留一半
+    non_fall_downsample_ratio = 1.0   # 設 1.0 表示不下採樣；0.5 表示保留一半
 
     # ---- Fall 過採樣（訓練索引層面重複正類樣本；不改模型結構）----
-    pos_oversample_mult = 3           # 1=不過採樣；2=將 fall 索引重複 2 倍
+    pos_oversample_mult = 1           # 1=不過採樣；2=將 fall 索引重複 2 倍
 
 # ===================== 穩定預設 =====================
 _SEED = 42
@@ -120,10 +125,12 @@ _CNN_OUT = 256
 _LSTM_LAYERS = 2
 _WEIGHT_DECAY = 1e-4
 _GRAD_CLIP = 1.0
-_AMP = True
+_AMP = False
 _EARLY_STOP_PATIENCE = 10
 _SAVE_TOP_K = 3
 _FOCAL_GAMMA = 2.0
+_MOTION_CLIP_V = 5.0   # 10 FPS 建議放寬一點 (原本 3.0)
+_MOTION_CLIP_A = 10.0  # (原本 9.0)
 
 COCO_EDGES = [
     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
@@ -142,37 +149,148 @@ def ensure_dir(p):
 
 # ===================== Relation Map（對齊推論側） =====================
 class RelationMapConfig:
-    def __init__(self, H=64, W=64, sigma_kp=3.0, kp_conf_th=0.4,
-                 include_bone_lines=True, object_classes=None):
+    def __init__(self, H=64, W=64, sigma_kp=2.0, sigma_obj=4.0, kp_conf_th=0.4,
+                 include_bone_lines=False, object_classes=None):
         self.H = int(H); self.W = int(W)
         self.sigma_kp = float(sigma_kp)
+        self.sigma_obj = float(sigma_obj)
         self.kp_conf_th = float(kp_conf_th)
         self.include_bone_lines = bool(include_bone_lines)
         self.object_classes = [c.strip() for c in (object_classes or []) if c and c.strip()]
 
 def gaussian2d(shape, sigma):
+    """生成中心為 1.0 的高斯核"""
     m, n = [(ss - 1.) / 2. for ss in shape]
     y, x = np.ogrid[-m:m+1, -n:n+1]
     h = np.exp(-(x*x + y*y)/(2*sigma*sigma))
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
     return h
 
-def draw_gaussian(canvas, cx, cy, sigma, mag=1.0):
+def draw_gaussian_on_channel(channel, cx, cy, sigma, mag=1.0):
+    """
+    在指定的 channel (H, W) 上，於 (cx, cy) 繪製高斯熱圖。
+    使用 max 取值 (避免重疊時數值過大)。
+    """
     if cx is None or cy is None:
         return
-    Hc, Wc = canvas.shape
+    
+    Hc, Wc = channel.shape
     x = int(cx); y = int(cy)
+    
+    # 確保在畫布範圍內
+    if x < 0 or x >= Wc or y < 0 or y >= Hc:
+        return
+
     size = int(6 * sigma + 3)
     g = gaussian2d((size, size), sigma)
+    g *= mag # 應用亮度 (信心度)
+
     x0 = x - size // 2; y0 = y - size // 2
-    x1 = min(Wc, x0 + size); y1 = min(Hc, y0 + size)
+    x1 = x0 + size;    y1 = y0 + size
+    
+    # 計算在 g 中的裁切範圍
     g_x0 = max(0, -x0); g_y0 = max(0, -y0)
-    gx1 = g_x0 + (x1 - max(0, x0)); gy1 = g_y0 + (y1 - max(0, y0))
-    if x0 < Wc and y0 < Hc and x1 > 0 and y1 > 0:
-        canvas[max(0,y0):y1, max(0,x0):x1] = np.maximum(
-            canvas[max(0,y0):y1, max(0,x0):x1],
-            g[g_y0:gy1, g_x0:gx1] * float(mag)
+    g_x1 = g_x0 + min(Wc, x1) - max(0, x0)
+    g_y1 = g_y0 + min(Hc, y1) - max(0, y0)
+    
+    # 計算在 channel 中的裁切範圍
+    c_x0 = max(0, x0); c_y0 = max(0, y0)
+    c_x1 = min(Wc, x1); c_y1 = min(Hc, y1)
+
+    if c_x1 > c_x0 and c_y1 > c_y0:
+        # 使用 np.maximum 避免疊加過亮
+        channel[c_y0:c_y1, c_x0:c_x1] = np.maximum(
+            channel[c_y0:c_y1, c_x0:c_x1],
+            g[g_y0:g_y1, g_x0:g_x1]
         )
+
+def rasterize_frame(bbox, kps_list, dets, img_w, img_h, cfg: RelationMapConfig):
+    Hc, Wc = cfg.H, cfg.W
+    
+    # === Channel 定義 ===
+    # 1. 骨架點: 17 個 Channel (獨立)
+    num_kp = 17
+    # 2. 骨骼連線: (可選)
+    num_edges = len(COCO_EDGES) if cfg.include_bone_lines else 0
+    # 3. 物件: N 個 Channel (獨立)
+    num_obj_ch = len(cfg.object_classes)
+    # 4. CoordConv: 2 個 Channel (x, y)
+    num_coord = 2
+    
+    # 總 Channel 數
+    C = num_kp + num_edges + num_obj_ch + num_coord
+    canvas = np.zeros((C, Hc, Wc), dtype=np.float32)
+    ch = 0
+
+    # --- 1. 繪製骨架點 (17 Channels) ---
+    # 修正正規化邏輯：直接依比例縮放，不需額外減 mean 除 std
+    if kps_list:
+        # 只取前 17 點
+        current_kps = kps_list[:num_kp]
+        for i, kp in enumerate(current_kps):
+            # 每個點佔用獨立 Channel
+            target_ch = ch + i 
+            try:
+                conf = float(kp.get('conf', kp.get('confidence', 1.0)))
+                if conf < cfg.kp_conf_th:
+                    continue
+                
+                # 座標縮放 (直接映射)
+                raw_x, raw_y = float(kp['x']), float(kp['y'])
+                x = np.clip((raw_x / img_w) * Wc, 0, Wc - 1)
+                y = np.clip((raw_y / img_h) * Hc, 0, Hc - 1)
+                
+                # 繪製高斯 (mag=1.0 固定亮度，或可改為 mag=conf)
+                # 這裡我們先依之前的結論：位置準確比較重要，暫時用固定亮度 1.0，
+                # 但若要抗雜訊，這裡改 mag=conf 也是可以的 (我們上一輪決定先不加)
+                draw_gaussian_on_channel(canvas[target_ch], x, y, cfg.sigma_kp, mag=1.0)
+                
+            except Exception:
+                pass
+    ch += num_kp
+
+    # --- 2. 繪製骨骼連線 (可選) ---
+    if cfg.include_bone_lines:
+        # ... (這部分第一階段先跳過，程式碼可以先留著或註解掉) ...
+        # 如果需要加，記得把線畫在 canvas[ch + e_idx]
+        pass
+    ch += num_edges # 即使不畫，也要佔位，或者動態調整 C
+
+    # --- 3. 繪製物件 (Object Channels - Gaussian Fill) ---
+    if num_obj_ch > 0 and dets:
+        cls2ch = {name: i for i, name in enumerate(cfg.object_classes)}
+        for d in dets or []:
+            name = d.get("cls_name") or d.get("class_name") or d.get("label") or d.get("name")
+            if name not in cls2ch:
+                continue
+            
+            bb = d.get("bbox") or d.get("xyxy") or {}
+            bxyxy = _bbox_xyxy_from_any(bb)
+            if bxyxy is None: continue
+            
+            x1, y1, x2, y2 = bxyxy
+            # 計算中心點與概略半徑
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            
+            # 縮放至 Map 座標
+            map_cx = (cx / img_w) * Wc
+            map_cy = (cy / img_h) * Hc
+            
+            # 繪製物件 (使用較大的 sigma_obj)
+            # 這裡我們用 "高斯填滿" 的概念：在中心畫一個大高斯
+            # 這樣比填滿矩形好，因為有中心強度的概念
+            obj_idx = cls2ch[name]
+            draw_gaussian_on_channel(canvas[ch + obj_idx], map_cx, map_cy, cfg.sigma_obj, mag=1.0)
+            
+    ch += num_obj_ch
+
+    # --- 4. CoordConv ---
+    xv = np.linspace(-1, 1, Wc)[None, :].repeat(Hc, 0)
+    yv = np.linspace(-1, 1, Hc)[:, None].repeat(Wc, 1)
+    canvas[ch] = xv; canvas[ch+1] = yv; ch += 2
+
+    return canvas
 
 def _bbox_xyxy_from_any(b):
     if b is None:
@@ -188,82 +306,6 @@ def _bbox_xyxy_from_any(b):
         x1,y1,x2,y2 = map(float,b)
         return x1,y1,x2,y2
     return None
-
-def rasterize_frame(bbox, kps_list, dets, img_w, img_h, cfg: RelationMapConfig):
-    Hc, Wc = cfg.H, cfg.W
-    num_kp = 17
-    num_edges = len(COCO_EDGES) if cfg.include_bone_lines else 0
-    num_obj_ch = len(cfg.object_classes)
-    num_coord = 2
-    C = 2 + num_kp + num_edges + num_obj_ch + num_coord
-    canvas = np.zeros((C, Hc, Wc), dtype=np.float32)
-    ch = 0
-    # 1) bbox mask
-    if bbox:
-        bxyxy = _bbox_xyxy_from_any(bbox)
-        if bxyxy is not None:
-            x1,y1,x2,y2 = bxyxy
-            x1 = int(np.clip((x1/img_w)*Wc, 0, Wc-1)); x2 = int(np.clip((x2/img_w)*Wc, 0, Wc-1))
-            y1 = int(np.clip((y1/img_h)*Hc, 0, Hc-1)); y2 = int(np.clip((y2/img_h)*Hc, 0, Hc-1))
-            if x2>=x1 and y2>=y1:
-                canvas[ch, y1:y2+1, x1:x2+1] = 1.0
-    ch += 1
-    # 2) distance transform
-    inv = (1.0 - canvas[ch-1]).astype(np.uint8)*255
-    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-    if dist.max() > 0:
-        dist = dist / dist.max()
-    canvas[ch] = dist; ch += 1
-    # 3) keypoints heatmaps
-    if kps_list:
-        for i, kp in enumerate(kps_list[:num_kp]):
-            try:
-                conf = float(kp.get('conf', kp.get('confidence',1.0)))
-                if conf < _KP_CONF_TH:
-                    continue
-                x = (float(kp['x'])/img_w)*Wc; y = (float(kp['y'])/img_h)*Hc
-                draw_gaussian(canvas[ch+i], x, y, _SIGMA_KP, mag=conf)
-            except Exception:
-                pass
-    ch += num_kp
-    # 4) bone lines
-    if num_edges > 0 and kps_list and len(kps_list) >= num_kp:
-        pts = []
-        for i in range(num_kp):
-            try:
-                x = int(np.clip((float(kps_list[i]['x'])/img_w)*Wc, 0, Wc-1))
-                y = int(np.clip((float(kps_list[i]['y'])/img_h)*Hc, 0, Hc-1))
-                c = float(kps_list[i].get('conf', kps_list[i].get('confidence',1.0)))
-                pts.append((x,y,c))
-            except Exception:
-                pts.append((None,None,0.0))
-        for e_idx, (a,b) in enumerate(COCO_EDGES):
-            x1,y1,c1 = pts[a]; x2,y2,c2 = pts[b]
-            if x1 is None or x2 is None: continue
-            if min(c1,c2) < _KP_CONF_TH: continue
-            cv2.line(canvas[ch+e_idx], (x1,y1), (x2,y2), 1.0, 1)
-    ch += num_edges
-    # 5) objects
-    if num_obj_ch > 0 and dets:
-        cls2ch = {name: i for i, name in enumerate(cfg.object_classes)}
-        for d in dets or []:
-            name = d.get("cls_name") or d.get("class_name") or d.get("label") or d.get("name")
-            if name not in cls2ch:
-                continue
-            bb = d.get("bbox") or d.get("xyxy") or {}
-            bxyxy = _bbox_xyxy_from_any(bb)
-            if bxyxy is None: continue
-            x1,y1,x2,y2 = bxyxy
-            x1 = int(np.clip((x1/img_w)*Wc, 0, Wc-1)); x2 = int(np.clip((x2/img_w)*Wc, 0, Wc-1))
-            y1 = int(np.clip((y1/img_h)*Hc, 0, Hc-1)); y2 = int(np.clip((y2/img_h)*Hc, 0, Hc-1))
-            if x2>=x1 and y2>=y1:
-                canvas[ch+cls2ch[name], y1:y2+1, x1:x2+1] = 1.0
-    ch += num_obj_ch
-    # 6) CoordConv（x/y）
-    xv = np.linspace(-1, 1, Wc)[None, :].repeat(Hc, 0)
-    yv = np.linspace(-1, 1, Hc)[:, None].repeat(Wc, 1)
-    canvas[ch] = xv; canvas[ch+1] = yv; ch += 2
-    return canvas
 
 # ===================== 骨架完整性（第一幀用） =====================
 def frame_has_full_skeleton(bbox, kps, *, kp_need=17, require_bbox=True):
@@ -301,71 +343,89 @@ class Kalman2D:
     def get_xy(self):
         return float(self.x[0,0]), float(self.x[1,0])
 
-def _kf_run_on_segment(kps_seq, require_full_first=True):
-    L = len(kps_seq)
-    if L == 0:
-        return []
-    if require_full_first:
-        bbox_dummy = [0,0,1,1]
-        if not frame_has_full_skeleton(bbox_dummy, kps_seq[0], kp_need=17, require_bbox=False):
-            return None
-    J = 17
-    first = kps_seq[0]
-    filters = []
-    for j in range(J):
-        if j < len(first) and ('x' in first[j]) and ('y' in first[j]):
-            kf = Kalman2D(first[j]['x'], first[j]['y'])
-        else:
-            kf = Kalman2D(0.0, 0.0)
-        filters.append(kf)
-    out = []
-    for t in range(L):
-        frame = kps_seq[t]
-        smoothed = []
-        for j in range(J):
-            kf = filters[j]
-            kf.predict()
-            if j < len(frame) and ('x' in frame[j]) and ('y' in frame[j]):
-                conf = float(frame[j].get('conf', frame[j].get('confidence', 1.0)))
-                if conf >= _KP_CONF_TH:
-                    z = np.array([[float(frame[j]['x'])],[float(frame[j]['y'])]], dtype=np.float32)
-                    kf.update(z)
-            x,y = kf.get_xy()
-            smoothed.append({'x': x, 'y': y, 'conf': float(frame[j].get('conf',1.0)) if j < len(frame) else 0.0})
-        out.append(smoothed)
-    return out
+def linear_interpolate_kps(window_parsed, max_missing=None):
+    """
+    對一個 window 的 keypoints 進行簡單線性插值 (Training Only)。
+    參數:
+      max_missing: 如果連續缺失幀數超過此值，就不補點 (視為長時間遮擋)。
+    """
+    if max_missing is None:
+        max_missing = Config.max_missing_interpolate
+    T = len(window_parsed)
+    if T < 2: return window_parsed
+    
+    num_kp = 17
+    # 建立 (T, 17, 3) 存 x, y, conf
+    data = np.full((T, num_kp, 3), np.nan, dtype=np.float32)
+    
+    # 1. 填入原始資料
+    for t, item in enumerate(window_parsed):
+        kps = item[1]
+        for k_idx in range(min(len(kps), num_kp)):
+            k_data = kps[k_idx]
+            if 'x' in k_data and 'y' in k_data:
+                conf = float(k_data.get('conf', k_data.get('confidence', 1.0)))
+                # 門檻設低一點，保留原始微弱訊號，讓插值有支點
+                if conf > 0.1: 
+                    data[t, k_idx, 0] = float(k_data['x'])
+                    data[t, k_idx, 1] = float(k_data['y'])
+                    data[t, k_idx, 2] = conf
+    
+    # 2. 執行插值 (加入 max_missing 判斷)
+    all_indices = np.arange(T)
+    
+    for k in range(num_kp):
+        seq = data[:, k, :]
+        valid_mask = ~np.isnan(seq[:, 0]) # 哪些幀是有值的
+        valid_indices = all_indices[valid_mask]
+        
+        # 至少要有兩點才能連線
+        if len(valid_indices) < 2:
+            continue
+            
+        # 先計算所有點的線性插值結果 (暫存)
+        # np.interp 會把所有空洞都填滿
+        interp_x = np.interp(all_indices, valid_indices, seq[valid_indices, 0])
+        interp_y = np.interp(all_indices, valid_indices, seq[valid_indices, 1])
+        interp_c = np.interp(all_indices, valid_indices, seq[valid_indices, 2])
+        
+        # 3. 過濾：只套用符合 max_missing 限制的區段
+        # 我們建立一個 mask，標記哪些位置是「允許填補」的
+        fill_mask = np.zeros(T, dtype=bool)
+        fill_mask[valid_indices] = True # 原始存在的點當然要留著
+        
+        # 檢查每一段間隔
+        for i in range(len(valid_indices) - 1):
+            start_idx = valid_indices[i]
+            end_idx = valid_indices[i+1]
+            gap_size = end_idx - start_idx - 1 # 中間缺幾幀
+            
+            if 0 < gap_size <= max_missing:
+                # 只有當缺口夠小，才把中間設為 True
+                fill_mask[start_idx+1 : end_idx] = True
+        
+        # 4. 將合法的插值結果寫回 data
+        # fill_mask 為 False 的地方保持 NaN (代表長時間缺失，不補)
+        data[fill_mask, k, 0] = interp_x[fill_mask]
+        data[fill_mask, k, 1] = interp_y[fill_mask]
+        data[fill_mask, k, 2] = interp_c[fill_mask]
 
-def kalman_smooth_kps(window_kps, *, half_slide=True, half_len=10, require_full_first=True, step=5):
-    T = len(window_kps)
-    if T == 0:
-        return window_kps
-    if not half_slide:
-        seq = _kf_run_on_segment(window_kps, require_full_first=require_full_first)
-        return seq if seq is not None else window_kps
-    half_len = int(half_len) if half_len else max(1, T//2)
-    step = int(step)
-    out = [None]*T
-    seg0 = _kf_run_on_segment(window_kps[0:half_len], require_full_first=require_full_first)
-    if seg0 is None:
-        return window_kps
-    for t in range(min(half_len, T)):
-        out[t] = seg0[t]
-    s = step
-    while s + half_len <= T:
-        seg = _kf_run_on_segment(window_kps[s:s+half_len], require_full_first=require_full_first)
-        if seg is not None:
-            a = s + half_len - step
-            b = s + half_len
-            for t_rel, t_abs in enumerate(range(a, b)):
-                if 0 <= t_abs < T:
-                    out[t_abs] = seg[half_len - step + t_rel]
-        s += step
-    if any(x is None for x in out):
-        fb = _kf_run_on_segment(window_kps, require_full_first=False) or window_kps
-        for i in range(T):
-            if out[i] is None:
-                out[i] = fb[i]
-    return out
+    # 5. 轉回 List 格式
+    new_window = []
+    for t in range(T):
+        bbox, _, dets, iw, ih = window_parsed[t]
+        new_kps = []
+        for k in range(num_kp):
+            x, y, c = data[t, k]
+            # 如果是 NaN (原始就缺 且 超過 max_missing 沒補)，填 0
+            if np.isnan(x) or np.isnan(y):
+                 new_kps.append({'x': 0.0, 'y': 0.0, 'conf': 0.0})
+            else:
+                 new_kps.append({'x': x, 'y': y, 'conf': c})
+        
+        new_window.append((bbox, new_kps, dets, iw, ih))
+        
+    return new_window
 
 # ===================== Motion + Mask（與推論一致） =====================
 def _safe_mean(vals):
@@ -463,16 +523,16 @@ def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=_KP_CONF_TH):
     dtrunk   = diff1(trunk)
     dkneeL   = diff1(kneeL); dkneeR = diff1(kneeR)
     feats = np.stack([
-        np.clip(v_y, -3.0, 3.0),
-        np.clip(a_y, -9.0, 9.0),
-        np.clip(v_h, -3.0, 3.0),
-        np.clip(a_h, -9.0, 9.0),
-        np.clip(v_A, -3.0, 3.0),
-        np.clip(a_A, -9.0, 9.0),
-        np.clip(dtrunk, -3.0, 3.0),
-        np.clip(dkneeL, -3.0, 3.0),
-        np.clip(dkneeR, -3.0, 3.0),
-    ], axis=1).astype(np.float32)
+            np.clip(v_y, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(a_y, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+            np.clip(v_h, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(a_h, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+            np.clip(v_A, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(a_A, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+            np.clip(dtrunk, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(dkneeL, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(dkneeR, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        ], axis=1).astype(np.float32)
     valid=[]
     for (bbox, kps, _d, _iw, _ih) in parsed:
         cnt=0
@@ -779,8 +839,6 @@ class PoseObjectDataset(Dataset):
         self.window = int(cfg.window)
         self.stride = int(cfg.stride)
         self.use_objects = bool(cfg.use_objects) and len(self.rm_cfg.object_classes)>0 and cfg.obj_root and os.path.isdir(cfg.obj_root)
-        self.enable_kf = bool(cfg.enable_kalman)
-        self.kf_half = bool(cfg.kalman_half_slide)
         self.half_len = int(cfg.half_len_override) if cfg.half_len_override else max(1,self.window//2)
         self.require_full_first = bool(cfg.require_full_first_frame)
         self.require_full_all = bool(cfg.require_full_skeleton_all)
@@ -906,20 +964,8 @@ class PoseObjectDataset(Dataset):
                             )
                         parsed.append((bbox, kps, dets, iw, ih))
 
-                    # （可選）KF 平滑：只動 kps，不動 raw
-                    if self.enable_kf:
-                        window_kps = [kps for (_, kps, _, _, _) in parsed]
-                        smoothed = kalman_smooth_kps(
-                            window_kps,
-                            half_slide=self.kf_half,
-                            half_len=self.half_len,
-                            require_full_first=True,
-                            step=self.stride
-                        )
-                        parsed = [
-                            (bbox, smoothed[j], dets, iw, ih)
-                            for j, (bbox, _k, dets, iw, ih) in enumerate(parsed)
-                        ]
+
+                    parsed = linear_interpolate_kps(parsed, max_missing=3)
 
                     # 指定 y（0/1 或多類）
                     if self.binary_mode:
@@ -967,10 +1013,7 @@ class PoseObjectDataset(Dataset):
                 bbox, kps, iw, ih = _extract_pose_basic(p)
                 dets = (o.get("detections") or o.get("objects") or o.get("boxes") or o.get("bboxes") or o.get("predictions") or []) if o else []
                 parsed.append((bbox, kps, dets, iw, ih))
-            if self.enable_kf:
-                window_kps = [kps for (_, kps, _, _, _) in parsed]
-                smoothed = kalman_smooth_kps(window_kps, half_slide=self.kf_half, half_len=self.half_len, require_full_first=True, step=self.stride)
-                parsed = [(bbox, smoothed[j], d, iw, ih) for j, (bbox, _k, d, iw, ih) in enumerate(parsed)]
+            parsed = linear_interpolate_kps(parsed, max_missing=3)
             if getattr(self.cfg, "aug_for_rare", False) and bool(getattr(self, "binary_mode", False)):
                 try:
                     is_rare = (int(y) == 1)
@@ -999,10 +1042,7 @@ class PoseObjectDataset(Dataset):
             bbox,kps,iw,ih = _extract_pose_basic(p)
             dets = (o.get("detections") or o.get("objects") or o.get("boxes") or o.get("bboxes") or o.get("predictions") or []) if o else []
             parsed.append((bbox,kps,dets,iw,ih))
-        if self.enable_kf:
-            window_kps=[kps for (_,kps,_,_,_) in parsed]
-            smoothed=kalman_smooth_kps(window_kps, half_slide=self.kf_half, half_len=self.half_len, require_full_first=True, step=self.stride)
-            parsed=[(bbox,smoothed[j],d,iw,ih) for j,(bbox,_,d,iw,ih) in enumerate(parsed)]
+        parsed = linear_interpolate_kps(parsed, max_missing=3)
 
         # 在 __getitem__ 用這個旗標
         if self.enable_aug and getattr(self.cfg, "aug_for_rare", False) and self.binary_mode:
@@ -1030,10 +1070,10 @@ class SpaceCNN(nn.Module):
     def __init__(self, in_ch: int, out_ch: int = 256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.GroupNorm(8, 128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1), nn.GroupNorm(8, 128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.GroupNorm(8, 256), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1,1))
         )
         self.proj = nn.Linear(256, out_ch)
@@ -1169,8 +1209,13 @@ def train(cfg: Config):
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    num_kp = 17
+    num_edges = len(COCO_EDGES) if cfg.include_bone_lines else 0
+    num_obj = len(ds.rm_cfg.object_classes) if cfg.use_objects else 0
+    num_coord = 2
     # in_ch 對齊 rasterizer
-    in_ch = 2 + 17 + (len(COCO_EDGES) if cfg.include_bone_lines else 0) + (len(ds.rm_cfg.object_classes) if cfg.use_objects else 0) + 2
+    in_ch = num_kp + num_edges + num_obj + num_coord
+
     model = CNNLSTM(in_ch=in_ch, num_classes=len(ds.class_names), cnn_out=_CNN_OUT,
                     lstm_h=cfg.lstm_hidden, lstm_layers=_LSTM_LAYERS, bidirectional=bool(cfg.bidirectional),
                     temporal_pool=cfg.temporal_pool, dropout=cfg.dropout, motion_dim=9).to(device)

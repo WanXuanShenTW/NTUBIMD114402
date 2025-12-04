@@ -1,540 +1,178 @@
 # -*- coding: utf-8 -*-
 """
-JSON → CNN+LSTM 推論（完全對齊新版 trainer 的前處理與模型介面）
-- ✅ 半視窗(10)卡爾曼濾波 + 第一幀完整檢查 + 每 5 幀滑動
-- ✅ 新增『動態特徵 (motion=9 維)』與『有效幀 mask(T,)』，傳入模型 forward(x, motion, mask)
-- ✅ TemporalHead 支援 mask（attn/mean pooling 會忽略無效幀）
-- ✅ Relation Map、物件通道、CoordConv 與訓練一致
-
-使用方式：
-1) 檔頭修改 MODEL_PATH / CLASSES_PATH / POSE_JSON / OBJECT_JSON / OBJECT_CLASSES。
-2) `python cnn_lstm_loader.py`
+JSON → CNN+LSTM 推論（完全對齊 Trainer v4）
+- ✅ 完整包含 Motion 計算函式與 Helper (不再有 missing variables)
+- ✅ 移除 Kalman，改用「最近鄰補點」
+- ✅ 移除 BBox Mask / Dist 通道 (輸入通道數固定為 22)
+- ✅ SpaceCNN 改用 GroupNorm (對齊訓練權重)
+- ✅ 增加座標 Clip 保護
 """
 
-import os, json, math
+import os, json, math, traceback
 from typing import List, Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
 import cv2
 
-# ===================== 常數設定（請依環境調整） =====================
-MODEL_PATH      = "outputs/models/test/best.pt"       # best.pt（state_dict）或 epXXX_score*.pt（完整 ckpt）
-CLASSES_PATH    = "outputs/models/test/classes.json"   # 若載入 best.pt 需提供類別清單
+# ===================== 常數設定 =====================
+# 請依據你的環境修改模型路徑
+MODEL_PATH      = "outputs/models/HM/focal/binary/best.pt"       
+CLASSES_PATH    = "outputs/models/HM/focal/binary/classes.json"   
 
-# 測試檔（影片級 JSON，list 形式；索引=幀號）
-POSE_JSON   = "outputs/skeletons/binary/YOLO-pose/fall/Home_video (2)_back.json"
-OBJECT_JSON = "outputs/skeletons/binary/YOLO-detect/fall/Home_video (2)_back.json"
-# POSE_JSON       = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
-# OBJECT_JSON     = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
-# POSE_JSON       = "outputs/skeletons/YOLO/YOLO-pose/normal/normal_002.json"
-# OBJECT_JSON     = "outputs/skeletons/YOLO/YOLO-detect/normal/normal_002.json"
-# POSE_JSON       = "medias/test/normal/ps_IMG_7694.json"
-# OBJECT_JSON     = None
-OUT_CSV         = None  # 例如 "preds.csv"；不要輸出就設 None
+# 測試資料路徑
+POSE_JSON   = "outputs/skeletons/binary-backup/YOLO-pose/fall/Home_video (2)_back.json"
+OBJECT_JSON = "outputs/skeletons/binary-backup/YOLO-detect/fall/Home_video (2)_back.json"
+OUT_CSV     = None 
 
-# Relation Map 與物件通道（需與訓練一致）
+# Relation Map (與 Trainer v4 一致)
 H, W                   = 64, 64
-INCLUDE_BONE_LINES     = True
-OBJECT_CLASSES         = ["bed", "chair", "bench"]  # 若不用物件通道 → []
+INCLUDE_BONE_LINES     = False  
+OBJECT_CLASSES         = ["bed", "chair", "bench"] 
+SIGMA_KP               = 2.0
+SIGMA_OBJ              = 4.0    
+KP_CONF_TH             = 0.4    
 
-# LSTM / 時序（需與訓練一致）
+# LSTM
 LSTM_HIDDEN            = 256
 BIDIRECTIONAL          = False
-TEMPORAL_POOL          = "attn"   # "last" | "mean" | "attn"
+TEMPORAL_POOL          = "attn" 
 WINDOW                 = 10
 STRIDE                 = 5
 DROPOUT                = 0.3
 
-# ===== 前置：KF 與完整性判斷（與訓練一致） =====
-ENABLE_KALMAN               = True
-KALMAN_HALF_SLIDE           = False    # 1~10 初始化；之後每 5 幀用 5~15、10~20 覆蓋尾段
-REQUIRE_FULL_FIRST_FRAME    = False   # 視窗第一幀必須完整，否則此視窗不推論
-HALF_LEN_OVERRIDE           = None    # 預設用 WINDOW//2 (=10)
-KP_CONF_TH                  = 0.6    # 與 trainer 同步
-SIGMA_KP                    = 2.0
+# Motion
+_USE_MOTION            = True   
+_MOTION_DIM            = 9
+_MOTION_CLIP_V = 5.0   # 10 FPS 建議放寬一點 (原本 3.0)
+_MOTION_CLIP_A = 10.0  # (原本 9.0)
 
-# Motion & 掩碼
-_USE_MOTION                 = True   # 與 trainer 一致；motion 維度固定 9
-_MOTION_DIM                 = 9
-_MOTION_CLIP_V              = 3.0
-_MOTION_CLIP_A              = 9.0
+# 前處理
+REQUIRE_FULL_FIRST_FRAME = False 
+MAX_MISSING_FILL       = 3      
 
-# ==== Binary decision（僅當 len(class_names)==2 才會生效）====
-BINARY_DECISION            = True     # True: 顯示/輸出稀有類機率與二元判斷
-RARE_CLASS_NAME_OVERRIDE   = None     # 例如 "fall"；若留 None，預設使用 class_names[1]
-DECISION_THR               = 0.50     # 稀有類機率 >= THR → 判定為稀有（陽性）
+# Binary decision
+BINARY_DECISION        = True
+DECISION_THR           = 0.50
 
-# ===================== Relation Map（與訓練一致） =====================
+# 骨架定義
 COCO_EDGES = [
     (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
     (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16)
 ]
 
 class RelationMapConfig:
-    def __init__(self, H=64, W=64, sigma_kp=3.0, kp_conf_th=0.4,
-                 include_bone_lines=True, object_classes=None):
+    def __init__(self, H=64, W=64, sigma_kp=2.0, sigma_obj=4.0, kp_conf_th=0.4,
+                 include_bone_lines=False, object_classes=None):
         self.H = int(H); self.W = int(W)
-        self.sigma_kp = float(sigma_kp); self.kp_conf_th = float(kp_conf_th)
+        self.sigma_kp = float(sigma_kp)
+        self.sigma_obj = float(sigma_obj)
+        self.kp_conf_th = float(kp_conf_th)
         self.include_bone_lines = bool(include_bone_lines)
         self.object_classes = [c.strip() for c in (object_classes or []) if c.strip()]
 
-def draw_gaussian(heatmap, x, y, sigma, mag=1.0):
-    H,W = heatmap.shape
-    xx,yy = np.meshgrid(np.arange(W), np.arange(H))
-    g = np.exp(-((xx-x)**2+(yy-y)**2)/(2.0*sigma**2)).astype(np.float32)*mag
-    heatmap += g
+# ===================== 繪圖工具 =====================
+def gaussian2d(shape, sigma):
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m+1, -n:n+1]
+    h = np.exp(-(x*x + y*y)/(2*sigma*sigma))
+    h[h < np.finfo(h.dtype).eps * h.max()] = 0
+    return h
 
-def _bbox_xyxy_from_any(b):
-    if b is None: return None
-    if isinstance(b, dict):
-        if all(k in b for k in ("cx","cy","w","h")):
-            cx,cy,w,h = float(b['cx']),float(b['cy']),float(b['w']),float(b['h'])
-            return cx-w/2, cy-h/2, cx+w/2, cy+h/2
-        if all(k in b for k in ("x","y","w","h")):
-            x,y,w,h = float(b['x']),float(b['y']),float(b['w']),float(b['h'])
-            return x, y, x+w, y+h
-    if isinstance(b,(list,tuple)) and len(b)==4:
-        x1,y1,x2,y2 = map(float,b)
-        return x1,y1,x2,y2
-    return None
+def draw_gaussian_on_channel(channel, cx, cy, sigma, mag=1.0):
+    if cx is None or cy is None: return
+    Hc, Wc = channel.shape
+    x = int(cx); y = int(cy)
+    if x < 0 or x >= Wc or y < 0 or y >= Hc: return
+    size = int(6 * sigma + 3)
+    g = gaussian2d((size, size), sigma)
+    g *= mag 
+    x0 = x - size // 2; y0 = y - size // 2
+    x1 = x0 + size;    y1 = y0 + size
+    g_x0 = max(0, -x0); g_y0 = max(0, -y0)
+    g_x1 = g_x0 + min(Wc, x1) - max(0, x0)
+    g_y1 = g_y0 + min(Hc, y1) - max(0, y0)
+    c_x0 = max(0, x0); c_y0 = max(0, y0)
+    c_x1 = min(Wc, x1); c_y1 = min(Hc, y1)
+    if c_x1 > c_x0 and c_y1 > c_y0:
+        channel[c_y0:c_y1, c_x0:c_x1] = np.maximum(
+            channel[c_y0:c_y1, c_x0:c_x1],
+            g[g_y0:g_y1, g_x0:g_x1]
+        )
 
-def rasterize_frame(bbox, kps, objects, img_w, img_h, cfg: RelationMapConfig):
+def rasterize_frame(bbox, kps_list, dets, img_w, img_h, cfg: RelationMapConfig):
     Hc, Wc = cfg.H, cfg.W
-    num_bbox_mask = 1
-    num_dist = 1
+    
+    # [修正] 移除 bbox mask 與 dist，通道數=22
     num_kp = 17
     num_edges = len(COCO_EDGES) if cfg.include_bone_lines else 0
     num_obj_ch = len(cfg.object_classes)
     num_coord = 2
-    C = num_bbox_mask + num_dist + num_kp + num_edges + num_obj_ch + num_coord
-
-    canvas = np.zeros((C,Hc,Wc), np.float32)
+    C = num_kp + num_edges + num_obj_ch + num_coord
+    
+    canvas = np.zeros((C, Hc, Wc), dtype=np.float32)
     ch = 0
-    # 1) bbox mask
-    if bbox:
-        bxyxy = _bbox_xyxy_from_any(bbox)
-        if bxyxy is not None:
-            x1,y1,x2,y2 = bxyxy
-            x1 = int(np.clip((x1/img_w)*Wc, 0, Wc-1)); y1 = int(np.clip((y1/img_h)*Hc, 0, Hc-1))
-            x2 = int(np.clip((x2/img_w)*Wc, 0, Wc-1)); y2 = int(np.clip((y2/img_h)*Hc, 0, Hc-1))
-            if x2>=x1 and y2>=y1:
-                canvas[ch, y1:y2+1, x1:x2+1] = 1.0
-    ch += 1
-    # 2) distance transform
-    inv = (1.0-canvas[0]).astype(np.uint8)
-    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-    if dist.max()>0: dist = dist/ dist.max()
-    canvas[ch] = dist; ch += 1
-    # 3) keypoints
-    if kps:
-        for i, kp in enumerate(kps[:num_kp]):
+
+    # 1. Keypoints
+    if kps_list:
+        current_kps = kps_list[:num_kp]
+        for i, kp in enumerate(current_kps):
+            target_ch = ch + i 
             try:
-                conf = float(kp.get('conf', kp.get('confidence',1.0)))
-                if conf < KP_CONF_TH: continue
-                x = (float(kp['x'])/img_w)*Wc; y = (float(kp['y'])/img_h)*Hc
-                draw_gaussian(canvas[ch+i], x, y, cfg.sigma_kp, mag=conf)
-            except Exception:
-                pass
+                conf = float(kp.get('conf', kp.get('confidence', 1.0)))
+                if conf < cfg.kp_conf_th: continue
+                raw_x, raw_y = float(kp['x']), float(kp['y'])
+                
+                # [修正] Clip
+                x = np.clip((raw_x / img_w) * Wc, 0, Wc - 1)
+                y = np.clip((raw_y / img_h) * Hc, 0, Hc - 1)
+                
+                draw_gaussian_on_channel(canvas[target_ch], x, y, cfg.sigma_kp, mag=1.0)
+            except Exception: pass
     ch += num_kp
-    # 4) bone lines
-    if cfg.include_bone_lines and kps and len(kps)>=num_kp:
-        pts = []
-        for i in range(num_kp):
-            try:
-                x = int(np.clip((float(kps[i]['x'])/img_w)*Wc,0,Wc-1))
-                y = int(np.clip((float(kps[i]['y'])/img_h)*Hc,0,Hc-1))
-                c = float(kps[i].get('conf', kps[i].get('confidence',1.0)))
-                pts.append((x,y,c))
-            except Exception:
-                pts.append((None,None,0.0))
-        for e_idx,(a,b) in enumerate(COCO_EDGES):
-            x1,y1,c1 = pts[a]; x2,y2,c2 = pts[b]
-            if x1 is None or x2 is None: continue
-            if min(c1,c2) < KP_CONF_TH: continue
-            cv2.line(canvas[ch+e_idx], (x1,y1), (x2,y2), 1.0, 1)
-    ch += num_edges
-    # 5) objects
-    if num_obj_ch>0 and objects:
-        name_to_idx = {n:i for i,n in enumerate(cfg.object_classes)}
-        for det in objects:
-            cname = None
-            for key in ("cls_name","class_name","name","label"):
-                val = det.get(key)
-                if isinstance(val,str) and val.strip():
-                    cname = val.strip(); break
-            if cname not in name_to_idx: continue
-            bxyxy = _bbox_xyxy_from_any(det.get('bbox') or det.get('xyxy') or det.get('box') or det.get('bbox_xyxy'))
+
+    # 2. Edges
+    if cfg.include_bone_lines: pass 
+    ch += num_edges 
+
+    # 3. Objects (Gaussian Fill)
+    if num_obj_ch > 0 and dets:
+        cls2ch = {name: i for i, name in enumerate(cfg.object_classes)}
+        for d in dets or []:
+            name = d.get("cls_name") or d.get("class_name") or d.get("label") or d.get("name")
+            if name not in cls2ch: continue
+            bb = d.get("bbox") or d.get("xyxy") or {}
+            bxyxy = _bbox_xyxy_from_any(bb)
             if bxyxy is None: continue
-            x1,y1,x2,y2 = bxyxy
-            x1 = int(np.clip((x1/img_w)*Wc, 0, Wc-1)); y1 = int(np.clip((y1/img_h)*Hc, 0, Hc-1))
-            x2 = int(np.clip((x2/img_w)*Wc, 0, Wc-1)); y2 = int(np.clip((y2/img_h)*Hc, 0, Hc-1))
-            if x2>=x1 and y2>=y1:
-                canvas[ch + name_to_idx[cname], y1:y2+1, x1:x2+1] = 1.0
+            
+            x1, y1, x2, y2 = bxyxy
+            cx = (x1 + x2) / 2.0; cy = (y1 + y2) / 2.0
+            
+            # [修正] Clip
+            map_cx = np.clip((cx / img_w) * Wc, 0, Wc - 1)
+            map_cy = np.clip((cy / img_h) * Hc, 0, Hc - 1)
+            
+            obj_idx = cls2ch[name]
+            draw_gaussian_on_channel(canvas[ch + obj_idx], map_cx, map_cy, cfg.sigma_obj, mag=1.0)
     ch += num_obj_ch
-    # 6) CoordConv
-    xv = np.linspace(-1,1,Wc)[None,:].repeat(Hc,0)
-    yv = np.linspace(-1,1,Hc)[:,None].repeat(Wc,1)
-    canvas[ch] = xv; canvas[ch+1] = yv; ch+=2
-    assert ch==C, f"channel mismatch {ch} vs {C}"
+
+    # 4. CoordConv
+    xv = np.linspace(-1, 1, Wc)[None, :].repeat(Hc, 0)
+    yv = np.linspace(-1, 1, Hc)[:, None].repeat(Wc, 1)
+    canvas[ch] = xv; canvas[ch+1] = yv; ch += 2
+
     return canvas
 
-# ===================== JSON 解析 =====================
-
-def read_any_json(path: Optional[str]):
-    if not path: return []
-    with open(path, 'r', encoding='utf-8') as f:
-        txt = f.read().strip()
-    if not txt: return []
-    try:
-        data = json.loads(txt)
-        if isinstance(data, list):
-            return [r for r in data if isinstance(r,(dict,list))]
-        if isinstance(data, dict):
-            for k in ('frames','data','records','annotations','items','results'):
-                if isinstance(data.get(k), list):
-                    return [r for r in data[k] if isinstance(r,(dict,list))]
-            # 若是 mapping: frame_id -> record
-            kv = []
-            for k,v in data.items():
-                if isinstance(k,str) and k.isdigit() and isinstance(v,dict):
-                    vv = v.copy(); vv.setdefault('frame_id', int(k)); kv.append(vv)
-            return kv or [data]
-    except Exception:
-        pass
-    # fallback: jsonl
-    recs = []
-    for line in txt.splitlines():
-        line = line.strip()
-        if not line: continue
-        try:
-            recs.append(json.loads(line))
-        except Exception:
-            pass
-    return recs
-
-# Pose record → (bbox, keypoints[17], img_w, img_h)
-
-def extract_pose_from_record(rec: dict) -> Tuple[Optional[List[float]], List[Dict], float, float]:
-    # 支援通用格式（boxes/keypoints），也容忍 person 格式
-    if isinstance(rec, dict) and rec.get("persons"):
-        person = max(rec.get("persons", []), key=lambda x: x.get("score", 0.0))
-        bbox = person.get("bbox")
-        kps  = person.get("keypoints") or []
-        kps_list = ([{"x": float(k.get("x",0.0)), "y": float(k.get("y",0.0)), "conf": float(k.get("conf", k.get("confidence",1.0)))} for k in kps[:17]] if kps else [])
-        img_w = rec.get("image_size",{}).get("width", 640.0) or 640.0
-        img_h = rec.get("image_size",{}).get("height",480.0) or 480.0
-        return bbox, kps_list, float(img_w), float(img_h)
-
-    boxes = (rec.get('boxes') if isinstance(rec, dict) else None) or []
-    kps_all = (rec.get('keypoints') if isinstance(rec, dict) else None) or []
-    # 選最大的 bbox 當主體
-    best_i, best_area = 0, -1
-    for i,b in enumerate(boxes):
-        if not (isinstance(b,(list,tuple)) and len(b)==4):
-            continue
-        x1,y1,x2,y2 = b
-        area = max(0,x2-x1)*max(0,y2-y1)
-        if area>best_area: best_i=i; best_area=area
-    bbox = boxes[best_i] if boxes else None
-    kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
-    kps_list = ([{"x":float(x),"y":float(y),"conf":1.0} for (x,y) in kp_raw[:17]] if kp_raw else [])
-    # 估計影像尺寸：取座標最大值
-    xs, ys = [], []
-    for b in boxes:
-        if isinstance(b,(list,tuple)) and len(b)==4:
-            xs += [b[0], b[2]]; ys += [b[1], b[3]]
-    for grp in kps_all:
-        for pt in grp:
-            if isinstance(pt,(list,tuple)) and len(pt)>=2:
-                xs.append(pt[0]); ys.append(pt[1])
-    img_w = max(1.0, max(xs) if xs else 640.0)
-    img_h = max(1.0, max(ys) if ys else 480.0)
-    return bbox, kps_list, img_w, img_h
-
-# Object record → list of {class_name, bbox}
-
-def extract_objects_from_record(rec: dict) -> List[dict]:
-    objs = (rec.get('objects') if isinstance(rec, dict) else None) \
-        or (rec.get('detections') if isinstance(rec, dict) else None) \
-        or (rec.get('boxes') if isinstance(rec, dict) else None) \
-        or (rec.get('bboxes') if isinstance(rec, dict) else None) \
-        or (rec.get('predictions') if isinstance(rec, dict) else None)
-    if objs is None:
-        return []
-    out = []
-    for o in objs:
-        if not isinstance(o, dict):
-            continue
-        name = None
-        for key in ("cls_name","class_name","name","label"):
-            val = o.get(key)
-            if isinstance(val,str) and val.strip():
-                name = val.strip(); break
-        bbox = o.get('bbox') or o.get('xyxy') or o.get('box') or o.get('bbox_xyxy')
-        if name is None or bbox is None:
-            continue
-        out.append({'class_name': name, 'bbox': bbox})
-    return out
-
-# =============== 骨架完整性（第一幀用） ===============
-
-def frame_has_full_skeleton(bbox, kps, *, kp_need=17, require_bbox=True):
-    if require_bbox and bbox is None:
-        return False
-    cnt = 0
-    for j in range(min(17, len(kps))):
-        x = kps[j].get('x', None); y = kps[j].get('y', None)
-        if x is None or y is None: continue
-        if not np.isfinite(x) or not np.isfinite(y): continue
-        conf = float(kps[j].get('conf', kps[j].get('confidence', 1.0)))
-        if conf < KP_CONF_TH: continue
-        cnt += 1
-    return cnt >= kp_need
-
-# ===================== Kalman Filter（2D 常速模型，一點一濾） =====================
-class Kalman2D:
-    def __init__(self, x=0.0, y=0.0, var_pos=1e-2, var_vel=1e-1, var_meas=4.0):
-        self.F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
-        self.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float32)
-        self.Q = np.diag([var_pos, var_pos, var_vel, var_vel]).astype(np.float32)
-        self.R = np.diag([var_meas, var_meas]).astype(np.float32)
-        self.x = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
-        self.P = np.eye(4, dtype=np.float32) * 10.0
-    def predict(self):
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-    def update(self, z):
-        y = z - (self.H @ self.x)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + (K @ y)
-        I = np.eye(4, dtype=np.float32)
-        self.P = (I - K @ self.H) @ self.P
-    def get_xy(self):
-        return float(self.x[0,0]), float(self.x[1,0])
-
-
-def _kf_run_on_segment(kps_seq, require_full_first=True):
-    L = len(kps_seq)
-    if L == 0:
-        return []
-    if require_full_first:
-        bbox_dummy = [0,0,1,1]
-        if not frame_has_full_skeleton(bbox_dummy, kps_seq[0], kp_need=17, require_bbox=False):
-            return None
-    J = 17
-    first = kps_seq[0]
-    filters = []
-    for j in range(J):
-        if j < len(first) and ('x' in first[j]) and ('y' in first[j]):
-            kf = Kalman2D(first[j]['x'], first[j]['y'])
-        else:
-            kf = Kalman2D(0.0, 0.0)
-        filters.append(kf)
-    out = []
-    for t in range(L):
-        frame = kps_seq[t]
-        smoothed = []
-        for j in range(J):
-            kf = filters[j]
-            kf.predict()
-            if j < len(frame) and ('x' in frame[j]) and ('y' in frame[j]):
-                conf = float(frame[j].get('conf', frame[j].get('confidence', 1.0)))
-                if conf >= KP_CONF_TH:
-                    z = np.array([[float(frame[j]['x'])],[float(frame[j]['y'])]], dtype=np.float32)
-                    kf.update(z)
-            x,y = kf.get_xy()
-            smoothed.append({'x': x, 'y': y, 'conf': float(frame[j].get('conf',1.0)) if j < len(frame) else 0.0})
-        out.append(smoothed)
-    return out
-
-
-def kalman_smooth_kps(window_kps, *, half_slide=True, half_len=10, require_full_first=True, step=5):
-    """半視窗 KF：0~half 覆蓋，之後每 step 覆蓋尾段（與 trainer/online 一致）"""
-    T = len(window_kps)
-    if T == 0:
-        return window_kps
-    if not half_slide:
-        seq = _kf_run_on_segment(window_kps, require_full_first=require_full_first)
-        return seq if seq is not None else window_kps
-
-    half_len = int(half_len) if half_len else max(1, T//2)
-    step = int(step)
-    out = [None]*T
-
-    seg0 = _kf_run_on_segment(window_kps[0:half_len], require_full_first=require_full_first)
-    if seg0 is None:
-        return window_kps
-    for t in range(min(half_len, T)):
-        out[t] = seg0[t]
-
-    s = step
-    while s + half_len <= T:
-        seg = _kf_run_on_segment(window_kps[s:s+half_len], require_full_first=require_full_first)
-        if seg is not None:
-            a = s + half_len - step
-            b = s + half_len
-            for t_rel, t_abs in enumerate(range(a, b)):
-                if 0 <= t_abs < T:
-                    out[t_abs] = seg[half_len - step + t_rel]
-        s += step
-
-    if any(x is None for x in out):
-        fb = _kf_run_on_segment(window_kps, require_full_first=False) or window_kps
-        for i in range(T):
-            if out[i] is None:
-                out[i] = fb[i]
-    return out
-
-# ===================== Motion 特徵（與 trainer 一致，dt=1 不用 timestamp） =====================
-
-def _safe_mean(vals):
-    vals = [v for v in vals if v is not None]
-    return sum(vals)/len(vals) if vals else None
-
-def _angle(a,b,c):
-    if (a is None) or (b is None) or (c is None): return None
-    ba = (a[0]-b[0], a[1]-b[1]); bc = (c[0]-b[0], c[1]-b[1])
-    nba = math.hypot(*ba); nbc = math.hypot(*bc)
-    if nba<1e-6 or nbc<1e-6: return None
-    cosv = (ba[0]*bc[0] + ba[1]*bc[1])/(nba*nbc)
-    cosv = max(-1.0, min(1.0, cosv))
-    return math.acos(cosv)
-
-def _kp_xy(kps, i, img_w, img_h, conf_th):
-    if i < len(kps):
-        d = kps[i]
-        conf = float(d.get("conf", d.get("confidence", 1.0)))
-        if conf >= KP_CONF_TH and ("x" in d) and ("y" in d):
-            return (float(d["x"]) / img_w, float(d["y"]) / img_h)
-    return None
-
-def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=0.3):
-    """
-    parsed: list of (bbox, kps_list, detections, img_w, img_h)
-    回傳:
-      feats: (T, 9)  -> [v_y, a_y, v_h, a_h, v_A, a_A, dtrunk, dkneeL, dkneeR]
-      mask:  (T,)    -> 0/1 有效幀
-    """
-    T = len(parsed)
-    if T == 0:
-        return np.zeros((0,9), np.float32), np.zeros((0,), np.float32)
-
-    ycom, hgt, area, trunk, kneeL, kneeR = [], [], [], [], [], []
-
-    for (bbox, kps, _, img_w, img_h) in parsed:
-        # y_com（優先髖 11/12，其次肩 5/6，最後高 conf 的平均）
-        hips = [_kp_xy(kps,11,img_w,img_h,conf_th), _kp_xy(kps,12,img_w,img_h,conf_th)]
-        hs = [p for p in hips if p is not None]
-        if hs:
-            y_c = _safe_mean([p[1] for p in hs])
-        else:
-            shs = [_kp_xy(kps,5,img_w,img_h,conf_th), _kp_xy(kps,6,img_w,img_h,conf_th)]
-            ss = [p for p in shs if p is not None]
-            if ss:
-                y_c = _safe_mean([p[1] for p in ss])
-            else:
-                ys = [float(p["y"]) / img_h for p in kps if float(p.get("conf", p.get("confidence",1.0))) >= conf_th and ("y" in p)]
-                y_c = _safe_mean(ys)
-        ycom.append(y_c)
-
-        # 身高 proxy 與面積（歸一化）
-        if bbox and all(k in bbox for k in ("w","h")):
-            h = float(bbox["h"]) / img_h; w = float(bbox["w"]) / img_w
-        else:
-            ys = [float(p["y"]) / img_h for p in kps if float(p.get("conf", p.get("confidence",1.0))) >= conf_th and ("y" in p)]
-            if len(ys) >= 2:
-                h = max(ys) - min(ys); w = 0.4 * h
-            else:
-                h=None; w=None
-        hgt.append(h)
-        area.append((w*h) if (w is not None and h is not None) else None)
-
-        # 軀幹角 vs 垂直、膝角
-        shL=_kp_xy(kps,5,img_w,img_h,conf_th); shR=_kp_xy(kps,6,img_w,img_h,conf_th)
-        hpL=_kp_xy(kps,11,img_w,img_h,conf_th); hpR=_kp_xy(kps,12,img_w,img_h,conf_th)
-        knL=_kp_xy(kps,13,img_w,img_h,conf_th); anL=_kp_xy(kps,15,img_w,img_h,conf_th)
-        knR=_kp_xy(kps,14,img_w,img_h,conf_th); anR=_kp_xy(kps,16,img_w,img_h,conf_th)
-        if shL and shR and hpL and hpR:
-            sh=((shL[0]+shR[0])/2,(shL[1]+shR[1])/2)
-            hp=((hpL[0]+hpR[0])/2,(hpL[1]+hpR[1])/2)
-            vec=(hp[0]-sh[0], hp[1]-sh[1])
-            ang=abs(math.atan2(vec[0], vec[1]))  # 0=垂直，越大越斜
-        else:
-            ang=None
-        trunk.append(ang)
-        kneeL.append(_angle(hpL, knL, anL))
-        kneeR.append(_angle(hpR, knR, anR))
-
-    # 小洞線性補（連續缺值<=3）
-    def fill_small(arr):
-        arr=list(arr); n=len(arr); i=0
-        while i<n:
-            if arr[i] is None:
-                j=i
-                while j<n and arr[j] is None: j+=1
-                gap=j-i
-                if gap<=3 and i>0 and j<n and arr[i-1] is not None and arr[j] is not None:
-                    for k in range(gap):
-                        w=(k+1)/(gap+1); arr[i+k]=arr[i-1]*(1-w)+arr[j]*w
-                i=j
-            else:
-                i+=1
-        return [0.0 if v is None else v for v in arr]
-
-    ycom=fill_small(ycom); hgt=fill_small(hgt); area=fill_small(area)
-    trunk=fill_small(trunk); kneeL=fill_small(kneeL); kneeR=fill_small(kneeR)
-
-    ycom=np.array(ycom,np.float32); hgt=np.array(hgt,np.float32); area=np.array(area,np.float32)
-    trunk=np.array(trunk,np.float32); kneeL=np.array(kneeL,np.float32); kneeR=np.array(kneeR,np.float32)
-
-    # 差分（dt=1）
-    def diff1(x):
-        v=np.zeros_like(x); v[1:]=x[1:]-x[:-1]; return v
-    def diff2(v):
-        a=np.zeros_like(v); a[1:]=v[1:]-v[:-1]; return a
-
-    v_y, a_y = diff1(ycom), diff2(diff1(ycom))
-    v_h, a_h = diff1(hgt),  diff2(diff1(hgt))
-    v_A, a_A = diff1(area), diff2(diff1(area))
-    dtrunk   = diff1(trunk)
-    dkneeL   = diff1(kneeL); dkneeR = diff1(kneeR)
-
-    feats = np.stack([
-        np.clip(v_y, -_MOTION_CLIP_V, _MOTION_CLIP_V),
-        np.clip(a_y, -_MOTION_CLIP_A, _MOTION_CLIP_A),
-        np.clip(v_h, -_MOTION_CLIP_V, _MOTION_CLIP_V),
-        np.clip(a_h, -_MOTION_CLIP_A, _MOTION_CLIP_A),
-        np.clip(v_A, -_MOTION_CLIP_V, _MOTION_CLIP_V),
-        np.clip(a_A, -_MOTION_CLIP_A, _MOTION_CLIP_A),
-        np.clip(dtrunk, -_MOTION_CLIP_V, _MOTION_CLIP_V),
-        np.clip(dkneeL, -_MOTION_CLIP_V, _MOTION_CLIP_V),
-        np.clip(dkneeR, -_MOTION_CLIP_V, _MOTION_CLIP_V),
-    ], axis=1).astype(np.float32)  # (T,9)
-
-    # 有效幀 mask：關鍵點命中數>=2 或 有 bbox
-    valid=[]
-    for (bbox, kps, _, _, _) in parsed:
-        cnt=0
-        for j in (11,12,5,6,13,14):
-            if j < len(kps):
-                conf=float(kps[j].get("conf", kps[j].get("confidence",1.0)))
-                if conf>=KP_CONF_TH: cnt+=1
-        ok=(cnt>=2) or (bbox is not None)
-        valid.append(1.0 if ok else 0.0)
-    valid=np.array(valid,np.float32)
-    return feats, valid
-
-# ===================== 模型（與訓練一致：支援 motion + mask） =====================
+# ===================== 模型定義 (對齊 Trainer) =====================
 class SpaceCNN(nn.Module):
     def __init__(self, in_ch, out_dim=256):
         super().__init__()
+        # [修正] 使用 GroupNorm(8, ...)
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 64, 3, padding=1), nn.BatchNorm2d(64), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.BatchNorm2d(256), nn.ReLU(inplace=True),
+            nn.Conv2d(in_ch, 64, 3, padding=1), nn.GroupNorm(8, 64), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.GroupNorm(8, 128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1), nn.GroupNorm(8, 128), nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, stride=2, padding=1), nn.GroupNorm(8, 256), nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1,1))
         )
         self.proj = nn.Linear(256, out_dim)
@@ -551,16 +189,15 @@ class TemporalHead(nn.Module):
             self.attn = nn.Linear(in_dim,1)
         self.fc = nn.Linear(in_dim, num_classes)
     def forward(self, seq_feats, mask: Optional[torch.Tensor]=None):
-        # seq_feats: (B,T,D), mask: (B,T) in {0,1}
         if (mask is not None) and (self.mode in ("mean","attn")):
             if self.mode == "mean":
                 m = mask.unsqueeze(-1)
                 den = m.sum(dim=1).clamp_min(1e-6)
                 g = (seq_feats * m).sum(dim=1) / den
             else:
-                a = self.attn(seq_feats).squeeze(-1)       # (B,T)
+                a = self.attn(seq_feats).squeeze(-1)
                 a = a.masked_fill((mask<=0), float("-inf"))
-                w = torch.softmax(a, dim=1).unsqueeze(-1)  # (B,T,1)
+                w = torch.softmax(a, dim=1).unsqueeze(-1)
                 g = (seq_feats * w).sum(dim=1)
         else:
             if self.mode == "mean":
@@ -585,137 +222,294 @@ class CNNLSTM(nn.Module):
         feat_dim = lstm_h * (2 if bidirectional else 1)
         self.head = TemporalHead(feat_dim, num_classes, mode=temporal_pool, dropout=dropout)
     def forward(self, x, motion: Optional[torch.Tensor]=None, mask: Optional[torch.Tensor]=None):
-        # x: (B,T,C,H,W)  motion: (B,T,D)  mask: (B,T)
         B,T,C,Hh,Ww = x.shape
-        z = self.cnn(x.view(B*T, C, Hh, Ww)).view(B, T, -1)  # (B,T,cnn_out)
+        z = self.cnn(x.view(B*T, C, Hh, Ww)).view(B, T, -1)
         if self.motion_dim > 0 and motion is not None:
-            z = torch.cat([z, motion], dim=-1)                # (B,T,cnn_out+D)
-        out, _ = self.lstm(z)                                 # (B,T,H)
+            z = torch.cat([z, motion], dim=-1)
+        out, _ = self.lstm(z)
         return self.head(out, mask=mask)
 
-# ===================== 推論主流程 =====================
+# ===================== 補點與工具 =====================
+def fill_missing_kps_inference(parsed_window, max_missing=3):
+    T = len(parsed_window)
+    if T < 2: return parsed_window
+    num_kp = 17
+    data = np.full((T, num_kp, 3), np.nan, dtype=np.float32)
+    for t, item in enumerate(parsed_window):
+        kps = item[1]
+        for k_idx in range(min(len(kps), num_kp)):
+            k_data = kps[k_idx]
+            if 'x' in k_data and 'y' in k_data:
+                conf = float(k_data.get('conf', k_data.get('confidence', 1.0)))
+                if conf > 0.1:
+                    data[t, k_idx, 0] = float(k_data['x'])
+                    data[t, k_idx, 1] = float(k_data['y'])
+                    data[t, k_idx, 2] = conf
+    for k in range(num_kp):
+        last_val = None
+        missing_count = 0
+        for t in range(T):
+            curr = data[t, k]
+            if not np.isnan(curr[0]):
+                last_val = curr.copy()
+                missing_count = 0
+            elif last_val is not None and missing_count < max_missing:
+                data[t, k] = last_val
+                missing_count += 1
+            else:
+                missing_count += 1
+    new_window = []
+    for t in range(T):
+        bbox, _, dets, iw, ih = parsed_window[t]
+        new_kps = []
+        for k in range(num_kp):
+            x, y, c = data[t, k]
+            if np.isnan(x): new_kps.append({'x':0.0,'y':0.0,'conf':0.0})
+            else: new_kps.append({'x':x,'y':y,'conf':c})
+        new_window.append((bbox, new_kps, dets, iw, ih))
+    return new_window
 
+def read_any_json(path: Optional[str]):
+    if not path: return []
+    with open(path, 'r', encoding='utf-8') as f: txt = f.read().strip()
+    if not txt: return []
+    try:
+        data = json.loads(txt)
+        if isinstance(data, list): return [r for r in data if isinstance(r,(dict,list))]
+        if isinstance(data, dict):
+            for k in ('frames','data','records','annotations','items','results'):
+                if isinstance(data.get(k), list): return [r for r in data[k] if isinstance(r,(dict,list))]
+            kv = []
+            for k,v in data.items():
+                if isinstance(k,str) and k.isdigit() and isinstance(v,dict):
+                    vv = v.copy(); vv.setdefault('frame_id', int(k)); kv.append(vv)
+            return kv or [data]
+    except: pass
+    recs = []
+    for line in txt.splitlines():
+        try: recs.append(json.loads(line))
+        except: pass
+    return recs
+
+def _bbox_xyxy_from_any(b):
+    if b is None: return None
+    if isinstance(b, dict):
+        if all(k in b for k in ("cx","cy","w","h")):
+            cx,cy,w,h = float(b['cx']),float(b['cy']),float(b['w']),float(b['h'])
+            return cx-w/2, cy-h/2, cx+w/2, cy+h/2
+        if all(k in b for k in ("x","y","w","h")):
+            x,y,w,h = float(b['x']),float(b['y']),float(b['w']),float(b['h'])
+            return x, y, x+w, y+h
+    if isinstance(b,(list,tuple)) and len(b)==4:
+        return float(b[0]),float(b[1]),float(b[2]),float(b[3])
+    return None
+
+def extract_pose_from_record(rec: dict):
+    if isinstance(rec, dict) and rec.get("persons"):
+        person = max(rec.get("persons", []), key=lambda x: x.get("score", 0.0))
+        bbox = person.get("bbox")
+        kps = person.get("keypoints") or []
+        kps_list = ([{"x": float(k.get("x",0.0)), "y": float(k.get("y",0.0)), "conf": float(k.get("conf", k.get("confidence",1.0)))} for k in kps[:17]] if kps else [])
+        img_w = rec.get("image_size",{}).get("width", 640.0) or 640.0
+        img_h = rec.get("image_size",{}).get("height",480.0) or 480.0
+        return bbox, kps_list, float(img_w), float(img_h)
+    
+    boxes = (rec.get('boxes') if isinstance(rec, dict) else None) or []
+    kps_all = (rec.get('keypoints') if isinstance(rec, dict) else None) or []
+    best_i, best_area = 0, -1
+    for i,b in enumerate(boxes):
+        if not (isinstance(b,(list,tuple)) and len(b)==4): continue
+        x1,y1,x2,y2 = b
+        area = max(0,x2-x1)*max(0,y2-y1)
+        if area>best_area: best_i=i; best_area=area
+    bbox = boxes[best_i] if boxes else None
+    kp_raw = kps_all[best_i] if (kps_all and best_i < len(kps_all)) else (kps_all[0] if kps_all else [])
+    kps_list = ([{"x":float(x),"y":float(y),"conf":1.0} for (x,y) in kp_raw[:17]] if kp_raw else [])
+    img_w = 640.0; img_h = 480.0 
+    return bbox, kps_list, img_w, img_h
+
+def extract_objects_from_record(rec: dict):
+    objs = (rec.get('objects') if isinstance(rec, dict) else None) or \
+           (rec.get('detections') if isinstance(rec, dict) else None) or []
+    out = []
+    for o in objs:
+        if not isinstance(o, dict): continue
+        name = o.get('cls_name') or o.get('class_name') or o.get('name') or o.get('label')
+        bbox = o.get('bbox') or o.get('xyxy')
+        if name and bbox:
+            out.append({'class_name': name, 'bbox': bbox})
+    return out
+
+# ===================== Motion Helpers (這裡就是你缺的部分) =====================
+def _safe_mean(vals):
+    vals = [v for v in vals if v is not None]
+    return sum(vals)/len(vals) if vals else None
+
+def _angle(a, b, c):
+    if (a is None) or (b is None) or (c is None): return None
+    ba = (a[0]-b[0], a[1]-b[1]); bc = (c[0]-b[0], c[1]-b[1])
+    nba = math.hypot(*ba); nbc = math.hypot(*bc)
+    if nba<1e-6 or nbc<1e-6: return None
+    cosv = (ba[0]*bc[0] + ba[1]*bc[1])/(nba*nbc)
+    cosv = max(-1.0, min(1.0, cosv))
+    return math.acos(cosv)
+
+def _kp_xy(kps, i, img_w, img_h, conf_th):
+    if i < len(kps):
+        d = kps[i]
+        conf = float(d.get("conf", d.get("confidence", 1.0)))
+        if conf >= conf_th and ("x" in d) and ("y" in d):
+            return (float(d["x"]) / img_w, float(d["y"]) / img_h)
+    return None
+
+def compute_motion_feats_with_mask_from_parsed(parsed, conf_th=KP_CONF_TH):
+    """(T,9) + (T,)"""
+    T = len(parsed)
+    if T == 0: return np.zeros((0,9), np.float32), np.zeros((0,), np.float32)
+    ycom, hgt, area, trunk, kneeL, kneeR = [], [], [], [], [], []
+    for (bbox, kps, _d, img_w, img_h) in parsed:
+        hips = [_kp_xy(kps,11,img_w,img_h,conf_th), _kp_xy(kps,12,img_w,img_h,conf_th)]
+        hs = [p for p in hips if p is not None]
+        if hs:
+            y_c = _safe_mean([p[1] for p in hs])
+        else:
+            shs = [_kp_xy(kps,5,img_w,img_h,conf_th), _kp_xy(kps,6,img_w,img_h,conf_th)]
+            ss = [p for p in shs if p is not None]
+            if ss: y_c = _safe_mean([p[1] for p in ss])
+            else:
+                ys = [float(p["y"]) / img_h for p in kps if float(p.get("conf", p.get("confidence",1.0))) >= conf_th and ("y" in p)]
+                y_c = _safe_mean(ys)
+        ycom.append(y_c)
+        if bbox is not None:
+            x1,y1,x2,y2 = _bbox_xyxy_from_any(bbox)
+            bw = max(1e-6, (x2-x1)/img_w); bh = max(1e-6, (y2-y1)/img_h)
+            h = bh; w = bw
+        else:
+            ys = [float(p["y"]) / img_h for p in kps if float(p.get("conf", p.get("confidence",1.0))) >= conf_th and ("y" in p)]
+            if len(ys) >= 2: h = max(ys)-min(ys); w = 0.4*h
+            else: h=None; w=None
+        hgt.append(h)
+        area.append((w*h) if (w is not None and h is not None) else None)
+        shL=_kp_xy(kps,5,img_w,img_h,conf_th); shR=_kp_xy(kps,6,img_w,img_h,conf_th)
+        hpL=_kp_xy(kps,11,img_w,img_h,conf_th); hpR=_kp_xy(kps,12,img_w,img_h,conf_th)
+        knL=_kp_xy(kps,13,img_w,img_h,conf_th); anL=_kp_xy(kps,15,img_w,img_h,conf_th)
+        knR=_kp_xy(kps,14,img_w,img_h,conf_th); anR=_kp_xy(kps,16,img_w,img_h,conf_th)
+        if shL and shR and hpL and hpR:
+            sh=((shL[0]+shR[0])/2,(shL[1]+shR[1])/2)
+            hp=((hpL[0]+hpR[0])/2,(hpL[1]+hpR[1])/2)
+            vec=(hp[0]-sh[0], hp[1]-sh[1])
+            ang=abs(math.atan2(vec[0], vec[1]))
+        else: ang=None
+        trunk.append(ang)
+        kneeL.append(_angle(hpL, knL, anL))
+        kneeR.append(_angle(hpR, knR, anR))
+    def fill_small(arr):
+        arr=list(arr); n=len(arr); i=0
+        while i<n:
+            if arr[i] is None:
+                j=i
+                while j<n and arr[j] is None: j+=1
+                gap=j-i
+                if gap<=3 and i>0 and j<n and arr[i-1] is not None and arr[j] is not None:
+                    for k in range(gap):
+                        w=(k+1)/(gap+1); arr[i+k]=arr[i-1]*(1-w)+arr[j]*w
+                i=j
+            else: i+=1
+        return [0.0 if v is None else v for v in arr]
+    ycom=fill_small(ycom); hgt=fill_small(hgt); area=fill_small(area)
+    trunk=fill_small(trunk); kneeL=fill_small(kneeL); kneeR=fill_small(kneeR)
+    ycom=np.array(ycom,np.float32); hgt=np.array(hgt,np.float32); area=np.array(area,np.float32)
+    trunk=np.array(trunk,np.float32); kneeL=np.array(kneeL,np.float32); kneeR=np.array(kneeR,np.float32)
+    def diff1(x):
+        v=np.zeros_like(x); v[1:]=x[1:]-x[:-1]; return v
+    def diff2(v):
+        a=np.zeros_like(v); a[1:]=v[1:]-v[:-1]; return a
+    v_y, a_y = diff1(ycom), diff2(diff1(ycom))
+    v_h, a_h = diff1(hgt),  diff2(diff1(hgt))
+    v_A, a_A = diff1(area), diff2(diff1(area))
+    dtrunk   = diff1(trunk)
+    dkneeL   = diff1(kneeL); dkneeR = diff1(kneeR)
+    feats = np.stack([
+            np.clip(v_y, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(a_y, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+            np.clip(v_h, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(a_h, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+            np.clip(v_A, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(a_A, -_MOTION_CLIP_A, _MOTION_CLIP_A),
+            np.clip(dtrunk, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(dkneeL, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+            np.clip(dkneeR, -_MOTION_CLIP_V, _MOTION_CLIP_V),
+        ], axis=1).astype(np.float32)
+    valid=[]
+    for (bbox, kps, _d, _iw, _ih) in parsed:
+        cnt=0
+        for j in (11,12,5,6,13,14):
+            if j < len(kps):
+                conf=float(kps[j].get("conf", kps[j].get("confidence",1.0)))
+                if conf>=KP_CONF_TH: cnt+=1
+        ok=(cnt>=2) or (bbox is not None)
+        valid.append(1.0 if ok else 0.0)
+    valid=np.array(valid,np.float32)
+    return feats, valid
+
+def frame_has_full_skeleton(bbox, kps, *, kp_need=17, require_bbox=True):
+    # 如果設定需要 bbox 但 bbox 是 None，則視為不完整
+    if require_bbox and bbox is None:
+        return False
+    
+    # 計算有效骨架點數量
+    cnt = 0
+    # kps 是 list of dict {'x':..., 'y':..., 'conf':...}
+    for j in range(min(17, len(kps))):
+        pt = kps[j]
+        x = pt.get('x')
+        y = pt.get('y')
+        # 檢查座標是否存在且有效
+        if x is None or y is None: continue
+        if not (math.isfinite(x) and math.isfinite(y)): continue
+        
+        # 檢查信心度
+        conf = float(pt.get('conf', pt.get('confidence', 1.0)))
+        if conf >= KP_CONF_TH:
+            cnt += 1
+            
+    return cnt >= kp_need
+
+# ===================== 主流程 =====================
 def run_on_json(pose_json: str, object_json: Optional[str]=None):
     poses = read_any_json(pose_json)
     objs  = read_any_json(object_json) if object_json else None
-
     T = len(poses)
-    print(f"[Debug] T={T}, window={WINDOW}, stride={STRIDE}")
-
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # 計算輸入通道數（與訓練一致）
-    in_ch = 1 + 1 + 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + len(OBJECT_CLASSES) + 2
 
-
-    # 讀類別 & 權重
-    class_names = None
-
-    # === Robust ckpt loading ===
-    import traceback
-    if (not os.path.exists(MODEL_PATH)) or (not os.path.isfile(MODEL_PATH)):
-        raise FileNotFoundError(f"模型檔不存在或非檔案：{MODEL_PATH}")
-    _sz = os.path.getsize(MODEL_PATH)
-    if _sz < 1024:
-        raise RuntimeError(f"模型檔案過小({_sz} bytes)，可能是空檔/未完整寫入：{MODEL_PATH}")
-
-    obj = None
-    try:
-        obj = torch.load(MODEL_PATH, map_location=device, weights_only=True)  # type: ignore
-    except TypeError:
-        try:
-            obj = torch.load(MODEL_PATH, map_location=device)
-        except EOFError as e:
-            raise RuntimeError(f"讀取模型遇到 EOFError，檔案可能損毀：{MODEL_PATH}") from e
-        except Exception as e:
-            raise RuntimeError(f"讀取模型失敗：{MODEL_PATH}\n{traceback.format_exc()}") from e
-
-    # 正規化成 state_dict
-    if isinstance(obj, dict) and 'model_state' in obj:
-        state = obj['model_state']
-        class_names = obj.get('class_names', class_names)
-    elif isinstance(obj, dict):
-        state = obj
-    else:
-        raise RuntimeError(f'不支援的 ckpt 內容型別：{type(obj)}')
-
-    if class_names is None:
-        if CLASSES_PATH and os.path.isfile(CLASSES_PATH):
-            with open(CLASSES_PATH,'r',encoding='utf-8') as f:
-                class_names = json.load(f)
-        else:
-            guess = os.path.join(os.path.dirname(MODEL_PATH), 'classes.json')
-            if os.path.isfile(guess):
-                with open(guess,'r',encoding='utf-8') as f:
-                    class_names = json.load(f)
-    if class_names is None:
-        raise RuntimeError('Class names not found. 請提供 CLASSES_PATH 或使用含 class_names 的 ckpt')
-
-    # 根據 ckpt 權重自動選擇 temporal_pool
-    pool_mode = TEMPORAL_POOL
-    try:
-        _has_attn = any(k.startswith("head.attn.") for k in state.keys())
-        if (not _has_attn) and (pool_mode == "attn"):
-            pool_mode = "last"
-    except Exception:
-        pass
-
-    # ==== 決定二元稀有類索引（僅二元時生效）====
-    rare_idx = None
-    if BINARY_DECISION and len(class_names) == 2:
-        rare_name = RARE_CLASS_NAME_OVERRIDE or class_names[1]  # 預設取索引 1
-        if rare_name not in class_names:
-            raise RuntimeError(f"指定的稀有類名 '{rare_name}' 不在 class_names: {class_names}")
-        rare_idx = class_names.index(rare_name)
-        nonrare_idx = 1 - rare_idx
+    in_ch = 17 + (len(COCO_EDGES) if INCLUDE_BONE_LINES else 0) + len(OBJECT_CLASSES) + 2
     
-    # 建模（含 motion_dim）
+    if not os.path.exists(MODEL_PATH): raise FileNotFoundError(MODEL_PATH)
+    ckpt = torch.load(MODEL_PATH, map_location=device)
+    state = ckpt['model_state'] if 'model_state' in ckpt else ckpt
+    class_names = ckpt.get('class_names')
+    
+    if class_names is None and os.path.exists(CLASSES_PATH):
+        with open(CLASSES_PATH) as f: class_names = json.load(f)
+    if not class_names: raise RuntimeError("Class names not found")
+
     model = CNNLSTM(in_ch=in_ch, num_classes=len(class_names), cnn_out=256,
                     lstm_h=LSTM_HIDDEN, lstm_layers=2, bidirectional=BIDIRECTIONAL,
-                    temporal_pool=pool_mode, dropout=DROPOUT,
+                    temporal_pool=TEMPORAL_POOL, dropout=DROPOUT,
                     motion_dim=(_MOTION_DIM if _USE_MOTION else 0)).to(device)
     
-    # ===== 舊→新鍵名映射（對齊新版 SpaceCNN） =====
-    fix = {}
-    for k, v in list(state.items()):
-        nk = k
-        nk = nk.replace("cnn.fc.", "cnn.proj.")
-        nk = nk.replace("cnn.net.2.", "cnn.net.0.")
-        nk = nk.replace("cnn.net.5.", "cnn.net.3.")
-        nk = nk.replace("cnn.net.8.", "cnn.net.6.")
-        if nk != k:
-            fix[nk] = v
-            del state[k]
-    state.update(fix)
-
-    # ===== 若 head.fc 輸出維度與目前模型不同，直接跳過該權重，改用隨機初始化 =====
-    try:
-        if "head.fc.weight" in state:
-            out_ckpt = state["head.fc.weight"].shape[0]
-            out_model = model.head.fc.out_features
-            if out_ckpt != out_model:
-                del state["head.fc.weight"]
-                if "head.fc.bias" in state:
-                    del state["head.fc.bias"]
-                print(f"[Warn] ckpt num_classes={out_ckpt} 與目前模型 {out_model} 不同，已跳過 head.fc 權重載入。")
-    except Exception:
-        pass
-
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print("[Warn] Missing keys:", missing)
-    if unexpected:
-        print("[Warn] Unexpected keys:", unexpected)
-
+    model.load_state_dict(state, strict=False)
     model.eval()
 
-    # 物件取得函式
-    def get_obj(i):
-        if objs is None: return []
-        if i < len(objs):
-            return extract_objects_from_record(objs[i])
-        return []
+    motion_stats = ckpt.get('motion_norm', {"mean": [0.0]*9, "std": [1.0]*9})
+    mm = np.array(motion_stats['mean'], np.float32)
+    ss = np.array(motion_stats['std'], np.float32)
 
+    rare_idx = 1 if BINARY_DECISION and len(class_names)==2 else None
     results = []
+
+    def get_obj(i): return extract_objects_from_record(objs[i]) if objs and i < len(objs) else []
+
     with torch.no_grad():
         for start in range(0, max(0, T - WINDOW + 1), STRIDE):
             parsed = []
@@ -724,84 +518,46 @@ def run_on_json(pose_json: str, object_json: Optional[str]=None):
                 dets = get_obj(i)
                 parsed.append((bbox, kps, dets, img_w, img_h))
 
-            # 第一幀完整性檢查（不完整就跳過這個 20 幀結果）
             if REQUIRE_FULL_FIRST_FRAME:
-                bbox0, kps0, _, _, _ = parsed[0]
-                if not frame_has_full_skeleton(bbox0, kps0, kp_need=17, require_bbox=True):
+                if not frame_has_full_skeleton(parsed[0][0], parsed[0][1], kp_need=17, require_bbox=True):
                     continue
+            
+            parsed = fill_missing_kps_inference(parsed, max_missing=MAX_MISSING_FILL)
 
-            # 半視窗 KF 平滑（覆蓋尾段）
-            if ENABLE_KALMAN:
-                window_kps = [kps for (_, kps, _, _, _) in parsed]
-                half_len = int(HALF_LEN_OVERRIDE) if HALF_LEN_OVERRIDE else max(1, WINDOW//2)
-                smoothed = kalman_smooth_kps(window_kps,
-                                             half_slide=KALMAN_HALF_SLIDE,
-                                             half_len=half_len,
-                                             require_full_first=True,
-                                             step=STRIDE)
-                parsed = [(bbox, smoothed[i], dets, img_w, img_h) for i,(bbox, _, dets, img_w, img_h) in enumerate(parsed)]
-
-            # Motion + mask（與訓練一致）
+            # Motion Calculation
             motion_feats, valid_mask = compute_motion_feats_with_mask_from_parsed(parsed, conf_th=KP_CONF_TH)
+            motion_feats = (motion_feats - mm) / ss
 
-            # 轉 relation maps
-            cfg = RelationMapConfig(H=H, W=W, sigma_kp=SIGMA_KP, kp_conf_th=KP_CONF_TH,
-                                     include_bone_lines=INCLUDE_BONE_LINES, object_classes=OBJECT_CLASSES)
+            # Rasterize
+            cfg = RelationMapConfig(H=H, W=W, sigma_kp=SIGMA_KP, sigma_obj=SIGMA_OBJ, 
+                                    kp_conf_th=KP_CONF_TH, include_bone_lines=INCLUDE_BONE_LINES, 
+                                    object_classes=OBJECT_CLASSES)
             clips = [rasterize_frame(bbox, kps, dets, img_w, img_h, cfg) for (bbox,kps,dets,img_w,img_h) in parsed]
 
-            x = torch.from_numpy(np.stack(clips)).unsqueeze(0).float().to(device)            # (1,T,C,H,W)
-            M = torch.from_numpy(motion_feats).unsqueeze(0).float().to(device) if _USE_MOTION else None  # (1,T,9)
-            mask = torch.from_numpy(valid_mask).unsqueeze(0).float().to(device)                           # (1,T)
+            x = torch.from_numpy(np.stack(clips)).unsqueeze(0).float().to(device)
+            M = torch.from_numpy(motion_feats).unsqueeze(0).float().to(device) if _USE_MOTION else None
+            mask = torch.from_numpy(valid_mask).unsqueeze(0).float().to(device)
 
             logits = model(x, motion=M, mask=mask)
             prob = torch.softmax(logits, dim=1).cpu().numpy()[0]
             pred_idx = int(prob.argmax())
             
             out_row = {
-                'start_frame': start,
-                'end_frame': start + WINDOW - 1,
-                'pred_idx': pred_idx,
-                'pred': class_names[pred_idx],
-                'probs': prob.tolist(),
+                'start_frame': start, 'end_frame': start + WINDOW - 1,
+                'pred_idx': pred_idx, 'pred': class_names[pred_idx], 'probs': prob.tolist(),
             }
-
-            # 若為二元，附上稀有類分數與二元判斷
             if rare_idx is not None:
-                rare_prob = float(prob[rare_idx])
+                out_row['score_rare'] = float(prob[rare_idx])
+                out_row['is_rare'] = bool(prob[rare_idx] >= DECISION_THR)
                 out_row['rare_name'] = class_names[rare_idx]
-                out_row['score_rare'] = rare_prob
-                out_row['is_rare'] = bool(rare_prob >= DECISION_THR)
-
             results.append(out_row)
             
     return results, class_names
 
-# ===================== 輸出 CSV（可選） =====================
-
-def save_results_csv(results: list, out_csv: str, class_names: List[str]):
-    import csv
-    with open(out_csv, 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
-        header = ['start_frame','end_frame','pred','pred_idx'] + [f'p_{c}' for c in class_names]
-        w.writerow(header)
-        for r in results:
-            row = [r['start_frame'], r['end_frame'], r['pred'], r['pred_idx']] + r['probs']
-            w.writerow(row)
-
-# ===================== Main =====================
 if __name__ == '__main__':
-    results, classes = run_on_json(POSE_JSON, OBJECT_JSON)
-    for r in results:
-        import numpy as _np
+    res, cls = run_on_json(POSE_JSON, OBJECT_JSON)
+    for r in res:
         if 'score_rare' in r:
-            print(
-                f"frames {r['start_frame']:>5}-{r['end_frame']:<5} | "
-                f"pred={r['pred']} | {r['rare_name']}={r['score_rare']:.3f} "
-                f"({'>= '+str(DECISION_THR) if r['is_rare'] else '< '+str(DECISION_THR)}) | "
-                f"probs={_np.round(r['probs'],3)}"
-            )
+            print(f"{r['start_frame']}-{r['end_frame']} | {r['rare_name']}: {r['score_rare']:.3f}")
         else:
-            print(f"frames {r['start_frame']:>5}-{r['end_frame']:<5} | pred={r['pred']} | probs={_np.round(r['probs'],3)}")
-    if OUT_CSV:
-        save_results_csv(results, OUT_CSV, classes)
-        print(f"Saved CSV: {OUT_CSV}")
+            print(f"{r['start_frame']}-{r['end_frame']} | {r['pred']}")
