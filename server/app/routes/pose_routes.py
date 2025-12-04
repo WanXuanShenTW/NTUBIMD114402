@@ -2,6 +2,8 @@
 import json
 import traceback
 import aiohttp
+from datetime import datetime, timedelta
+from collections import defaultdict
 from fastapi import APIRouter, WebSocket
 from starlette.websockets import WebSocketDisconnect
 
@@ -16,22 +18,27 @@ from ..utils import stream_infer_manager as sim_mod
 
 pose_router = APIRouter(tags=["姿態偵測與跌倒事件"])
 
-# 你原本使用的固定欄位（如需）
 LOCATION = "客廳"
 POSE_BEFORE_FALL = "站立"
 
+# === [新增] 用來記錄每個使用者「上一次跌倒結束」的時間 ===
+# 格式: user_id (str) -> datetime object
+USER_LAST_FALL_END = defaultdict(lambda: None)
+
+# 設定「跌倒後多久內的躺下」視為無效睡眠 (秒)
+FALL_COOLDOWN_SECONDS = 30 
+
 # ---------------------------
-# 事件 Handler（供推論核心呼叫）
+# 事件 Handler
 # ---------------------------
 async def on_fall_start(user_id: str, start_time: str, result: dict = None,
                         peak_score: float = None, prev_action_name: str | None = None,
                         curr_action_name: str | None = None, payload: dict = None,
-                        clip: dict = None, **kwargs):
+                        clip: dict = None, location: str = None, **kwargs):
     """
     跌倒開始：寫 DB + 基本 log
     """
     elder_id = int(user_id)
-    # 從參數 clip 或 kwargs 取得（manager 會以 clip=... 傳入）
     if clip is None:
         clip = kwargs.get("clip")
     _start = clip.get("start") if isinstance(clip, dict) else None
@@ -43,34 +50,37 @@ async def on_fall_start(user_id: str, start_time: str, result: dict = None,
         "start": _start,
         "end": _end
     }
+    
+    # 優先使用傳入的 location，如果沒有則使用預設值
+    final_location = location if location else LOCATION
+
     try:
         print(f"[FALL_START] {user_id} {start_time}")
-        # 依你的 service 實作調整欄位
         if pose_before.lower() in ["lie", "liestill", "lying"]:
             pose_before = "躺"
         elif pose_before.lower() in ["sit", "sitstill", "sitting"]:
             pose_before = "坐"
         else:
             pose_before = "走路"
+            
         record_id = await add_fall_event(
             user_id=int(user_id),
-            location=LOCATION,
+            location=final_location,
             pose_before_fall=pose_before,
             detected_time=start_time
         )
-        print(f"[FALL EVENT] user_id={user_id} recorded to DB.")
+        print(f"[FALL EVENT] user_id={user_id} recorded to DB. id={record_id}")
+        
+        # Webhook
         url = "https://smartcare.southeastasia.cloudapp.azure.com/eric/webhook/elder"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=body, timeout=10) as response:
-                    print("[WEBHOOK] POST", url, "payload=", json.dumps(body, ensure_ascii=False), "status=", response.status)
-                    try:
-                        response_data = await response.json()
-                        print("[WEBHOOK RESPONSE] Received:", json.dumps(response_data, ensure_ascii=False))
-                    except Exception as e:
-                        print("[WEBHOOK RESPONSE][ERROR]", str(e))
+                    # print("[WEBHOOK] POST payload=", json.dumps(body, ensure_ascii=False))
+                    pass
         except Exception as e:
-            print(f"[Webhook][Warn] 無法發送跌倒通知 (可能是測試端未開啟): {e}")
+            print(f"[Webhook][Warn] 無法發送跌倒通知: {e}")
+            
     except Exception as e:
         print(f"[FALL_START][ERROR] user_id={user_id}: {e}")
         traceback.print_exc()
@@ -78,10 +88,19 @@ async def on_fall_start(user_id: str, start_time: str, result: dict = None,
 async def on_fall_recover(user_id: str, start_time: str, end_time: str,
                           peak_score: float = None, reason: str = "", payload: dict = None, **kwargs):
     """
-    跌倒恢復：寫 log（若你有要更新 DB 的 end_time，可在此補寫）
+    跌倒恢復：記錄恢復時間，防止後續誤判睡眠
     """
     try:
-        print(f"[FALL_RECOVER] {user_id} {start_time} {end_time} {peak_score} reason= {reason}")
+        print(f"[FALL_RECOVER] {user_id} {start_time} {end_time} {peak_score} reason={reason}")
+        
+        # [新增] 記錄跌倒結束時間，供後續 filter 使用
+        try:
+            dt_end = datetime.strptime(end_time, "%Y-%m-%d %H:%M:%S")
+            USER_LAST_FALL_END[user_id] = dt_end
+            print(f"[FILTER] User {user_id} fall ended at {dt_end}. Cooldown starts.")
+        except Exception:
+            pass
+            
     except Exception as e:
         print(f"[FALL_RECOVER][ERROR] user={user_id}: {e}")
         traceback.print_exc()
@@ -90,14 +109,10 @@ async def on_state_event_start(user_id: str, event_name: str,
                                start_time: str, peak_score: float = None,
                                prev_action_name: str = None, curr_action_name: str = None,
                                payload: dict = None, clip: dict | None = None, **kwargs):
-    """
-    多動作：事件開始（例如 walk）
-    """
     try:
         print(f"[STATE_START] user={user_id} event={event_name} at {start_time} "
               f"peak={peak_score if peak_score is not None else 'n/a'} "
               f"prev={prev_action_name or 'none'} -> curr={curr_action_name or event_name}")
-
     except Exception as e:
         print(f"[STATE_START][ERROR] user={user_id}: {e}")
         traceback.print_exc()
@@ -107,18 +122,45 @@ async def on_state_event_recover(user_id: str, event_name: str,
                                  prev_action_name: str = None, curr_action_name: str = None,
                                  payload: dict = None, clip: dict | None = None, **kwargs):
     """
-    多動作：事件恢復（例如 walk -> none 或 walk -> 另一個事件）
+    多動作事件結束：判斷是否寫入 DB (坐姿、睡眠)
     """
     try:
+        # --- 處理坐姿 ---
         if prev_action_name == "sitstill":
+            # [修正] 參數可能也是 start_at/end_at，請確認 sit_event_service
+            # 這裡假設 add_sit_event 用 start_at
             await add_sit_event(user_id=user_id, start_at=start_time, end_at=end_time)
             print(f"[SIT EVENT] user_id={user_id} recorded to DB.")
+
+        # --- 處理睡眠 (liestill) ---
         elif prev_action_name == "liestill":
-            await add_sleep_record(user_id=user_id, start_time=start_time, end_time=end_time)
-            print(f"[SLEEP RECORD] user_id={user_id} recorded to DB.")
+            # [新增] 檢查是否為跌倒後的連帶動作
+            last_fall = USER_LAST_FALL_END[user_id]
+            is_valid_sleep = True
+            
+            if last_fall:
+                try:
+                    dt_start = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+                    diff = (dt_start - last_fall).total_seconds()
+                    
+                    # 如果睡眠開始時間 - 上次跌倒結束時間 < 冷卻時間 (例如 30秒)
+                    # 且 diff >= 0 (確保不是舊資料)
+                    if 0 <= diff < FALL_COOLDOWN_SECONDS:
+                        print(f"[FILTER] Ignored sleep record for user {user_id}. "
+                              f"Too close to fall (gap={diff:.1f}s < {FALL_COOLDOWN_SECONDS}s).")
+                        is_valid_sleep = False
+                except Exception as e_time:
+                    print(f"[FILTER] Time parsing error: {e_time}")
+
+            if is_valid_sleep:
+                # [修正] 參數名稱改為 start_at, end_at 以匹配 service 定義
+                await add_sleep_record(user_id=user_id, start_at=start_time, end_at=end_time)
+                print(f"[SLEEP RECORD] user_id={user_id} recorded to DB.")
+
         print(f"[STATE_RECOVER] {user_id} {event_name} {start_time} {end_time} "
               f"{peak_score if peak_score is not None else 'n/a'} "
               f"prev= {prev_action_name or 'none'} curr= {curr_action_name or 'none'}")
+
     except Exception as e:
         print(f"[STATE_RECOVER][ERROR] user={user_id}: {e}")
         traceback.print_exc()
@@ -140,10 +182,10 @@ async def ws_pose(websocket: WebSocket):
     await ws_manager.connect(user_id, websocket)
     print(f"[WS] User {user_id} connected")
 
-    # 3) 直接使用模組級單例（現行版本於 import 時建立）
+    # 3) 直接使用模組級單例
     manager = sim_mod.stream_infer_manager
 
-    # 4) 綁定事件 handlers（可覆蓋既有設定）
+    # 4) 綁定事件 handlers
     try:
         manager.set_handlers(
             on_fall_start=on_fall_start,
@@ -155,36 +197,29 @@ async def ws_pose(websocket: WebSocket):
         print(f"[STREAM][HANDLERS][ERROR] user={user_id}: {e}")
         traceback.print_exc()
 
-    # 5) 主循環：接收文字訊息交給 dispatcher
+    # 5) 主循環
     try:
         while True:
             text = await websocket.receive_text()
             await handle_ws_text(user_id, text)
 
     except WebSocketDisconnect as e:
-        # 使用者主動離線
         code = getattr(e, "code", None)
         print(f"[WS][DISCONNECT] user={user_id} code={code}")
         ws_manager.disconnect(user_id, websocket)
-        # 清理該 user 的狀態
         try:
             await manager.force_recover(user_id, reason=f"disconnect(code={code})")
-        except Exception as e2:
-            print(f"[STREAM][force_recover][ERROR] user={user_id}: {e2}")
-            traceback.print_exc()
-        # 若該 user 已無連線，發送通知
+        except Exception:
+            pass
         if not ws_manager.get_user_connections(user_id):
             notify_user_disconnected(user_id)
 
     except Exception as e:
-        # 未預期錯誤
         print(f"[WS][ROUTE][ERROR] user={user_id}: {e}")
-        traceback.print_exc()
         try:
             await manager.force_recover(user_id, reason="error")
-        except Exception as e2:
-            print(f"[STREAM][force_recover][ERROR] user={user_id}: {e2}")
-            traceback.print_exc()
+        except Exception:
+            pass
         try:
             await websocket.close(code=1011)
         except Exception:
@@ -194,9 +229,7 @@ async def ws_pose(websocket: WebSocket):
             notify_user_disconnected(user_id)
 
     finally:
-        # 雙保險清理
         try:
             await manager.force_recover(user_id, reason="finally")
-        except Exception as e2:
-            print(f"[STREAM][force_recover][ERROR][finally] user={user_id}: {e2}")
-            traceback.print_exc()
+        except Exception:
+            pass
