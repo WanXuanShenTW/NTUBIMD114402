@@ -101,7 +101,7 @@ class Config:
     max_missing_interpolate = 3  # 訓練時最多連續補幾幀
 
     # ====== On-the-fly 擴增（只給稀有類：fall；不改模型大小/輸出）======
-    aug_for_rare = True           # 開啟針對稀有類（fall）的擴增
+    aug_for_rare = False           # 開啟針對稀有類（fall）的擴增
     aug_prob = 0.50               # 每個 window 觸發擴增的機率
     aug_hflip = True              # 允許左右翻轉（不會違反重力/因果）
     # 仿射變換（整段 window 使用同一組參數；避免跨幀不一致）
@@ -322,28 +322,6 @@ def frame_has_full_skeleton(bbox, kps, *, kp_need=17, require_bbox=True):
             if conf >= _KP_CONF_TH:
                 cnt += 1
     return cnt >= kp_need
-
-# ===================== Kalman（半視窗） =====================
-class Kalman2D:
-    def __init__(self, x=0.0, y=0.0, var_pos=1e-2, var_vel=1e-1, var_meas=4.0):
-        self.F = np.array([[1,0,1,0],[0,1,0,1],[0,0,1,0],[0,0,0,1]], dtype=np.float32)
-        self.H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float32)
-        self.Q = np.diag([var_pos, var_pos, var_vel, var_vel]).astype(np.float32)
-        self.R = np.diag([var_meas, var_meas]).astype(np.float32)
-        self.x = np.array([[x], [y], [0.0], [0.0]], dtype=np.float32)
-        self.P = np.eye(4, dtype=np.float32) * 10.0
-    def predict(self):
-        self.x = self.F @ self.x
-        self.P = self.F @ self.P @ self.F.T + self.Q
-    def update(self, z):
-        y = z - (self.H @ self.x)
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-        self.x = self.x + (K @ y)
-        I = np.eye(4, dtype=np.float32)
-        self.P = (I - K @ self.H) @ self.P
-    def get_xy(self):
-        return float(self.x[0,0]), float(self.x[1,0])
 
 def linear_interpolate_kps(window_parsed, max_missing=None):
     """
@@ -972,11 +950,9 @@ class PoseObjectDataset(Dataset):
 
             for pose_path, obj_path in seq_paths:
                 # 讀單一序列（以 frame_id 為 key 的 dict）
-                poses = load_pose_sequence(
-                    pose_path, 
-                    video_root=getattr(self.cfg, "video_root", None),
-                    video_exts=getattr(self.cfg, "video_exts", [".mp4"])
-                )
+                poses = load_pose_sequence(pose_path, 
+                           video_root=getattr(self.cfg, "video_root", None),
+                           video_exts=getattr(self.cfg, "video_exts", [".mp4"]))
                 objs  = load_object_sequence(obj_path) if (self.use_objects and obj_path) else {}
 
                 # 兩邊取交集的 frame 清單
