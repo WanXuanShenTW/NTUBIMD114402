@@ -24,29 +24,32 @@ import numpy as np
 # ==============================
 # POSE_JSON_PATH     = "outputs/skeletons/test/pose/Meet and Split (46).json"
 # DETECT_JSON_PATH   = "outputs/skeletons/test/detect/Meet and Split (46).json"
-POSE_JSON_PATH   = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
-DETECT_JSON_PATH = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
 # POSE_JSON_PATH   = "outputs/skeletons/binary-backup/YOLO-pose/fall/Home_video (2)_back.json"
 # DETECT_JSON_PATH = "outputs/skeletons/binary-backup/YOLO-detect/fall/Home_video (2)_back.json"
+POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/walk/Walking (70).json"
+DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/walk/Walking (70).json"
 # POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/lie/780251760.975590_back.json"
 # DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/lie/780251760.975590_back.json"
 # POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/sitstill/Sitting (20).json"
 # DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/sitstill/Sitting (20).json"
-# POSE_JSON_PATH   = "outputs/skeletons/multi/YOLO-pose/walk/Walking (70).json"
-# DETECT_JSON_PATH = "outputs/skeletons/multi/YOLO-detect/walk/Walking (70).json"
+# POSE_JSON_PATH   = "outputs/skeletons/binary/YOLO-pose/non_fall/Office_video (18)_back_front.json"
+# DETECT_JSON_PATH = "outputs/skeletons/binary/YOLO-detect/non_fall/Office_video (18)_back_front.json"
 
 MODE             = "two-stage"    # "two-stage" | "binary-only" | "none"
 
 ENABLE_VIDEO     = True
 # VIDEO_PATH       = "medias/test/Meet and Split (46).mp4"
-VIDEO_PATH       = "medias/train_video/binary/non_fall/Office_video (18)_back_front.mp4"
 # VIDEO_PATH       = "medias/raw_n_edited/fall_all/Home_video (2)_back.mp4"
+VIDEO_PATH       = "medias/train_video/multi/walk/Walking (70).mp4"
 # VIDEO_PATH       = "medias/train_video/multi/lie/780251760.975590_back.mp4"
 # VIDEO_PATH       = "medias/train_video/multi/sitstill/Sitting (20).mp4"
-# VIDEO_PATH       = "medias/train_video/multi/walk/Walking (70).mp4"
+# VIDEO_PATH       = "medias/train_video/binary/non_fall/Office_video (18)_back_front.mp4"
+
 VIDEO_FRAME_OFFSET = 0            # JSON 第 0 幀對應影片的第幾幀（對齊起點用）
 
-SKELETON_FPS     = 12.5             
+# SKELETON_FPS     = 10
+# SKELETON_FPS     = 12.5  
+SKELETON_FPS     = 10             
 JSON_FRAME_OFFSET = 0             
 
 CANVAS_WIDTH     = 640
